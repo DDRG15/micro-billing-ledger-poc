@@ -312,6 +312,82 @@ The pipeline is now clean end-to-end: dirty data in → Pydantic-validated model
 
 ---
 
+## 🔧 Phase 3: Cross-Field Business Logic Validators (May 13, 2026)
+
+**Status:** The rules that Field can't write. 69/69 tests passing. Now the bouncer doesn't just check your ID — he checks if your story makes sense.
+
+Phase 1 validated types and values. Phase 2 validated the output structure. Phase 3 validates the *relationship between fields* — because some rules only exist when you look at two things at the same time.
+
+### What Got Implemented
+
+**1. Invoice Amount > 0 — Cross-Field Logic**
+```python
+@model_validator(mode='after')
+def check_invoice_amount_nonzero(self):
+    invoice_types = {EventType.INVOICE_PAID, EventType.INVOICE_FAILED}
+    if self.type in invoice_types:
+        if self.data.object.get_amount() == 0:
+            raise ValueError(f"{self.type.value} must have amount > 0")
+    return self
+```
+`invoice.paid` with `$0` is not a payment. `invoice.payment_failed` with `$0` has nothing to retry. Both are data quality failures — caught here, routed to DLQ, never touch the database.
+
+Subscription events (`created`, `deleted`, `updated`) are **exempt** — they're lifecycle events, not payments. They can have `$0` and that's fine.
+
+Field alone can't do this. `ge=0` allows zero. The rule "zero is only invalid for invoice types" requires reading `self.type` and `self.data.object.amount` together.
+
+**2. Customer ID Format — Structural Validation**
+```python
+@model_validator(mode='after')
+def check_customer_id_format(self):
+    if not self.data.object.customer.startswith("cus_"):
+        raise ValueError(f"Customer ID must start with 'cus_'")
+    return self
+```
+`min_length=4` from Phase 1 catches empty and short strings. It doesn't catch `"abc1234567"` — which is 10 characters and completely wrong. Stripe customer IDs always start with `"cus_"`. That's a structural rule, not a length rule.
+
+**3. Both Validators Fire Together**
+
+When both fail, Pydantic collects every error before raising `ValidationError`. The DLQ entry gets the full count. No "first error wins" — you get the complete picture.
+
+### What the Tests Cover
+
+**9 new tests, 69 total:**
+
+| Scenario | Expected |
+|---|---|
+| `invoice.paid` with `amount=0` | `DLQ_INVALID` |
+| `invoice.payment_failed` with `amount=0` | `DLQ_INVALID` |
+| `subscription.created` with `amount=0` | `POSTED` (lifecycle, not payment) |
+| Customer `"abc1234567"` (no prefix) | `DLQ_INVALID` |
+| Customer `"cus_abc123"` | `POSTED` |
+| Both rules violated at once | `DLQ_INVALID`, reason includes error count |
+
+### What This Means
+
+Before Phase 3, a `$0` invoice could sail through validation and land in the ledger with a `POSTED` status. That's a ghost revenue record — exists in the database, doesn't exist in reality. Now it's caught at the boundary, logged with a reason, and a human reviews it. No silent data rot.
+
+---
+
+## 🔑 Where the API Key Goes
+
+The Stripe webhook secret is in [ledger.py](ledger.py) — two spots, both marked:
+
+**1. Configuration section** — where you set it:
+```python
+STRIPE_WEBHOOK_SECRET: str = "whsec_YOUR_SECRET_HERE"  # <-- replace this
+```
+Get it from: Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret.
+
+**2. Webhook handler** — where it gets used (commented out, ready to uncomment):
+```python
+# stripe.WebhookSignature.verify_header(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
+```
+
+Without this, anyone who knows your endpoint URL can POST fake events. Bots know your URL. Don't skip this step in production.
+
+---
+
 ## ⚡ Performance: Tactical Speed
 
 Bypassing the HTTP overhead to measure pure ledger throughput:
