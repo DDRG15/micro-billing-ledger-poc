@@ -204,6 +204,35 @@ errores antes de lanzar la excepción."
 
 ---
 
+## API Key — Where It Lives and Why It Matters
+
+Added after Phase 3. Two spots in [ledger.py](ledger.py):
+
+**Spot 1 — Configuration section:**
+```python
+STRIPE_WEBHOOK_SECRET: str = "whsec_YOUR_SECRET_HERE"  # <-- replace this
+```
+This is where you paste the signing secret from your Stripe Dashboard.
+Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret.
+Looks like: `whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`
+
+**Spot 2 — The webhook handler (commented out):**
+```python
+# stripe.WebhookSignature.verify_header(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
+```
+This is the actual verification call. It's commented out because `stripe` isn't in
+`requirements.txt` yet — adding it means adding the SDK dependency. For the Makers
+Challenge demo this is fine to leave commented. For anything touching real Stripe data,
+uncomment it and add `stripe` to requirements.
+
+**Why this matters for AltScore:**
+The Makers Challenge integration will receive webhooks from third-party systems. Without
+signature verification, anyone who discovers your endpoint URL can replay arbitrary events.
+That's not a theoretical risk — it's the first thing a security review will flag. The fix is
+one `pip install stripe` and three lines of code. No excuse to skip it in production.
+
+---
+
 ## The Validation Stack (Complete Picture)
 
 Every webhook now passes through this stack in order:
