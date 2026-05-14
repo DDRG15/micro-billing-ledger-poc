@@ -460,6 +460,182 @@ r = L.process_stripe_event(conn6, ev_sub_updated)
 chk("subscription.updated → PENDING", r["outcome"] == "PENDING", f"got {r['outcome']}")
 
 
+print("\n── Phase 5: Integration — HTTP layer (TestClient) ──────────────────────")
+
+from starlette.testclient import TestClient
+
+# Patch module-level connection so HTTP tests use in-memory DB, not billing_ledger.db
+http_conn = L._bootstrap(pathlib.Path(":memory:"))
+L._conn = http_conn
+client = TestClient(L.app)
+
+# Health check
+r = client.get("/health")
+chk("GET /health → 200", r.status_code == 200)
+chk("health response is ok", r.json().get("status") == "ok")
+
+# Valid event through HTTP
+ev_http = fake_event(eid="evt_http_001", customer="cus_http001", amount=9900)
+r = client.post("/webhook/stripe", json=ev_http)
+chk("POST valid event → HTTP 200",       r.status_code == 200)
+chk("valid event → POSTED via HTTP",     r.json()["outcome"] == "POSTED",
+    f"got {r.json()}")
+
+# Duplicate via HTTP → still 200 (Stripe needs 200 to stop retrying)
+r = client.post("/webhook/stripe", json=ev_http)
+chk("POST duplicate → HTTP 200 (not 4xx)",      r.status_code == 200)
+chk("duplicate → DLQ_DUPLICATE via HTTP",        r.json()["outcome"] == "DLQ_DUPLICATE",
+    f"got {r.json()}")
+
+# Invalid currency via HTTP → DLQ_INVALID
+ev_bad_curr = fake_event(eid="evt_http_bad_curr", currency="USD")
+r = client.post("/webhook/stripe", json=ev_bad_curr)
+chk("POST uppercase currency → HTTP 200",        r.status_code == 200)
+chk("uppercase currency → DLQ_INVALID via HTTP", r.json()["outcome"] == "DLQ_INVALID",
+    f"got {r.json()}")
+
+# $0 invoice via HTTP → cross-field validator fires
+ev_zero = fake_event(eid="evt_http_zero", amount=0)
+r = client.post("/webhook/stripe", json=ev_zero)
+chk("POST $0 invoice → HTTP 200",               r.status_code == 200)
+chk("$0 invoice → DLQ_INVALID via HTTP",         r.json()["outcome"] == "DLQ_INVALID",
+    f"got {r.json()}")
+
+# Bad customer prefix via HTTP
+ev_bad_cus = fake_event(eid="evt_http_bad_cus", customer="notacus_001")
+r = client.post("/webhook/stripe", json=ev_bad_cus)
+chk("POST bad customer prefix → HTTP 200",       r.status_code == 200)
+chk("bad prefix → DLQ_INVALID via HTTP",         r.json()["outcome"] == "DLQ_INVALID",
+    f"got {r.json()}")
+
+# Ledger summary endpoint
+r = client.get("/ledger/summary")
+chk("GET /ledger/summary → 200", r.status_code == 200)
+summary = r.json()
+chk("summary has 'ledger' key",         "ledger" in summary)
+chk("summary has 'dlq_depth' key",      "dlq_depth" in summary)
+chk("summary has 'outbox_pending' key", "outbox_pending" in summary)
+chk("summary dlq_depth is 4",           summary["dlq_depth"] == 4,
+    f"got {summary['dlq_depth']}")
+chk("summary outbox_pending is 1",      summary["outbox_pending"] == 1,
+    f"got {summary['outbox_pending']}")
+
+
+print("\n── Phase 5: Concurrent insertion (threading) ────────────────────────────")
+
+import threading
+import tempfile
+import os
+
+# Each thread must have its own connection — shared connection + BEGIN = nested tx error.
+# Use a temp file so multiple connections can point at the same database.
+tmp_db = pathlib.Path(tempfile.mktemp(suffix=".db"))
+L._bootstrap(tmp_db).close()   # create schema once
+
+ev_concurrent      = fake_event(eid="evt_concurrent_001",
+                                customer="cus_concurrent", amount=5000)
+results_concurrent = []
+errors_concurrent  = []
+
+def _fire():
+    try:
+        conn = L._bootstrap(tmp_db)      # own connection per thread
+        r = L.process_stripe_event(conn, ev_concurrent)
+        results_concurrent.append(r["outcome"])
+        conn.close()
+    except Exception as exc:
+        errors_concurrent.append(str(exc))
+
+threads = [threading.Thread(target=_fire) for _ in range(5)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+# Read final ledger count before cleanup
+verify_conn = L._bootstrap(tmp_db)
+ledger_rows = verify_conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
+verify_conn.close()
+
+# Cleanup temp files
+for suffix in ("", "-wal", "-shm"):
+    try:
+        pathlib.Path(str(tmp_db) + suffix).unlink()
+    except FileNotFoundError:
+        pass
+
+chk("no exceptions from 5 concurrent inserts", len(errors_concurrent) == 0,
+    str(errors_concurrent))
+chk("exactly 1 POSTED outcome",      results_concurrent.count("POSTED") == 1,
+    f"POSTED count: {results_concurrent.count('POSTED')}")
+chk("remaining 4 are DLQ_DUPLICATE", results_concurrent.count("DLQ_DUPLICATE") == 4,
+    f"DUPLICATE count: {results_concurrent.count('DLQ_DUPLICATE')}")
+chk("ledger has exactly 1 row after 5 concurrent inserts", ledger_rows == 1,
+    f"got {ledger_rows}")
+
+
+print("\n── Phase 5: Outbox dispatch simulation ──────────────────────────────────")
+
+dispatch_conn = L._bootstrap(pathlib.Path(":memory:"))
+L.process_stripe_event(
+    dispatch_conn,
+    fake_event(eid="evt_dispatch_001", customer="cus_dispatch", amount=7500)
+)
+
+pending_before = dispatch_conn.execute(
+    "SELECT COUNT(*) FROM outbox WHERE dispatched=0"
+).fetchone()[0]
+chk("outbox has 1 pending row before dispatch", pending_before == 1)
+
+# Simulate downstream worker flipping dispatched=1
+dispatch_conn.execute(
+    "UPDATE outbox SET dispatched=1 WHERE transaction_id='evt_dispatch_001'"
+)
+dispatch_conn.commit()
+
+pending_after = dispatch_conn.execute(
+    "SELECT COUNT(*) FROM outbox WHERE dispatched=0"
+).fetchone()[0]
+chk("outbox has 0 pending rows after dispatch", pending_after == 0)
+
+# Replay the same event — idempotency holds even after outbox dispatch
+r = L.process_stripe_event(
+    dispatch_conn,
+    fake_event(eid="evt_dispatch_001", customer="cus_dispatch", amount=7500)
+)
+chk("replay after dispatch → DLQ_DUPLICATE (idempotency holds)",
+    r["outcome"] == "DLQ_DUPLICATE", f"got {r['outcome']}")
+
+ledger_rows = dispatch_conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
+chk("ledger still has 1 row after replay post-dispatch", ledger_rows == 1,
+    f"got {ledger_rows}")
+
+
+print("\n── Phase 5: DLQ queryability and payload preservation ───────────────────")
+
+dlq_conn = L._bootstrap(pathlib.Path(":memory:"))
+
+# Three distinct invalid events → three DLQ entries
+L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_1", currency="WRONG"))
+L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_2", amount=0))
+L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_3", customer=""))
+
+rows = dlq_conn.execute(
+    "SELECT transaction_id, reason, raw_payload FROM dlq ORDER BY id"
+).fetchall()
+
+chk("DLQ has 3 rows",                    len(rows) == 3,   f"got {len(rows)}")
+chk("all 3 reasons are INVALID",
+    all(r[1] == "INVALID" for r in rows))
+chk("raw_payload is a JSON string",
+    all(isinstance(r[2], str) for r in rows))
+
+parsed = [json.loads(r[2]) for r in rows]
+chk("payload evt_dlq_1 id preserved",    parsed[0].get("id") == "evt_dlq_1")
+chk("payload evt_dlq_2 id preserved",    parsed[1].get("id") == "evt_dlq_2")
+chk("payload evt_dlq_3 id preserved",    parsed[2].get("id") == "evt_dlq_3")
+
+
 print("\n── Phase 3: Cross-field validator — invoice amount > 0 ──────────────────")
 
 conn7 = fresh_conn()
