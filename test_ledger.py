@@ -1,6 +1,6 @@
 """
-test_ledger.py — smoke tests for ledger.py (stdlib only, no pytest required)
-=============================================================================
+test_ledger.py — smoke tests for ledger.py (Phase 1: Pydantic Validation)
+=========================================================================
 Run: python test_ledger.py
 """
 
@@ -10,28 +10,7 @@ import sys
 import time
 import pathlib
 
-# Make sure ledger.py is importable without FastAPI/uvicorn at test time.
-# We only import the framework-agnostic core.
-import importlib, types
-
-# Stub FastAPI so ledger.py imports cleanly even without the package installed.
-for mod in ["fastapi", "fastapi.responses", "pydantic", "uvicorn"]:
-    sys.modules.setdefault(mod, types.ModuleType(mod))
-
-# Minimal stubs
-_fastapi = sys.modules["fastapi"]
-_fastapi.FastAPI     = lambda **kw: types.SimpleNamespace(
-    post=lambda *a, **k: (lambda f: f),
-    get =lambda *a, **k: (lambda f: f),
-)
-_fastapi.HTTPException = Exception
-_fastapi.Request       = object
-_fastapi.status        = types.SimpleNamespace(HTTP_200_OK=200)
-sys.modules["fastapi.responses"].JSONResponse = dict
-sys.modules["pydantic"].BaseModel = object
-sys.modules["pydantic"].Field     = lambda *a, **k: None
-
-import ledger as L   # noqa: E402  (import after stub setup)
+import ledger as L   # Direct import — all dependencies installed
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -56,22 +35,176 @@ def fake_event(
     etype: str = "invoice.paid",
     customer: str = "cus_123",
     amount: int = 4900,
+    currency: str = "usd",
+    include_request: bool = True,
 ) -> dict:
-    return {
-        "id":   eid,
+    """Factory for fake Stripe events matching StripeEvent Pydantic structure."""
+    event = {
+        "id": eid,
         "type": etype,
         "data": {"object": {
-            "customer":    customer,
+            "customer": customer,
             "amount_paid": amount,
-            "currency":    "usd",
+            "currency": currency,
         }},
-        "request": {"idempotency_key": f"idem_{eid}"},
     }
+    if include_request:
+        event["request"] = {"idempotency_key": f"idem_{eid}"}
+    return event
 
 
 # =============================================================================
 # Tests
 # =============================================================================
+
+print("\n── Phase 1: Pydantic Validation (Entry Boundary) ────────────────────────")
+
+conn = fresh_conn()
+ev   = fake_event()
+
+r1 = L.process_stripe_event(conn, ev)
+chk("valid event → POSTED",  r1["outcome"] == "POSTED")
+chk("transaction_id returned", r1["transaction_id"] == "evt_test_001")
+
+
+print("\n── Phase 1: Currency Validation (Regex Pattern) ────────────────────────")
+
+conn = fresh_conn()
+
+# Valid currency (lowercase, 3 chars)
+ev_valid = fake_event(currency="usd")
+r = L.process_stripe_event(conn, ev_valid)
+chk("currency 'usd' → POSTED", r["outcome"] == "POSTED")
+
+# Invalid currency (uppercase)
+ev_uppercase = fake_event(eid="evt_invalid_curr_1", currency="USD")
+r = L.process_stripe_event(conn, ev_uppercase)
+chk("currency 'USD' (uppercase) → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+# Invalid currency (wrong length)
+ev_short = fake_event(eid="evt_invalid_curr_2", currency="us")
+r = L.process_stripe_event(conn, ev_short)
+chk("currency 'us' (2 chars) → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+
+print("\n── Phase 1: Customer ID Validation (Min Length) ────────────────────────")
+
+conn = fresh_conn()
+
+# Valid customer ID (min 4 chars)
+ev_valid = fake_event(customer="cus_123")
+r = L.process_stripe_event(conn, ev_valid)
+chk("customer 'cus_123' → POSTED", r["outcome"] == "POSTED")
+
+# Invalid customer ID (too short)
+ev_short = fake_event(eid="evt_short_cus", customer="cus")
+r = L.process_stripe_event(conn, ev_short)
+chk("customer 'cus' (3 chars) → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+# Invalid customer ID (empty)
+ev_empty = fake_event(eid="evt_empty_cus", customer="")
+r = L.process_stripe_event(conn, ev_empty)
+chk("customer '' (empty) → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+
+print("\n── Phase 1: Amount Validation (Fallback + Non-Negative) ────────────────")
+
+conn = fresh_conn()
+
+# Valid: amount_paid provided
+ev_amount_paid = fake_event(eid="evt_amt_1", amount=5000)
+r = L.process_stripe_event(conn, ev_amount_paid)
+chk("amount_paid 5000 → POSTED", r["outcome"] == "POSTED")
+
+# Invalid: negative amount_paid
+ev_negative = fake_event(eid="evt_negative", amount=-5000)
+r = L.process_stripe_event(conn, ev_negative)
+chk("amount_paid -5000 → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+# Valid: fallback to amount field (when amount_paid is None)
+ev_amount_fallback = {
+    "id": "evt_amount_fallback",
+    "type": "invoice.paid",
+    "data": {"object": {
+        "customer": "cus_fallback",
+        "amount_paid": None,  # Try fallback
+        "amount": 3000,
+        "currency": "usd",
+    }},
+    "request": {},
+}
+r = L.process_stripe_event(conn, ev_amount_fallback)
+chk("amount (fallback from amount_paid) → POSTED", r["outcome"] == "POSTED")
+
+# Invalid: both amount_paid and amount missing
+ev_no_amount = {
+    "id": "evt_no_amount",
+    "type": "invoice.paid",
+    "data": {"object": {
+        "customer": "cus_no_amount",
+        "amount_paid": None,
+        "amount": None,
+        "currency": "usd",
+    }},
+    "request": {},
+}
+r = L.process_stripe_event(conn, ev_no_amount)
+chk("both amount fields None → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+
+print("\n── Phase 1: EventType Enum Validation ─────────────────────────────────")
+
+conn = fresh_conn()
+
+# Valid: supported event types
+ev_valid_type = fake_event(etype="invoice.paid")
+r = L.process_stripe_event(conn, ev_valid_type)
+chk("event type 'invoice.paid' → POSTED", r["outcome"] == "POSTED")
+
+# Invalid: unsupported event type
+ev_invalid_type = fake_event(eid="evt_bad_type", etype="payment.created")
+r = L.process_stripe_event(conn, ev_invalid_type)
+chk("event type 'payment.created' → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+
+print("\n── Phase 1: Missing Required Fields ───────────────────────────────────")
+
+conn = fresh_conn()
+
+# Missing 'id'
+ev_no_id = {
+    "id": "",
+    "type": "invoice.paid",
+    "data": {"object": {"customer": "cus_123", "amount_paid": 5000, "currency": "usd"}},
+}
+r = L.process_stripe_event(conn, ev_no_id)
+chk("empty id → DLQ_INVALID", r["outcome"] == "DLQ_INVALID")
+
+# Missing 'type'
+ev_no_type = {
+    "id": "evt_no_type",
+    "type": "",
+    "data": {"object": {"customer": "cus_123", "amount_paid": 5000, "currency": "usd"}},
+}
+r = L.process_stripe_event(conn, ev_no_type)
+chk("empty type → DLQ_INVALID", r["outcome"] == "DLQ_INVALID")
+
+# Missing 'data.object.customer'
+ev_no_customer = {
+    "id": "evt_no_cus",
+    "type": "invoice.paid",
+    "data": {"object": {"amount_paid": 5000, "currency": "usd"}},
+}
+r = L.process_stripe_event(conn, ev_no_customer)
+chk("missing customer → DLQ_INVALID", r["outcome"] == "DLQ_INVALID")
+
 
 print("\n── Idempotency guard ────────────────────────────────────────────────")
 
@@ -112,9 +245,10 @@ conn2 = fresh_conn()
 r = L.process_stripe_event(conn2, {"id": "", "type": "invoice.paid", "data": {}})
 chk("empty id → DLQ_INVALID",      r["outcome"] == "DLQ_INVALID")
 
-# Unknown event type
+# Unknown event type (now caught by Pydantic Enum validation as DLQ_INVALID, not DLQ_UNKNOWN_TYPE)
 r = L.process_stripe_event(conn2, fake_event(eid="evt_x", etype="payment.created"))
-chk("unknown type → DLQ_UNKNOWN_TYPE", r["outcome"] == "DLQ_UNKNOWN_TYPE")
+chk("unknown type → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']} instead of DLQ_INVALID")
 
 dlq_count = conn2.execute("SELECT COUNT(*) FROM dlq").fetchone()[0]
 chk("DLQ has 2 rows",  dlq_count == 2)
