@@ -132,6 +132,39 @@ class StripeEvent(BaseModel):
                 self.idempotency_key = self.request.get("idempotency_key", self.id)
         return self
 
+    @model_validator(mode='after')
+    def check_invoice_amount_nonzero(self):
+        """Cross-field: invoice events must carry a non-zero amount.
+
+        invoice.paid with $0 = no revenue received.
+        invoice.payment_failed with $0 = nothing to retry.
+        Both are data quality failures, not valid events.
+        """
+        invoice_types = {EventType.INVOICE_PAID, EventType.INVOICE_FAILED}
+        if self.type in invoice_types:
+            amount = self.data.object.get_amount()
+            if amount == 0:
+                raise ValueError(
+                    f"{self.type.value} must have amount > 0 "
+                    f"(got 0 — route to DLQ for manual review)"
+                )
+        return self
+
+    @model_validator(mode='after')
+    def check_customer_id_format(self):
+        """Cross-field: Stripe customer IDs always start with 'cus_'.
+
+        min_length=4 on StripeObject catches empty/short strings.
+        This validator catches structurally wrong IDs like 'abc123'
+        that pass length but are not Stripe customer IDs.
+        """
+        if not self.data.object.customer.startswith("cus_"):
+            raise ValueError(
+                f"Customer ID must start with 'cus_': "
+                f"got '{self.data.object.customer}'"
+            )
+        return self
+
 
 class LedgerStatus(str, Enum):
     """Ledger row statuses used for downstream business rules."""
