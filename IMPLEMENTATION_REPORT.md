@@ -204,6 +204,74 @@ errores antes de lanzar la excepción."
 
 ---
 
+## Audit Trail Hardening (COMPLETE)
+
+**Commit:** `3e33ed4`
+**Tests:** 101/101 — unchanged
+
+### What the PDF said:
+Nothing. This isn't in the PDF. This is production discipline applied to a PoC.
+The rule: in fintech, missing data is a liability. Silent failures are fraud-adjacent.
+If something went wrong, there must always be a log line that proves it happened.
+
+### What we fixed:
+
+**1. `_write_dlq` bare `except: pass` → structured ERROR log**
+
+The old code:
+```python
+except Exception:
+    pass
+```
+That's "I know something failed and I chose not to tell anyone." In a billing system
+that's not acceptable. The fix:
+
+```python
+except Exception as exc:
+    _log.error(
+        "DLQ write failed — payload preserved here for manual recovery. "
+        "transaction_id=%s reason=%s error=%r raw_payload=%s",
+        entry.transaction_id, entry.reason.value, exc,
+        json.dumps(entry.raw_payload),
+    )
+```
+
+The full raw payload is in the log line as JSON. An operator can grep `billing_ledger.log`
+for "DLQ write failed", extract the `raw_payload` field, and replay every entry manually.
+Nothing disappears. The hot path still doesn't raise. Both requirements satisfied.
+
+**2. `GET /dlq/entries` endpoint**
+
+Before: DLQ was write-only from an HTTP perspective. You could see the depth.
+You could not see what was in there without querying SQLite.
+After: `GET /dlq/entries?limit=N` returns newest entries first, raw payload deserialized.
+
+For the AltScore demo: this is the endpoint the ops team would use to triage failures.
+Without it, "check the DLQ" means "SSH into the box and open a sqlite3 prompt."
+
+**3. Dead code: `SUPPORTED_EVENT_TYPES` removed**
+
+```python
+# was:
+SUPPORTED_EVENT_TYPES = {e.value for e in EventType}
+```
+Never referenced after the Pydantic refactor. The benchmark and test were updated to use
+`random.choice(list(EventType)).value` directly. The set was a landmine — a future
+reader might assume it was authoritative and not realize the enum is.
+
+**4. Unreachable branch removed from `check_amount_present`**
+
+```python
+# was:
+if actual_amount < 0:
+    raise ValueError(...)
+```
+`ge=0` on the Field definitions means Pydantic rejects negatives before the validator
+runs. This branch could never fire. Keeping it is technically wrong (it implies it
+can happen) and practically misleading (reviewer spends time verifying it can't).
+
+---
+
 ## API Key — Where It Lives and Why It Matters
 
 Added after Phase 3. Two spots in [ledger.py](ledger.py):
@@ -356,6 +424,7 @@ need Postgres, so this is also good evidence for that migration.
 ## Git Log Summary
 
 ```
+3e33ed4  fix: audit trail hardening — no silent failures, no dead code
 d5b56df  Phase 5: Integration tests — HTTP layer, concurrency, outbox dispatch, DLQ
 b2dac5b  docs: Add Phase 3 section and API key to both README and private report
 d82e729  Phase 3: Cross-field business logic validators
