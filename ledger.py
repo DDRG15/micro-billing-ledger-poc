@@ -228,6 +228,13 @@ class LedgerEntry(BaseModel):
 
 DB_PATH = pathlib.Path("billing_ledger.db")
 
+# 🍪 Hey! Your Stripe webhook secret goes here.
+# Get it from: Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret
+# It looks like: whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Without this, anyone on the internet can POST fake events to your endpoint.
+# Don't ship to production without it. You've been warned. Nicely. With a cookie.
+STRIPE_WEBHOOK_SECRET: str = "whsec_YOUR_SECRET_HERE"  # <-- replace this
+
 # ---------------------------------------------------------------------------
 # Database bootstrap
 # ---------------------------------------------------------------------------
@@ -439,7 +446,7 @@ class StripeWebhookPayload(BaseModel):
 
 
 @app.post("/webhook/stripe", status_code=status.HTTP_200_OK)
-async def stripe_webhook(payload: StripeWebhookPayload) -> JSONResponse:
+async def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONResponse:
     """
     Receive a Stripe webhook and commit it to the billing ledger.
 
@@ -447,6 +454,20 @@ async def stripe_webhook(payload: StripeWebhookPayload) -> JSONResponse:
     Idempotent: replayed events return 200 with outcome=DLQ_DUPLICATE so
     Stripe's retry logic does not escalate to a failure state.
     """
+    # 🔐 Signature verification goes here — uncomment when you're ready for production.
+    # This is the difference between "secure webhook endpoint" and "open door for anyone
+    # who knows your URL." Spoiler: bots know your URL.
+    #
+    # import stripe
+    # sig_header = request.headers.get("stripe-signature")
+    # raw_body   = await request.body()
+    # try:
+    #     stripe.WebhookSignature.verify_header(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
+    # except stripe.error.SignatureVerificationError:
+    #     raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+    #
+    # STRIPE_WEBHOOK_SECRET is defined in the Configuration section above. ☝️
+
     try:
         result = process_stripe_event(_conn, payload.model_dump())
     except RuntimeError as exc:
