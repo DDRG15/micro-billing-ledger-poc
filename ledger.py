@@ -133,6 +133,62 @@ class StripeEvent(BaseModel):
         return self
 
 
+class LedgerStatus(str, Enum):
+    """Ledger row statuses used for downstream business rules."""
+    POSTED = "POSTED"
+    PENDING = "PENDING"
+    VOID = "VOID"
+
+
+class DLQReason(str, Enum):
+    """Structured DLQ reasons for audit and replay safety."""
+    DUPLICATE = "DUPLICATE"
+    INVALID = "INVALID"
+    UNKNOWN_TYPE = "UNKNOWN_TYPE"
+
+
+class DLQEntry(BaseModel):
+    """A dead-letter queue record for invalid or replayed payloads."""
+    transaction_id: str = Field(min_length=1)
+    reason: DLQReason
+    raw_payload: dict
+    received_at: float = Field(default_factory=time.time)
+
+    def to_db(self) -> tuple:
+        return (
+            self.transaction_id,
+            self.reason.value,
+            json.dumps(self.raw_payload),
+            self.received_at,
+        )
+
+
+class LedgerEntry(BaseModel):
+    """Represents a validated ledger row ready for database insertion."""
+    transaction_id: str = Field(min_length=1)
+    event_type: EventType
+    customer_id: str = Field(min_length=4)
+    amount_cents: int = Field(ge=0)
+    currency: str = Field(pattern=r"^[a-z]{3}$")
+    status: LedgerStatus
+    idempotency_key: str = Field(min_length=1)
+    payload: str
+    created_at: float
+
+    def to_db(self) -> tuple:
+        return (
+            self.transaction_id,
+            self.event_type.value,
+            self.customer_id,
+            self.amount_cents,
+            self.currency,
+            self.status.value,
+            self.idempotency_key,
+            self.payload,
+            self.created_at,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -203,12 +259,12 @@ def _tx(conn: sqlite3.Connection) -> Generator[sqlite3.Cursor, None, None]:
 SUPPORTED_EVENT_TYPES = {e.value for e in EventType}
 
 # Maps EventType -> ledger status (type-safe via Enum)
-_STATUS_MAP: dict[EventType, str] = {
-    EventType.INVOICE_PAID:     "POSTED",
-    EventType.INVOICE_FAILED:   "VOID",
-    EventType.SUB_CREATED:      "POSTED",
-    EventType.SUB_DELETED:      "VOID",
-    EventType.SUB_UPDATED:      "PENDING",
+_STATUS_MAP: dict[EventType, LedgerStatus] = {
+    EventType.INVOICE_PAID:     LedgerStatus.POSTED,
+    EventType.INVOICE_FAILED:   LedgerStatus.VOID,
+    EventType.SUB_CREATED:      LedgerStatus.POSTED,
+    EventType.SUB_DELETED:      LedgerStatus.VOID,
+    EventType.SUB_UPDATED:      LedgerStatus.PENDING,
 }
 
 
@@ -231,20 +287,25 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
         validated_event = StripeEvent(**event)
     except ValidationError as e:
         # Invalid structure/types → Dead Letter Queue
-        transaction_id = event.get("id", "unknown")
-        _write_dlq(conn, transaction_id, "INVALID", event, now, e)
+        transaction_id = event.get("id") or "unknown"
+        dlq_entry = DLQEntry(
+            transaction_id=transaction_id,
+            reason=DLQReason.INVALID,
+            raw_payload=event,
+        )
+        _write_dlq(conn, dlq_entry)
         return {
             "outcome": "DLQ_INVALID",
             "transaction_id": transaction_id,
             "reason": f"Pydantic validation failed: {e.error_count()} errors"
         }
-    
+
     # ── Extract validated fields (now guaranteed to be valid types/values) ────
     transaction_id  = validated_event.id
     event_type      = validated_event.type
     data_object     = validated_event.data.object
     idempotency_key = validated_event.idempotency_key
-    
+
     # ── LAYER 2: Business Logic ────────────────────────────────────────────────
     # Extract billing data from validated object
     amount_cents = data_object.get_amount()  # Uses smart fallback logic
@@ -252,6 +313,18 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
     currency     = data_object.currency
     ledger_status = _STATUS_MAP[event_type]  # Now type-safe: EventType key
     payload_json  = json.dumps(event)
+
+    ledger_entry = LedgerEntry(
+        transaction_id=transaction_id,
+        event_type=event_type,
+        customer_id=customer_id,
+        amount_cents=amount_cents,
+        currency=currency,
+        status=ledger_status,
+        idempotency_key=idempotency_key,
+        payload=payload_json,
+        created_at=now,
+    )
     
     # ── Transactional Outbox: ledger + outbox in one atomic commit ────────────
     try:
@@ -263,8 +336,7 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
                    currency, status, idempotency_key, payload, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?)
                 """,
-                (transaction_id, event_type.value, customer_id, amount_cents,
-                 currency, ledger_status, idempotency_key, payload_json, now),
+                ledger_entry.to_db(),
             )
             inserted = cur.rowcount   # 1 = new row, 0 = duplicate ignored
 
@@ -284,7 +356,12 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
     # ── LAYER 3: DLQ Routing ───────────────────────────────────────────────────
     if inserted == 0:
         # Duplicate: idempotency guard fired (good!)
-        _write_dlq(conn, transaction_id, "DUPLICATE", event, now, None)
+        dlq_entry = DLQEntry(
+            transaction_id=transaction_id,
+            reason=DLQReason.DUPLICATE,
+            raw_payload=event,
+        )
+        _write_dlq(conn, dlq_entry)
         return {
             "outcome": "DLQ_DUPLICATE",
             "transaction_id": transaction_id,
@@ -293,29 +370,20 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
 
     # Success!
     return {
-        "outcome": ledger_status,
+        "outcome": ledger_status.value,
         "transaction_id": transaction_id,
         "reason": None
     }
 
 
-def _write_dlq(conn: sqlite3.Connection, transaction_id: str,
-               reason: str, event: dict, now: float, validation_error: Optional[ValidationError] = None) -> None:
-    """Best-effort DLQ append — never raises so the main path is unaffected.
-    
-    Args:
-        transaction_id: Stripe event ID
-        reason: DLQ reason code (DUPLICATE, INVALID, UNKNOWN_TYPE)
-        event: Raw event payload
-        now: Timestamp
-        validation_error: Optional Pydantic ValidationError with error details
-    """
+def _write_dlq(conn: sqlite3.Connection, entry: DLQEntry) -> None:
+    """Best-effort DLQ append — never raises so the main path is unaffected."""
     try:
         with _tx(conn) as cur:
             cur.execute(
                 "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at)"
                 " VALUES (?,?,?,?)",
-                (transaction_id, reason, json.dumps(event), now),
+                entry.to_db(),
             )
     except Exception:
         pass   # DLQ write failure must never kill the hot path
