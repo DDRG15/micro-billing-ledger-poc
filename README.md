@@ -209,6 +209,109 @@ Still a PoC, but now with guardrails that would make an auditor smile. Ready for
 
 ---
 
+## 🔧 Phase 2: Type-Safe Output Models (May 13, 2026)
+
+**Status:** The bouncers are now also checking what *leaves* the building. 60/60 tests passing. Data goes in dirty, comes out clean, and everything in between is auditable.
+
+Phase 1 locked down the entry. Phase 2 locked down the exit. DLQ entries and ledger rows are now Pydantic models — not free-form dicts that quietly accept anything you throw at them.
+
+### What Got Implemented
+
+**1. LedgerStatus Enum — No More Magic Strings**
+```python
+class LedgerStatus(str, Enum):
+    POSTED  = "POSTED"
+    PENDING = "PENDING"
+    VOID    = "VOID"
+```
+Before, `"POSTED"` was just a string. A typo like `"POSETD"` would sail right into the database with zero complaint. Now it's an enum — if it's not `LedgerStatus.POSTED`, it doesn't exist.
+
+**2. DLQReason Enum — Structured Failure Codes**
+```python
+class DLQReason(str, Enum):
+    DUPLICATE    = "DUPLICATE"
+    INVALID      = "INVALID"
+    UNKNOWN_TYPE = "UNKNOWN_TYPE"
+```
+Every DLQ entry now carries a typed reason. No freeform strings, no "I wonder what INVLAID means" six months from now.
+
+**3. DLQEntry Model — The DLQ Gets Its Own Bouncer**
+```python
+class DLQEntry(BaseModel):
+    transaction_id: str = Field(min_length=1)
+    reason:         DLQReason
+    raw_payload:    dict
+    received_at:    float = Field(default_factory=time.time)
+
+    def to_db(self) -> tuple:
+        return (self.transaction_id, self.reason.value,
+                json.dumps(self.raw_payload), self.received_at)
+```
+`to_db()` handles all serialization. The rest of the code stops caring about how DLQ rows are structured.
+
+**4. LedgerEntry Model — The Ledger Row Becomes a Contract**
+```python
+class LedgerEntry(BaseModel):
+    transaction_id:  str = Field(min_length=1)
+    event_type:      EventType
+    customer_id:     str = Field(min_length=4)
+    amount_cents:    int = Field(ge=0)
+    currency:        str = Field(pattern=r"^[a-z]{3}$")
+    status:          LedgerStatus
+    idempotency_key: str = Field(min_length=1)
+    payload:         str
+    created_at:      float
+
+    def to_db(self) -> tuple: ...
+```
+Nine fields, all validated, all serializable. The `INSERT` statement now receives a `to_db()` tuple instead of a bag of variables that could be in any order.
+
+**5. Type-Safe Status Mapping**
+```python
+_STATUS_MAP: dict[EventType, LedgerStatus] = {
+    EventType.INVOICE_PAID:   LedgerStatus.POSTED,
+    EventType.INVOICE_FAILED: LedgerStatus.VOID,
+    ...
+}
+```
+Before: a `dict[str, str]` that would `KeyError` at runtime if an EventType was missing.
+After: mypy can verify completeness at import time. New event types require a corresponding status.
+
+### What the Tests Now Cover
+
+**Phase 2 tests added (26 new, 60 total):**
+
+| Test group | What it verifies |
+|---|---|
+| DLQEntry model | Valid build, to_db() 4-tuple format, enum rejection, empty id rejection |
+| LedgerEntry model | Valid build, to_db() 9-tuple format, negative amount, uppercase currency, short customer_id |
+| DB DLQ rows | DUPLICATE and INVALID written correctly at DB level |
+| LedgerStatus enum | POSTED, PENDING, VOID values; status map routing |
+
+**Performance:** 16,628 TPS (5,000 events in 0.301s) — got faster, not slower.
+
+### Errors We Fixed This Round
+
+**1. Windows UTF-8 Encoding**
+- The test runner crashed on Windows with `UnicodeEncodeError` on Unicode separators
+- Fixed: Added `sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")` at test startup
+- Lesson: Unicode in print statements is fine until it isn't. Windows CP-1252 has opinions.
+
+**2. DLQEntry Empty ID**
+- A missing Stripe `id` field produces `"unknown"` fallback before DLQEntry creation
+- `DLQEntry` itself enforces `min_length=1` — the fallback happens *before* model creation, not inside it
+- This is the correct boundary: business logic handles the empty case, the model enforces non-empty
+
+### What This Means for Production
+
+**Before Phase 2:** `INSERT INTO ledger ... VALUES (transaction_id, event_type, ...)` — variables assembled manually, order matters, nothing validates the combination.
+
+**After Phase 2:** `ledger_entry.to_db()` — a validated tuple from a model that can't hold invalid data. If you somehow build a `LedgerEntry` with `amount_cents=-1`, Pydantic catches it before the SQL runs.
+
+The pipeline is now clean end-to-end: dirty data in → Pydantic-validated model out → typed tuple into the database. No more "how did a negative amount get in there."
+
+---
+
 ## ⚡ Performance: Tactical Speed
 
 Bypassing the HTTP overhead to measure pure ledger throughput:
