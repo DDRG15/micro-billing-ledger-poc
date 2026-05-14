@@ -4,11 +4,15 @@ test_ledger.py — smoke tests for ledger.py (Phase 1: Pydantic Validation)
 Run: python test_ledger.py
 """
 
+import io
 import json
 import sqlite3
 import sys
 import time
 import pathlib
+
+# Force UTF-8 output on Windows so Unicode separators print correctly
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 import ledger as L   # Direct import — all dependencies installed
 
@@ -297,6 +301,165 @@ print(f"         {N:,} events in {elapsed:.3f}s  →  {tps:,.0f} TPS  "
       f"(single-core, SQLite in-memory)")
 
 # =============================================================================
+print("\n── Phase 2: DLQEntry model ──────────────────────────────────────────────")
+
+from pydantic import ValidationError as PydanticValidationError
+
+# Valid DLQEntry builds correctly
+entry = L.DLQEntry(
+    transaction_id="evt_test_001",
+    reason=L.DLQReason.DUPLICATE,
+    raw_payload={"id": "evt_test_001"},
+)
+chk("DLQEntry builds with valid data", entry.transaction_id == "evt_test_001")
+chk("DLQEntry reason is enum value",  entry.reason == L.DLQReason.DUPLICATE)
+
+# to_db() returns the right 4-tuple
+db_row = entry.to_db()
+chk("DLQEntry.to_db() is 4-tuple",         len(db_row) == 4)
+chk("to_db() reason is string not enum",   db_row[1] == "DUPLICATE")
+chk("to_db() payload is JSON string",      db_row[2] == '{"id": "evt_test_001"}')
+chk("to_db() received_at is float",        isinstance(db_row[3], float))
+
+# DLQReason rejects unknown values
+try:
+    L.DLQEntry(
+        transaction_id="evt_x",
+        reason="TYPO",           # not in enum
+        raw_payload={},
+    )
+    chk("DLQEntry rejects unknown reason", False, "should have raised ValidationError")
+except (PydanticValidationError, ValueError):
+    chk("DLQEntry rejects unknown reason", True)
+
+# transaction_id must not be empty
+try:
+    L.DLQEntry(
+        transaction_id="",
+        reason=L.DLQReason.INVALID,
+        raw_payload={},
+    )
+    chk("DLQEntry rejects empty transaction_id", False, "should have raised ValidationError")
+except (PydanticValidationError, ValueError):
+    chk("DLQEntry rejects empty transaction_id", True)
+
+
+print("\n── Phase 2: LedgerEntry model ───────────────────────────────────────────")
+
+# Valid LedgerEntry builds and serializes
+le = L.LedgerEntry(
+    transaction_id="evt_le_001",
+    event_type=L.EventType.INVOICE_PAID,
+    customer_id="cus_abc123",
+    amount_cents=4900,
+    currency="usd",
+    status=L.LedgerStatus.POSTED,
+    idempotency_key="idem_evt_le_001",
+    payload='{"id": "evt_le_001"}',
+    created_at=1234567890.0,
+)
+chk("LedgerEntry builds with valid data",    le.transaction_id == "evt_le_001")
+chk("LedgerEntry status is LedgerStatus",   le.status == L.LedgerStatus.POSTED)
+
+# to_db() returns 9-tuple with string enum values
+db_row = le.to_db()
+chk("LedgerEntry.to_db() is 9-tuple",          len(db_row) == 9)
+chk("to_db() event_type is string not enum",   db_row[1] == "invoice.paid")
+chk("to_db() status is string not enum",       db_row[5] == "POSTED")
+chk("to_db() amount_cents is int",             db_row[3] == 4900)
+chk("to_db() created_at is float",             db_row[8] == 1234567890.0)
+
+# amount_cents cannot be negative
+try:
+    L.LedgerEntry(
+        transaction_id="evt_neg",
+        event_type=L.EventType.INVOICE_PAID,
+        customer_id="cus_abc",
+        amount_cents=-1,
+        currency="usd",
+        status=L.LedgerStatus.POSTED,
+        idempotency_key="idem_neg",
+        payload="{}",
+        created_at=0.0,
+    )
+    chk("LedgerEntry rejects negative amount_cents", False, "should have raised ValidationError")
+except (PydanticValidationError, ValueError):
+    chk("LedgerEntry rejects negative amount_cents", True)
+
+# currency must match ISO pattern
+try:
+    L.LedgerEntry(
+        transaction_id="evt_curr",
+        event_type=L.EventType.INVOICE_PAID,
+        customer_id="cus_abc",
+        amount_cents=100,
+        currency="USD",     # uppercase — invalid
+        status=L.LedgerStatus.POSTED,
+        idempotency_key="idem_curr",
+        payload="{}",
+        created_at=0.0,
+    )
+    chk("LedgerEntry rejects uppercase currency", False, "should have raised ValidationError")
+except (PydanticValidationError, ValueError):
+    chk("LedgerEntry rejects uppercase currency", True)
+
+# customer_id min_length=4
+try:
+    L.LedgerEntry(
+        transaction_id="evt_cus",
+        event_type=L.EventType.INVOICE_PAID,
+        customer_id="cus",   # 3 chars — too short
+        amount_cents=100,
+        currency="usd",
+        status=L.LedgerStatus.POSTED,
+        idempotency_key="idem_cus",
+        payload="{}",
+        created_at=0.0,
+    )
+    chk("LedgerEntry rejects short customer_id", False, "should have raised ValidationError")
+except (PydanticValidationError, ValueError):
+    chk("LedgerEntry rejects short customer_id", True)
+
+
+print("\n── Phase 2: DLQ rows in DB have correct structured reasons ──────────────")
+
+conn5 = fresh_conn()
+
+# Process valid event then replay to produce DUPLICATE
+ev_dup = fake_event(eid="evt_dup_check")
+L.process_stripe_event(conn5, ev_dup)
+L.process_stripe_event(conn5, ev_dup)   # replay → DUPLICATE
+
+# Process invalid event to produce INVALID
+ev_bad = fake_event(eid="evt_invalid_check", currency="WRONG")
+L.process_stripe_event(conn5, ev_bad)
+
+rows = conn5.execute(
+    "SELECT reason FROM dlq ORDER BY id"
+).fetchall()
+reasons = [r[0] for r in rows]
+chk("DB DLQ has 2 rows",                        len(reasons) == 2)
+chk("First DLQ row reason is DUPLICATE",        reasons[0] == "DUPLICATE")
+chk("Second DLQ row reason is INVALID",         reasons[1] == "INVALID")
+
+
+print("\n── Phase 2: LedgerStatus enum coverage ──────────────────────────────────")
+
+chk("LedgerStatus.POSTED value",   L.LedgerStatus.POSTED.value == "POSTED")
+chk("LedgerStatus.PENDING value",  L.LedgerStatus.PENDING.value == "PENDING")
+chk("LedgerStatus.VOID value",     L.LedgerStatus.VOID.value == "VOID")
+
+# Status map produces VOID for invoice.payment_failed
+conn6 = fresh_conn()
+ev_failed = fake_event(eid="evt_failed_001", etype="invoice.payment_failed")
+r = L.process_stripe_event(conn6, ev_failed)
+chk("invoice.payment_failed → VOID", r["outcome"] == "VOID", f"got {r['outcome']}")
+
+ev_sub_updated = fake_event(eid="evt_sub_upd", etype="customer.subscription.updated")
+r = L.process_stripe_event(conn6, ev_sub_updated)
+chk("subscription.updated → PENDING", r["outcome"] == "PENDING", f"got {r['outcome']}")
+
+
 print(f"\n{'='*60}")
 print(f"  {ok} passed | {fail} failed")
 if fail:
