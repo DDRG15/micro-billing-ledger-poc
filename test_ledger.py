@@ -460,6 +460,99 @@ r = L.process_stripe_event(conn6, ev_sub_updated)
 chk("subscription.updated → PENDING", r["outcome"] == "PENDING", f"got {r['outcome']}")
 
 
+print("\n── Phase 3: Cross-field validator — invoice amount > 0 ──────────────────")
+
+conn7 = fresh_conn()
+
+# invoice.paid with $0 must be rejected
+ev_zero_invoice = fake_event(eid="evt_zero_paid", etype="invoice.paid", amount=0)
+r = L.process_stripe_event(conn7, ev_zero_invoice)
+chk("invoice.paid with amount=0 → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+# invoice.payment_failed with $0 must also be rejected
+ev_zero_failed = {
+    "id": "evt_zero_failed",
+    "type": "invoice.payment_failed",
+    "data": {"object": {
+        "customer": "cus_abc123",
+        "amount_paid": 0,
+        "currency": "usd",
+    }},
+}
+r = L.process_stripe_event(conn7, ev_zero_failed)
+chk("invoice.payment_failed with amount=0 → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+
+# subscription events with amount=0 are fine — they are lifecycle events, not payments
+ev_sub_zero = {
+    "id": "evt_sub_zero",
+    "type": "customer.subscription.created",
+    "data": {"object": {
+        "customer": "cus_sub001",
+        "amount_paid": 0,
+        "currency": "usd",
+    }},
+}
+r = L.process_stripe_event(conn7, ev_sub_zero)
+chk("subscription.created with amount=0 → POSTED (lifecycle event, not payment)",
+    r["outcome"] == "POSTED", f"got {r['outcome']}")
+
+# invoice.paid with amount > 0 still works
+ev_valid_invoice = fake_event(eid="evt_valid_paid", etype="invoice.paid", amount=4900)
+r = L.process_stripe_event(conn7, ev_valid_invoice)
+chk("invoice.paid with amount=4900 → POSTED", r["outcome"] == "POSTED",
+    f"got {r['outcome']}")
+
+
+print("\n── Phase 3: Cross-field validator — customer ID format ──────────────────")
+
+conn8 = fresh_conn()
+
+# Customer without 'cus_' prefix must be rejected
+ev_bad_cus_fmt = fake_event(eid="evt_bad_cus_fmt", customer="abc1234567")
+r = L.process_stripe_event(conn8, ev_bad_cus_fmt)
+chk("customer 'abc1234567' (no cus_ prefix) → DLQ_INVALID",
+    r["outcome"] == "DLQ_INVALID", f"got {r['outcome']}")
+
+# Customer with correct 'cus_' prefix passes
+ev_good_cus = fake_event(eid="evt_good_cus", customer="cus_abc123")
+r = L.process_stripe_event(conn8, ev_good_cus)
+chk("customer 'cus_abc123' → POSTED", r["outcome"] == "POSTED",
+    f"got {r['outcome']}")
+
+# Edge case: exactly 'cus_' with no suffix — still 4 chars, passes length but...
+# 'cus_' = 4 chars, passes min_length=4, but is it a real ID?
+# We accept it — the format validator only checks the prefix, not minimum suffix length.
+ev_bare_prefix = fake_event(eid="evt_bare_cus", customer="cus_")
+r = L.process_stripe_event(conn8, ev_bare_prefix)
+chk("customer 'cus_' (prefix only, 4 chars) → POSTED (prefix valid, suffix optional)",
+    r["outcome"] == "POSTED", f"got {r['outcome']}")
+
+
+print("\n── Phase 3: Cross-field validators fire together ────────────────────────")
+
+conn9 = fresh_conn()
+
+# Both cross-field rules violated: invoice.paid + $0 + bad customer prefix
+# Pydantic collects ALL errors — the error report will mention both
+ev_double_bad = {
+    "id": "evt_double_bad",
+    "type": "invoice.paid",
+    "data": {"object": {
+        "customer": "notacustomer",  # no cus_ prefix
+        "amount_paid": 0,            # zero amount for invoice
+        "currency": "usd",
+    }},
+}
+r = L.process_stripe_event(conn9, ev_double_bad)
+chk("invoice.paid + $0 + bad customer → DLQ_INVALID", r["outcome"] == "DLQ_INVALID",
+    f"got {r['outcome']}")
+chk("reason mentions validation failures",
+    "validation" in r.get("reason", "").lower() or "Pydantic" in r.get("reason", ""),
+    f"got reason: {r.get('reason')}")
+
+
 print(f"\n{'='*60}")
 print(f"  {ok} passed | {fail} failed")
 if fail:
