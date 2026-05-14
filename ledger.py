@@ -14,11 +14,13 @@ Key design decisions / Decisiones de diseño clave
 --------------------------------------------------
 Idempotency guard / Guardia de Idempotencia:
   EN: Every Stripe event carries a unique `id` (e.g. "evt_3PxK..."). We use this
-      as the ledger primary key. INSERT OR IGNORE means a replayed webhook is a
-      no-op at the DB level — no application-level lock needed.
+      as the ledger primary key. INSERT INTO ledger ... ON CONFLICT (transaction_id)
+      DO NOTHING means a replayed webhook is a no-op at the DB level — no
+      application-level lock needed.
   ES: Cada evento de Stripe lleva un `id` único (ej. "evt_3PxK..."). Lo usamos
-      como clave primaria del libro. INSERT OR IGNORE significa que un webhook
-      repetido es un no-op a nivel de DB — no se necesita bloqueo a nivel aplicación.
+      como clave primaria del libro. INSERT INTO ledger ... ON CONFLICT (transaction_id)
+      DO NOTHING significa que un webhook repetido es un no-op a nivel de DB —
+      no se necesita bloqueo a nivel aplicación.
 
 Transactional Outbox / Outbox Transaccional:
   EN: The ledger row and the outbox row are written in the same BEGIN…COMMIT.
@@ -26,11 +28,13 @@ Transactional Outbox / Outbox Transaccional:
   ES: La fila del libro y la fila del outbox se escriben en el mismo BEGIN…COMMIT.
       Un worker downstream sigue el outbox y reenvía los eventos confirmados.
 
-WAL mode / Modo WAL:
-  EN: SQLite in WAL mode allows concurrent readers while the writer commits.
-      Pattern ports directly to Postgres (ON CONFLICT DO NOTHING) for production.
-  ES: SQLite en modo WAL permite lectores concurrentes mientras el escritor hace commit.
-      El patrón se porta directamente a Postgres (ON CONFLICT DO NOTHING) para producción.
+Idempotency (PostgreSQL) / Idempotencia (PostgreSQL):
+  EN: INSERT INTO ledger (...) VALUES (...) ON CONFLICT (transaction_id) DO NOTHING.
+      rowcount=0 after the INSERT means the event was already in the ledger — the
+      unique constraint on transaction_id rejected it silently. Route to DLQ_DUPLICATE.
+  ES: INSERT INTO ledger (...) VALUES (...) ON CONFLICT (transaction_id) DO NOTHING.
+      rowcount=0 después del INSERT significa que el evento ya estaba en el libro — la
+      restricción única en transaction_id lo rechazó silenciosamente. Enrutar a DLQ_DUPLICATE.
 
 Usage / Uso:
   uvicorn ledger:app --port 8000
@@ -45,9 +49,9 @@ Usage / Uso:
 import argparse       # EN: CLI argument parsing for --silent/--events flags / ES: Parseo de argumentos CLI para las banderas --silent/--events
 import json           # EN: JSON serialization for raw payload archiving / ES: Serialización JSON para archivo del payload crudo
 import logging        # EN: Structured log output to file and stderr / ES: Salida de log estructurado a archivo y stderr
-import sqlite3        # EN: Embedded database — sufficient for PoC, swap for PostgreSQL in prod / ES: Base de datos embebida — suficiente para PoC, cambiar a PostgreSQL en prod
+import os             # EN: DATABASE_URL env var lookup / ES: Lectura de la variable de entorno DATABASE_URL
 import time           # EN: Unix timestamps for created_at and received_at fields / ES: Timestamps Unix para campos created_at y received_at
-import pathlib        # EN: Cross-platform file path handling / ES: Manejo de rutas de archivo multiplataforma
+import psycopg2       # EN: PostgreSQL driver — replaces SQLite for production-grade storage / ES: Driver PostgreSQL — reemplaza SQLite para almacenamiento de grado producción
 from contextlib import contextmanager  # EN: @contextmanager for _tx() BEGIN/COMMIT wrapper / ES: @contextmanager para el wrapper BEGIN/COMMIT de _tx()
 from typing import Generator, Optional  # EN: Type hints for static analysis / ES: Hints de tipo para análisis estático
 from enum import Enum  # EN: Enums for EventType, LedgerStatus, DLQReason — prevents raw string drift / ES: Enums para EventType, LedgerStatus, DLQReason — previene drift de strings crudos
@@ -406,13 +410,11 @@ class DLQEntry(BaseModel):
     def to_db(self) -> tuple:
         """
         EN: Serializes the DLQEntry to an ordered 4-tuple for the INSERT statement.
-            .value on the enum converts it to a plain string — SQLite doesn't know
-            what a Python enum is. json.dumps on raw_payload preserves the full
-            structure as a JSON string in the TEXT column.
+            .value on the enum converts it to a plain string for the TEXT column.
+            json.dumps on raw_payload preserves the full structure as a JSON string.
         ES: Serializa el DLQEntry a una 4-tupla ordenada para el INSERT.
-            .value en el enum lo convierte a un string plano — SQLite no sabe
-            qué es un enum de Python. json.dumps en raw_payload preserva la
-            estructura completa como string JSON en la columna TEXT.
+            .value en el enum lo convierte a un string plano para la columna TEXT.
+            json.dumps en raw_payload preserva la estructura completa como string JSON.
         """
         return (
             self.transaction_id,
@@ -448,11 +450,11 @@ class LedgerEntry(BaseModel):
     def to_db(self) -> tuple:
         """
         EN: Serializes the LedgerEntry to an ordered 9-tuple for the INSERT statement.
-            .value on enum fields produces plain strings for SQLite TEXT columns.
+            .value on enum fields produces plain strings for TEXT columns.
             Column order here must match the INSERT statement in process_stripe_event
             exactly — any mismatch causes silent data corruption (wrong value in wrong column).
         ES: Serializa el LedgerEntry a una 9-tupla ordenada para el INSERT.
-            .value en campos enum produce strings planos para columnas TEXT de SQLite.
+            .value en campos enum produce strings planos para columnas TEXT.
             El orden de columnas aquí debe coincidir exactamente con el INSERT en
             process_stripe_event — cualquier discrepancia causa corrupción silenciosa
             de datos (valor incorrecto en columna incorrecta).
@@ -482,11 +484,18 @@ class LedgerEntry(BaseModel):
 #     instrucciones completas sobre activar la verificación de firma.
 # ===========================================================================
 
-# EN: Path to the SQLite database file. In Docker, this is overridden by the
-#     BILLING_DB_PATH environment variable and points to a /data volume mount.
-# ES: Ruta al archivo de base de datos SQLite. En Docker, esto es sobreescrito
-#     por la variable de entorno BILLING_DB_PATH y apunta a un montaje de volumen /data.
-DB_PATH = pathlib.Path("billing_ledger.db")
+# EN: PostgreSQL connection string. Set DATABASE_URL in your environment or .env file.
+#     Format: postgresql://user:password@host:port/dbname
+#     In Docker: pass via environment variable in docker run / compose.
+#     In tests: set DATABASE_URL to point at a dedicated test database (see docker-compose.yml).
+# ES: String de conexión PostgreSQL. Establecer DATABASE_URL en tu entorno o archivo .env.
+#     Formato: postgresql://usuario:contraseña@host:puerto/nombredb
+#     En Docker: pasar vía variable de entorno en docker run / compose.
+#     En tests: establecer DATABASE_URL apuntando a una base de datos de test dedicada (ver docker-compose.yml).
+DATABASE_URL: str = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/billing"
+)
 
 # EN: Stripe webhook signing secret. Replace with the real value from:
 #     Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret
@@ -513,111 +522,112 @@ STRIPE_WEBHOOK_SECRET: str = "whsec_YOUR_SECRET_HERE"  # <-- REPLACE BEFORE PROD
 #     habilitado para lecturas concurrentes mientras hay escrituras en progreso.
 # ===========================================================================
 
-def _bootstrap(path: pathlib.Path = DB_PATH) -> sqlite3.Connection:
+def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
     """
-    EN: Opens (or creates) the ledger database and returns a WAL-mode connection.
-        Three tables are created if they don't exist:
-        - ledger: the financial record — one row per unique Stripe event
-        - outbox: pending downstream delivery tasks — dispatched=0 means waiting
+    EN: Connects to PostgreSQL and ensures all three tables exist.
+        autocommit=True: each DDL/DML statement commits immediately unless wrapped
+        in an explicit BEGIN...COMMIT block (which _tx() provides for writes).
+        Tables use IF NOT EXISTS — safe to call on every startup and in every test.
+        Three tables:
+        - ledger: financial record — transaction_id TEXT PRIMARY KEY = idempotency guard
+        - outbox: pending downstream delivery — dispatched=0 means not yet forwarded
         - dlq: rejected events — DUPLICATE, INVALID, or UNKNOWN_TYPE
-        In production, replace with a psycopg2/asyncpg connection to PostgreSQL.
-        See BLUEPRINT_ANALYSIS.md §1 for the full migration path.
-    ES: Abre (o crea) la base de datos del libro y retorna una conexión en modo WAL.
-        Se crean tres tablas si no existen:
-        - ledger: el registro financiero — una fila por evento Stripe único
-        - outbox: tareas de entrega downstream pendientes — dispatched=0 significa esperando
+    ES: Se conecta a PostgreSQL y asegura que las tres tablas existan.
+        autocommit=True: cada sentencia DDL/DML hace commit inmediatamente a menos que
+        esté envuelta en un bloque BEGIN...COMMIT explícito (que _tx() provee para escrituras).
+        Las tablas usan IF NOT EXISTS — seguro llamar en cada inicio y en cada test.
+        Tres tablas:
+        - ledger: registro financiero — transaction_id TEXT PRIMARY KEY = guardia de idempotencia
+        - outbox: entrega downstream pendiente — dispatched=0 significa aún no reenviado
         - dlq: eventos rechazados — DUPLICATE, INVALID, o UNKNOWN_TYPE
-        En producción, reemplazar con una conexión psycopg2/asyncpg a PostgreSQL.
-        Ver BLUEPRINT_ANALYSIS.md §1 para la ruta de migración completa.
     """
-    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=10)
+    conn = psycopg2.connect(dsn)
+    # EN: autocommit=True so DDL (CREATE TABLE) and reads execute outside any transaction.
+    #     Write transactions use explicit BEGIN/COMMIT inside _tx().
+    # ES: autocommit=True para que DDL (CREATE TABLE) y lecturas ejecuten fuera de transacción.
+    #     Las transacciones de escritura usan BEGIN/COMMIT explícito dentro de _tx().
+    conn.autocommit = True
 
-    # EN: WAL mode — readers don't block writers and writers don't block readers.
-    #     Without WAL, a read during a write causes "database is locked" errors.
-    # ES: Modo WAL — los lectores no bloquean a los escritores y viceversa.
-    #     Sin WAL, una lectura durante una escritura causa errores "database is locked".
-    conn.execute("PRAGMA journal_mode=WAL;")
+    with conn.cursor() as cur:
+        # EN: ledger — one row per unique Stripe event. transaction_id is the PK and the
+        #     idempotency key. ON CONFLICT (transaction_id) DO NOTHING in the INSERT
+        #     is what makes the deduplication zero-lock at the database level.
+        # ES: ledger — una fila por evento Stripe único. transaction_id es el PK y la
+        #     clave de idempotencia. ON CONFLICT (transaction_id) DO NOTHING en el INSERT
+        #     es lo que hace la deduplicación sin bloqueo a nivel de base de datos.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ledger (
+                transaction_id  TEXT             PRIMARY KEY,
+                event_type      TEXT             NOT NULL,
+                customer_id     TEXT             NOT NULL,
+                amount_cents    INTEGER          NOT NULL,
+                currency        TEXT             NOT NULL DEFAULT 'usd',
+                status          TEXT             NOT NULL,
+                idempotency_key TEXT             NOT NULL,
+                payload         TEXT             NOT NULL,
+                created_at      DOUBLE PRECISION NOT NULL
+            )
+        """)
 
-    # EN: NORMAL sync — fsync on checkpoint, not on every commit. Faster than FULL.
-    #     Acceptable risk for a PoC; use FULL in production for crash safety.
-    # ES: Sync NORMAL — fsync en checkpoint, no en cada commit. Más rápido que FULL.
-    #     Riesgo aceptable para un PoC; usar FULL en producción para seguridad ante crashes.
-    conn.execute("PRAGMA synchronous=NORMAL;")
+        # EN: outbox — dispatched=0 rows are pending forwarding to a downstream system.
+        #     BIGSERIAL gives a monotonically increasing id for ordered processing.
+        # ES: outbox — las filas dispatched=0 están pendientes de reenvío a un sistema downstream.
+        #     BIGSERIAL da un id monotónicamente creciente para procesamiento ordenado.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS outbox (
+                id              BIGSERIAL        PRIMARY KEY,
+                transaction_id  TEXT             NOT NULL,
+                event_type      TEXT             NOT NULL,
+                payload         TEXT             NOT NULL,
+                dispatched      INTEGER          NOT NULL DEFAULT 0,
+                created_at      DOUBLE PRECISION NOT NULL
+            )
+        """)
 
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS ledger (
-            transaction_id  TEXT    PRIMARY KEY,
-            -- EN: Maps directly to Stripe event ID — the idempotency key at DB level
-            -- ES: Mapea directamente al ID de evento Stripe — la clave de idempotencia a nivel DB
-            event_type      TEXT    NOT NULL,
-            -- EN: Stored as string (EventType.value) — validated before insert
-            -- ES: Almacenado como string (EventType.value) — validado antes de insertar
-            customer_id     TEXT    NOT NULL,
-            amount_cents    INTEGER NOT NULL,
-            -- EN: Always non-negative (ge=0 enforced by Pydantic before this point)
-            -- ES: Siempre no negativo (ge=0 aplicado por Pydantic antes de este punto)
-            currency        TEXT    NOT NULL DEFAULT 'usd',
-            status          TEXT    NOT NULL,
-            -- EN: POSTED | PENDING | VOID — LedgerStatus enum values
-            -- ES: POSTED | PENDING | VOID — valores del enum LedgerStatus
-            idempotency_key TEXT    NOT NULL,
-            payload         TEXT    NOT NULL,
-            -- EN: Full JSON payload archived for outbox replay and audit
-            -- ES: Payload JSON completo archivado para reproducción del outbox y auditoría
-            created_at      REAL    NOT NULL
-            -- EN: Unix epoch float — consistent with time.time() calls in Python
-            -- ES: Float de época Unix — consistente con llamadas time.time() en Python
-        );
+        # EN: dlq — every rejected event lands here with a structured reason code.
+        #     raw_payload is the full original JSON, preserved byte-perfect for replay.
+        # ES: dlq — cada evento rechazado aterriza aquí con un código de razón estructurado.
+        #     raw_payload es el JSON original completo, preservado byte-perfecto para reproducción.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS dlq (
+                id              BIGSERIAL        PRIMARY KEY,
+                transaction_id  TEXT             NOT NULL,
+                reason          TEXT             NOT NULL,
+                raw_payload     TEXT             NOT NULL,
+                received_at     DOUBLE PRECISION NOT NULL
+            )
+        """)
 
-        CREATE TABLE IF NOT EXISTS outbox (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            transaction_id  TEXT    NOT NULL,
-            event_type      TEXT    NOT NULL,
-            payload         TEXT    NOT NULL,
-            dispatched      INTEGER NOT NULL DEFAULT 0,
-            -- EN: 0=pending (not yet sent downstream), 1=sent (worker has processed it)
-            -- ES: 0=pendiente (aún no enviado downstream), 1=enviado (el worker lo procesó)
-            created_at      REAL    NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS dlq (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            transaction_id  TEXT    NOT NULL,
-            reason          TEXT    NOT NULL,
-            -- EN: DUPLICATE | INVALID | UNKNOWN_TYPE — DLQReason enum values
-            -- ES: DUPLICATE | INVALID | UNKNOWN_TYPE — valores del enum DLQReason
-            raw_payload     TEXT    NOT NULL,
-            -- EN: Complete original JSON — never corrected, never truncated
-            -- ES: JSON original completo — nunca corregido, nunca truncado
-            received_at     REAL    NOT NULL
-        );
-    """)
-    conn.commit()
     return conn
 
 
 @contextmanager
-def _tx(conn: sqlite3.Connection) -> Generator[sqlite3.Cursor, None, None]:
+def _tx(conn: "psycopg2.extensions.connection") -> Generator["psycopg2.extensions.cursor", None, None]:
     """
-    EN: Minimal explicit transaction context manager. Wraps BEGIN…COMMIT/ROLLBACK.
-        Used instead of SQLite's implicit transaction mode to make the
-        transactional outbox pattern explicit: both the ledger write and the
-        outbox write happen in the same BEGIN…COMMIT block. If either fails,
-        both roll back — no orphaned outbox rows without ledger rows.
-    ES: Gestor de contexto de transacción explícita mínima. Envuelve BEGIN…COMMIT/ROLLBACK.
-        Usado en lugar del modo de transacción implícita de SQLite para hacer el
-        patrón de outbox transaccional explícito: tanto la escritura en el libro como
-        la escritura en el outbox ocurren en el mismo bloque BEGIN…COMMIT. Si alguna
-        falla, ambas hacen rollback — sin filas huérfanas del outbox sin filas del libro.
+    EN: Explicit transaction context manager for PostgreSQL. Issues BEGIN, yields
+        a cursor for the caller's statements, then COMMIT on success or ROLLBACK
+        on any exception. Because the connection runs with autocommit=True, we need
+        explicit BEGIN to group multiple statements into one atomic transaction.
+        This is what makes the transactional outbox atomic: the ledger INSERT and
+        the outbox INSERT both succeed or both roll back — no half-written state.
+    ES: Gestor de contexto de transacción explícita para PostgreSQL. Emite BEGIN,
+        cede un cursor para las sentencias del llamador, luego COMMIT en éxito o
+        ROLLBACK en cualquier excepción. Como la conexión corre con autocommit=True,
+        necesitamos BEGIN explícito para agrupar múltiples sentencias en una
+        transacción atómica. Esto es lo que hace el outbox transaccional atómico:
+        el INSERT del libro y el INSERT del outbox ambos tienen éxito o ambos hacen
+        rollback — sin estado medio-escrito.
     """
     cur = conn.cursor()
-    conn.execute("BEGIN")
+    cur.execute("BEGIN")
     try:
         yield cur
-        conn.commit()
+        cur.execute("COMMIT")
     except Exception:
-        conn.rollback()
+        cur.execute("ROLLBACK")
         raise
+    finally:
+        cur.close()
 
 
 # ===========================================================================
@@ -651,7 +661,7 @@ _STATUS_MAP: dict[EventType, LedgerStatus] = {
 }
 
 
-def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
+def process_stripe_event(conn: "psycopg2.extensions.connection", event: dict) -> dict:
     """
     EN: Idempotently inserts a Stripe event into the ledger and outbox.
 
@@ -754,27 +764,28 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
 
     # ── Transactional Outbox: atomic dual-write ───────────────────────────────
     # EN: The ledger INSERT and the outbox INSERT are in the same BEGIN…COMMIT.
-    #     If the process crashes after HTTP 200 but before the outbox write,
-    #     the outbox row survives. A downstream worker picks it up on restart.
-    #     rowcount=1 means genuinely new; rowcount=0 means INSERT OR IGNORE fired
-    #     (duplicate — the unique PK constraint rejected it silently).
+    #     ON CONFLICT (transaction_id) DO NOTHING is the idempotency guard:
+    #     if the event ID already exists in the ledger, the INSERT silently skips.
+    #     rowcount=1 = new event, committed to both ledger and outbox.
+    #     rowcount=0 = duplicate, ON CONFLICT fired, nothing written.
     # ES: El INSERT del libro y el INSERT del outbox están en el mismo BEGIN…COMMIT.
-    #     Si el proceso se cuelga después del HTTP 200 pero antes de la escritura
-    #     del outbox, la fila del outbox sobrevive. Un worker downstream la recoge
-    #     al reiniciar. rowcount=1 significa genuinamente nuevo; rowcount=0 significa
-    #     que INSERT OR IGNORE se disparó (duplicado — la restricción de PK única lo rechazó silenciosamente).
+    #     ON CONFLICT (transaction_id) DO NOTHING es la guardia de idempotencia:
+    #     si el ID de evento ya existe en el libro, el INSERT se omite silenciosamente.
+    #     rowcount=1 = evento nuevo, commiteado tanto al libro como al outbox.
+    #     rowcount=0 = duplicado, ON CONFLICT se disparó, nada escrito.
     try:
         with _tx(conn) as cur:
             cur.execute(
                 """
-                INSERT OR IGNORE INTO ledger
+                INSERT INTO ledger
                   (transaction_id, event_type, customer_id, amount_cents,
                    currency, status, idempotency_key, payload, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (transaction_id) DO NOTHING
                 """,
                 ledger_entry.to_db(),
             )
-            inserted = cur.rowcount  # EN: 1=new row inserted, 0=duplicate ignored / ES: 1=fila nueva insertada, 0=duplicado ignorado
+            inserted = cur.rowcount  # EN: 1=new row inserted, 0=ON CONFLICT fired (duplicate) / ES: 1=fila nueva insertada, 0=ON CONFLICT disparado (duplicado)
 
             if inserted == 1:
                 # EN: Only write outbox row for genuinely new events — not for duplicates.
@@ -784,15 +795,15 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
                 cur.execute(
                     """
                     INSERT INTO outbox (transaction_id, event_type, payload, created_at)
-                    VALUES (?,?,?,?)
+                    VALUES (%s, %s, %s, %s)
                     """,
                     (transaction_id, event_type.value, payload_json, now),
                 )
-    except sqlite3.OperationalError as exc:
-        # EN: DB-level error (locked, corrupt, disk full). Raise RuntimeError so the
+    except psycopg2.OperationalError as exc:
+        # EN: DB-level error (connection lost, server down). Raise RuntimeError so the
         #     FastAPI handler converts it to HTTP 503 — telling Stripe to retry.
         #     503 is the correct response; 200 would tell Stripe "got it, stop retrying."
-        # ES: Error a nivel DB (bloqueada, corrupta, disco lleno). Lanzar RuntimeError para
+        # ES: Error a nivel DB (conexión perdida, servidor caído). Lanzar RuntimeError para
         #     que el manejador FastAPI lo convierta en HTTP 503 — diciéndole a Stripe que reintente.
         #     503 es la respuesta correcta; 200 le diría a Stripe "recibido, deja de reintentar".
         raise RuntimeError(f"DB write failed: {exc}") from exc
@@ -829,7 +840,7 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
     }
 
 
-def _write_dlq(conn: sqlite3.Connection, entry: DLQEntry) -> None:
+def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
     """
     EN: Best-effort DLQ append. Deliberately never raises — the main processing
         path must not die because the DLQ is unavailable. If the DB write fails
@@ -849,7 +860,7 @@ def _write_dlq(conn: sqlite3.Connection, entry: DLQEntry) -> None:
         with _tx(conn) as cur:
             cur.execute(
                 "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at)"
-                " VALUES (?,?,?,?)",
+                " VALUES (%s, %s, %s, %s)",
                 entry.to_db(),
             )
     except Exception as exc:
@@ -885,12 +896,14 @@ def _write_dlq(conn: sqlite3.Connection, entry: DLQEntry) -> None:
 
 app   = FastAPI(title="Micro-Billing-Ledger PoC", version="1.0.0")
 
-# EN: Module-level DB connection — shared across all requests in a single process.
-#     In tests, this is patched to an in-memory connection: L._conn = test_conn.
-#     In production with PostgreSQL, use a connection pool (psycopg2.pool or asyncpg).
-# ES: Conexión DB a nivel de módulo — compartida entre todas las solicitudes en un
-#     solo proceso. En tests, esto se parchea a una conexión en memoria: L._conn = test_conn.
-#     En producción con PostgreSQL, usar un pool de conexiones (psycopg2.pool o asyncpg).
+# EN: Module-level PostgreSQL connection — shared across all requests in a single process.
+#     In tests, this is patched to a dedicated test connection: L._conn = test_conn.
+#     For production at scale, replace with psycopg2.pool.ThreadedConnectionPool or asyncpg.
+#     DATABASE_URL controls which PostgreSQL instance this connects to.
+# ES: Conexión PostgreSQL a nivel de módulo — compartida entre todas las solicitudes en un
+#     solo proceso. En tests, esto se parchea a una conexión de test dedicada: L._conn = test_conn.
+#     Para producción a escala, reemplazar con psycopg2.pool.ThreadedConnectionPool o asyncpg.
+#     DATABASE_URL controla a qué instancia PostgreSQL se conecta.
 _conn = _bootstrap()
 
 
@@ -971,15 +984,22 @@ async def ledger_summary() -> JSONResponse:
         usar /metrics (ver BLUEPRINT_ANALYSIS.md §7 para implementación de Prometheus).
     """
     # EN: GROUP BY status gives {POSTED: N, VOID: N, PENDING: N} in one query.
+    #     All three SELECT statements are reads — no explicit transaction needed
+    #     because autocommit=True on the module-level _conn.
     # ES: GROUP BY status da {POSTED: N, VOID: N, PENDING: N} en una sola consulta.
-    cur = _conn.execute(
-        "SELECT status, COUNT(*) FROM ledger GROUP BY status"
-    )
-    counts         = {row[0]: row[1] for row in cur.fetchall()}
-    dlq_depth      = _conn.execute("SELECT COUNT(*) FROM dlq").fetchone()[0]
-    outbox_pending = _conn.execute(
-        "SELECT COUNT(*) FROM outbox WHERE dispatched=0"
-    ).fetchone()[0]
+    #     Las tres sentencias SELECT son lecturas — no se necesita transacción explícita
+    #     porque autocommit=True en el _conn a nivel de módulo.
+    with _conn.cursor() as cur:
+        cur.execute("SELECT status, COUNT(*) FROM ledger GROUP BY status")
+        counts = {row[0]: row[1] for row in cur.fetchall()}
+
+    with _conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM dlq")
+        dlq_depth = cur.fetchone()[0]
+
+    with _conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
+        outbox_pending = cur.fetchone()[0]
 
     return JSONResponse(content={
         "ledger":         counts,
@@ -992,20 +1012,22 @@ async def ledger_summary() -> JSONResponse:
 async def dlq_entries(limit: int = 50) -> JSONResponse:
     """
     EN: Inspect DLQ entries over HTTP — newest first. This is the ops endpoint:
-        without it, "check the DLQ" means "SSH into the box and open sqlite3."
+        without it, "check the DLQ" means "SSH into the box and run a psql query."
         Default limit 50; capped at 1000 to prevent accidental full-table dumps.
         raw_payload is deserialized so callers get a JSON object, not a string.
     ES: Inspeccionar entradas del DLQ por HTTP — más recientes primero. Este es
         el endpoint de ops: sin él, "revisar el DLQ" significa "SSH a la máquina
-        y abrir sqlite3". Límite por defecto 50; limitado a 1000 para prevenir
+        y ejecutar una consulta psql". Límite por defecto 50; limitado a 1000 para prevenir
         volcados accidentales de tabla completa. raw_payload está deserializado
         para que los llamadores obtengan un objeto JSON, no un string.
     """
-    rows = _conn.execute(
-        "SELECT id, transaction_id, reason, raw_payload, received_at "
-        "FROM dlq ORDER BY id DESC LIMIT ?",
-        (min(limit, 1000),),  # EN: cap at 1000 — never dump the entire table / ES: limitar a 1000 — nunca volcar toda la tabla
-    ).fetchall()
+    with _conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, transaction_id, reason, raw_payload, received_at "
+            "FROM dlq ORDER BY id DESC LIMIT %s",
+            (min(limit, 1000),),  # EN: cap at 1000 — never dump the entire table / ES: limitar a 1000 — nunca volcar toda la tabla
+        )
+        rows = cur.fetchall()
 
     return JSONResponse(content={
         "entries": [
@@ -1049,19 +1071,19 @@ async def health() -> JSONResponse:
 def _run_headless_benchmark(n: int = 10_000) -> None:
     """
     EN: Drives process_stripe_event() directly — no HTTP, no console I/O.
-        Uses an in-memory SQLite DB so results aren't skewed by disk I/O.
-        Each fake event gets a random ID so no duplicates — we're measuring
-        insert throughput, not idempotency overhead.
+        Connects to PostgreSQL via DATABASE_URL. Each fake event gets a random ID
+        so no duplicates — we're measuring insert throughput, not idempotency overhead.
+        PostgreSQL TPS is lower than SQLite in-memory (~1,000-3,000 vs ~15,000) because
+        of network round-trips and WAL fsync on the server side. That's the correct tradeoff.
     ES: Ejecuta process_stripe_event() directamente — sin HTTP, sin E/S de consola.
-        Usa una DB SQLite en memoria para que los resultados no estén sesgados por E/S de disco.
-        Cada evento falso obtiene un ID aleatorio para no tener duplicados — medimos
-        el throughput de inserción, no la sobrecarga de idempotencia.
+        Se conecta a PostgreSQL vía DATABASE_URL. Cada evento falso obtiene un ID aleatorio
+        para no tener duplicados — medimos el throughput de inserción, no la sobrecarga de
+        idempotencia. El TPS de PostgreSQL es menor que SQLite en memoria (~1,000-3,000 vs ~15,000)
+        debido a los round-trips de red y WAL fsync del lado del servidor. Ese es el tradeoff correcto.
     """
     import random, string
 
-    # EN: In-memory DB — fastest possible storage, no WAL file, no disk writes.
-    # ES: DB en memoria — almacenamiento más rápido posible, sin archivo WAL, sin escrituras en disco.
-    conn = _bootstrap(pathlib.Path(":memory:"))
+    conn = _bootstrap()
 
     def _fake_event(i: int) -> dict:
         """

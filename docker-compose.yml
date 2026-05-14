@@ -1,0 +1,75 @@
+# docker-compose.yml — Micro-Billing-Ledger PoC
+# ===============================================
+# EN: Spins up two services: a PostgreSQL database and the billing API.
+#     For running tests locally, start only the postgres service:
+#       docker-compose up -d postgres
+#       python test_ledger.py
+#     For running the full stack (API + DB together):
+#       docker-compose up
+#
+# ES: Levanta dos servicios: una base de datos PostgreSQL y la API de facturación.
+#     Para ejecutar tests localmente, iniciar solo el servicio postgres:
+#       docker-compose up -d postgres
+#       python test_ledger.py
+#     Para ejecutar el stack completo (API + DB juntos):
+#       docker-compose up
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # postgres — the database backend
+  # EN: PostgreSQL 16 Alpine. Data is persisted in a named volume (pgdata) so
+  #     it survives container restarts. The billing database and user are created
+  #     automatically by the POSTGRES_* environment variables.
+  # ES: PostgreSQL 16 Alpine. Los datos se persisten en un volumen con nombre (pgdata)
+  #     para que sobrevivan reinicios del contenedor. La base de datos y el usuario
+  #     billing se crean automáticamente por las variables de entorno POSTGRES_*.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB:       billing
+    ports:
+      # EN: 5432 exposed to localhost so tests can reach it without going through the API container.
+      # ES: 5432 expuesto a localhost para que los tests puedan alcanzarlo sin pasar por el contenedor API.
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # EN: pg_isready -U postgres exits 0 when PostgreSQL is accepting connections.
+      #     The billing service depends_on this healthcheck so it won't start until the DB is ready.
+      # ES: pg_isready -U postgres sale con 0 cuando PostgreSQL acepta conexiones.
+      #     El servicio billing depends_on este healthcheck para no iniciar hasta que la DB esté lista.
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # billing — the FastAPI application
+  # EN: Built from the Dockerfile in this directory. Connects to the postgres service
+  #     using the DATABASE_URL environment variable. Waits for postgres to be healthy
+  #     before starting (depends_on condition: service_healthy).
+  # ES: Construido desde el Dockerfile en este directorio. Se conecta al servicio postgres
+  #     usando la variable de entorno DATABASE_URL. Espera a que postgres esté saludable
+  #     antes de iniciar (depends_on condición: service_healthy).
+  # ---------------------------------------------------------------------------
+  billing:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/billing
+      STRIPE_WEBHOOK_SECRET: whsec_YOUR_SECRET_HERE
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  # EN: Named volume — persists PostgreSQL data between docker-compose down/up cycles.
+  #     To wipe all data and start fresh: docker-compose down -v
+  # ES: Volumen con nombre — persiste datos PostgreSQL entre ciclos docker-compose down/up.
+  #     Para borrar todos los datos y empezar de nuevo: docker-compose down -v
+  pgdata:
