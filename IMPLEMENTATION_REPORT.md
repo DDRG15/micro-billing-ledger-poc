@@ -266,23 +266,98 @@ Humans review. Humans decide. Humans contact. The system never assumes.
 
 ---
 
-## What's Left (Phase 5 — Integration Tests)
+## Phase 5 — Integration Tests (COMPLETE)
 
-This is the only remaining phase. The business logic pipeline is complete.
-What Phase 5 would add:
+**Commit:** `d5b56df`
+**Tests:** 101/101
 
-- End-to-end test through FastAPI (HTTP layer, not just `process_stripe_event()`)
-- Concurrent insertion test (two threads, same event ID, verify exactly 1 row)
-- DLQ replay test (mark a DLQ entry retryable, verify it processes correctly)
-- Outbox dispatch simulation (flip dispatched=1, verify pending count drops)
+### What the PDF said:
+The PDF doesn't cover FastAPI testing — this is production discipline, not study material.
+The principle is the same though: "testa en la capa donde vive el bug." The concurrency bug
+doesn't live in `process_stripe_event()`. It lives in the thread-connection boundary.
 
-None of these are blockers for the Makers Challenge demo. They're production hardening.
+### What we built:
+
+**HTTP layer (18 tests)** — TestClient fires actual HTTP requests at the FastAPI app.
+Not `process_stripe_event()` directly. Not a mock. A real in-memory SQLite database
+wired through the module connection reference (`L._conn = http_conn`), which means
+the full stack gets exercised: routing → handler → validation → ledger write → response.
+
+This is how you know the HTTP 200/503 split is correct, not just theoretically correct.
+
+**Concurrent insertion (4 tests)** — 5 threads, same event ID, simultaneous fire.
+
+```python
+posted = results.count("POSTED")
+dupes  = results.count("DLQ_DUPLICATE")
+assert posted == 1
+assert dupes  == 4
+```
+
+This is the whole reason for `INSERT OR IGNORE`. Either the math is exact or the test fails.
+No fudge factor. One POSTED, four DUPLICATE, nothing else.
+
+**Outbox dispatch simulation (4 tests)** — flip `dispatched=1`, verify `pending=0`.
+This is the state machine for the Temporal activity that doesn't exist yet in this PoC.
+Testing the state machine without the worker is legitimate — the state is the contract,
+and the worker just needs to honor it.
+
+**DLQ queryability (6 tests)** — raw payload preserved byte-perfect. The DLQ is only
+useful if you can query it and trust what you get back. Tested: reason codes correct,
+payloads round-trip without corruption, event type routing maps correctly to DLQ outcomes.
+
+### The Two Bugs We Hit:
+
+**Bug 1: DLQ count wrong in summary test**
+
+```python
+# Expected 3, got 4
+assert dlq_depth == 3   # WRONG
+assert dlq_depth == 4   # RIGHT
+```
+
+3 INVALID (bad currency + $0 invoice + bad customer) + 1 DUPLICATE (the replay event).
+I miscounted. The test caught it. This is why you write assertions before you assume.
+
+**Bug 2: SQLite "cannot start a transaction within a transaction"**
+
+This one took a minute. The concurrent test shared one connection object across 5 threads.
+`_tx()` calls `conn.execute("BEGIN")`. When two threads call this on the same connection
+object simultaneously, SQLite complains about nested transactions — because from SQLite's
+perspective, you're trying to open a transaction that's already open.
+
+The fix: each thread gets its own connection to a shared temp file database.
+
+```python
+tmp_db = pathlib.Path(tempfile.mktemp(suffix=".db"))
+L._bootstrap(tmp_db).close()   # initialize schema once
+
+def _fire():
+    conn = L._bootstrap(tmp_db)    # each thread: own connection
+    result = L.process_stripe_event(conn, ev)
+    results.append(result["outcome"])
+    conn.close()
+```
+
+In-memory SQLite can't be shared across threads — each connection sees its own memory.
+A file is required for shared concurrent access. This is the kind of thing that doesn't
+show up until you actually run concurrent tests. The AltScore production environment will
+need Postgres, so this is also good evidence for that migration.
+
+### Result:
+- 101/101 passing
+- Full stack tested: HTTP → validation → ledger → DLQ → outbox
+- Concurrency guard verified with exact math
+- DLQ raw payload preservation verified
+- 32 new tests across 4 categories
 
 ---
 
 ## Git Log Summary
 
 ```
+d5b56df  Phase 5: Integration tests — HTTP layer, concurrency, outbox dispatch, DLQ
+b2dac5b  docs: Add Phase 3 section and API key to both README and private report
 d82e729  Phase 3: Cross-field business logic validators
 db5d79f  docs: Add Phase 2 implementation report to README
 d2a0ef7  Phase 2 chunk 2: Expand test coverage for DLQEntry and LedgerEntry models
@@ -303,6 +378,7 @@ e4724e7  chore: add .gitignore and cleanup local artifacts
 | After Phase 1 | 34 | 12,412 |
 | After Phase 2 | 60 | 16,628 |
 | After Phase 3 | 69 | 16,609 |
+| After Phase 5 | 101 | 16,600+ |
 
 TPS fluctuates between runs — it's SQLite in-memory on a single core.
 The trend is flat, which is correct: adding validation at model creation
