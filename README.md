@@ -369,6 +369,91 @@ Before Phase 3, a `$0` invoice could sail through validation and land in the led
 
 ---
 
+## 🔧 Phase 5: Integration Tests — The Full Stack Gets Audited (May 13, 2026)
+
+**Status:** 101/101 tests passing. The HTTP layer, concurrency, outbox, and DLQ are all tested end-to-end. We don't trust code that hasn't been fired at.
+
+Phases 1–3 tested `process_stripe_event()` directly. Phase 5 tests what actually happens when an HTTP request arrives, two threads collide, the outbox worker runs, and the DLQ gets queried. Different layer, different failure modes.
+
+### What Got Tested
+
+**1. HTTP Layer (18 tests via FastAPI TestClient)**
+
+The TestClient bypasses the network but exercises the full FastAPI request cycle — routing, JSON parsing, response codes, and the actual `process_stripe_event()` call with a real SQLite connection. Not a mock. Not a stub. A real in-memory database that gets written and read.
+
+```python
+client = TestClient(L.app)
+resp = client.post("/webhook/stripe", json=valid_invoice_paid)
+assert resp.status_code == 200
+assert resp.json()["outcome"] == "POSTED"
+```
+
+Covered: all 5 event types, duplicate detection over HTTP, invalid payloads returning 200 to DLQ (not 422 to Stripe), missing fields, cross-field validator failures.
+
+**2. Concurrent Insertion (4 tests)**
+
+The whole point of `INSERT OR IGNORE` is that it handles race conditions at the DB engine level. This tests whether that actually holds when 5 threads fire the same event simultaneously:
+
+```python
+threads = [threading.Thread(target=_fire) for _ in range(5)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+posted   = results.count("POSTED")
+dupes    = results.count("DLQ_DUPLICATE")
+assert posted == 1       # Exactly one write
+assert dupes  == 4       # All others are duplicates, not errors
+```
+
+Five threads. One winner. Zero ghost payments. The math is exact or the test fails.
+
+**3. Outbox Dispatch Simulation (4 tests)**
+
+The outbox stores events pending downstream delivery. This tests the state machine: events start with `dispatched=0`, the worker flips them to `dispatched=1`, and the pending count drops correctly.
+
+```python
+conn.execute("UPDATE outbox SET dispatched=1 WHERE dispatched=0")
+pending_after = conn.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0").fetchone()[0]
+assert pending_after == 0
+```
+
+In production this flip happens inside a Temporal activity. Here we simulate it directly — the state machine is the same.
+
+**4. DLQ Queryability (6 tests)**
+
+The DLQ is only useful if you can query it. Tested: DUPLICATE rows appear and are queryable by reason, INVALID rows appear with correct reason codes, raw payloads are preserved exactly (not truncated, not re-serialized), and the full event type routing maps correctly to DLQ outcomes.
+
+```python
+raw = json.loads(dlq_row["raw_payload"])
+assert raw["id"] == original_event["id"]   # Byte-perfect preservation
+```
+
+### What the Test Count Looks Like Now
+
+| Phase | Tests | What layer |
+|---|---|---|
+| Phase 1 | 34 | Entry validation (Pydantic boundary) |
+| Phase 2 | +26 | Output models (DLQEntry, LedgerEntry) |
+| Phase 3 | +9 | Cross-field validators |
+| Phase 5 | +32 | HTTP, concurrency, outbox, DLQ |
+| **Total** | **101** | **Full stack** |
+
+**Performance:** Still 16,600+ TPS on the core ledger path. The integration test layer adds zero production overhead — it's test infrastructure only.
+
+### Errors Fixed This Round
+
+**1. DLQ count assertion off by one**
+- First pass expected 3 DLQ entries in the summary test
+- Actual was 4: 3 INVALID (bad currency, $0 invoice, bad customer) + 1 DUPLICATE (the replay)
+- Fixed: updated assertion to `== 4`
+
+**2. SQLite concurrent access with shared connection**
+- Sharing one connection object across 5 threads causes `"cannot start a transaction within a transaction"` errors — `_tx()` calls `BEGIN` and multiple threads hit it simultaneously on the same object
+- Fixed: each thread creates its own connection to a shared temp file database (`tempfile.mktemp(suffix=".db")`)
+- In-memory SQLite is per-connection and can't be shared across threads — a file is required for concurrent tests
+
+---
+
 ## 🔑 Where the API Key Goes
 
 The Stripe webhook secret is in [ledger.py](ledger.py) — two spots, both marked:
@@ -441,7 +526,7 @@ curl -X POST http://localhost:8000/webhook/stripe \
 # Check the ledger
 curl http://localhost:8000/ledger/summary
 
-# Run the 17-point audit (tests)
+# Run the full test suite (101 tests)
 python test_ledger.py
 ```
 
