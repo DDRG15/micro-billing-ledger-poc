@@ -2,16 +2,18 @@
 test_ledger.py — Full Integration Test Suite / Suite Completa de Tests de Integración
 ======================================================================================
 EN: 101 tests across 5 phases. Run with: python test_ledger.py
+    Requires: PostgreSQL running and DATABASE_URL set (see docker-compose.yml).
     Covers: entry validation, output models, cross-field rules, HTTP layer,
     concurrent insertion, outbox dispatch simulation, DLQ queryability.
-    No mocks. No stubs. Real SQLite connections (in-memory or temp-file).
+    No mocks. No stubs. Every test hits a real PostgreSQL database.
     The test runner is deliberately simple — no pytest dependency — so anyone
     can run it with a plain Python install.
 
 ES: 101 tests en 5 fases. Ejecutar con: python test_ledger.py
+    Requiere: PostgreSQL en ejecución y DATABASE_URL establecido (ver docker-compose.yml).
     Cubre: validación de entrada, modelos de salida, reglas de campos cruzados,
     capa HTTP, inserción concurrente, simulación de despacho del outbox, consultabilidad del DLQ.
-    Sin mocks. Sin stubs. Conexiones SQLite reales (en memoria o archivo temporal).
+    Sin mocks. Sin stubs. Cada test golpea una base de datos PostgreSQL real.
     El runner de tests es deliberadamente simple — sin dependencia de pytest — para que
     cualquiera pueda ejecutarlo con una instalación Python plana.
 """
@@ -21,10 +23,8 @@ ES: 101 tests en 5 fases. Ejecutar con: python test_ledger.py
 # ---------------------------------------------------------------------------
 import io          # EN: Used to wrap stdout for UTF-8 output on Windows / ES: Usado para envolver stdout para salida UTF-8 en Windows
 import json        # EN: Used to verify raw_payload round-trips correctly / ES: Usado para verificar que raw_payload va y vuelve correctamente
-import sqlite3     # EN: Type hint for connection objects / ES: Hint de tipo para objetos de conexión
 import sys         # EN: stdout override for Windows UTF-8 encoding / ES: Override de stdout para codificación UTF-8 en Windows
 import time        # EN: Used in benchmark timing / ES: Usado en temporización del benchmark
-import pathlib     # EN: Cross-platform path for in-memory and temp-file DBs / ES: Ruta multiplataforma para DBs en memoria y archivos temporales
 
 # EN: Force UTF-8 output on Windows. Without this, Unicode characters in print()
 #     cause UnicodeEncodeError because Windows stdout defaults to CP-1252.
@@ -67,16 +67,47 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
         print(f"  FAIL  {name}" + (f"  |  {detail}" if detail else ""))
 
 
-def fresh_conn() -> sqlite3.Connection:
+def _q1(conn, sql: str, params: tuple = ()) -> object:
     """
-    EN: Returns a fresh in-memory SQLite connection with schema bootstrapped.
-        Each test section that needs isolation gets its own fresh_conn() call.
-        In-memory = zero disk I/O, zero state leakage between test sections.
-    ES: Retorna una conexión SQLite en memoria fresca con el esquema inicializado.
-        Cada sección de test que necesita aislamiento obtiene su propia llamada fresh_conn().
-        En memoria = cero E/S de disco, cero filtrado de estado entre secciones de test.
+    EN: Execute a query and return the first column of the first row.
+        Used for COUNT(*) and similar single-value reads. psycopg2 connections
+        do not have a .execute() shortcut — cursors are required.
+    ES: Ejecutar una consulta y retornar la primera columna de la primera fila.
+        Usado para COUNT(*) y lecturas similares de valor único. Las conexiones
+        psycopg2 no tienen un atajo .execute() — se requieren cursores.
     """
-    return L._bootstrap(pathlib.Path(":memory:"))
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()[0]
+
+
+def _qall(conn, sql: str, params: tuple = ()) -> list:
+    """
+    EN: Execute a query and return all rows as a list of tuples.
+    ES: Ejecutar una consulta y retornar todas las filas como lista de tuplas.
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def fresh_conn():
+    """
+    EN: Returns a PostgreSQL connection with all tables truncated.
+        Each test section that needs isolation calls fresh_conn() to start clean.
+        TRUNCATE ... RESTART IDENTITY resets all table data and BIGSERIAL sequences.
+        No mocking — this hits the real PostgreSQL database defined by DATABASE_URL.
+        Requires: docker-compose up -d postgres (or a running PostgreSQL instance).
+    ES: Retorna una conexión PostgreSQL con todas las tablas truncadas.
+        Cada sección de test que necesita aislamiento llama fresh_conn() para empezar limpio.
+        TRUNCATE ... RESTART IDENTITY resetea todos los datos de tablas y secuencias BIGSERIAL.
+        Sin mocking — esto golpea la base de datos PostgreSQL real definida por DATABASE_URL.
+        Requiere: docker-compose up -d postgres (o una instancia PostgreSQL en ejecución).
+    """
+    conn = L._bootstrap()
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+    return conn
 
 
 def fake_event(
@@ -317,13 +348,14 @@ chk("missing customer → DLQ_INVALID",           r["outcome"] == "DLQ_INVALID")
 
 
 print("\n── Idempotency guard ────────────────────────────────────────────────")
-# EN: Core concurrency test — verifies that INSERT OR IGNORE correctly prevents
-#     duplicate rows. The second call with the same event ID must route to DLQ_DUPLICATE,
-#     not write a second ledger row. The ledger must have exactly 1 row after both calls.
-# ES: Test de concurrencia central — verifica que INSERT OR IGNORE evite correctamente
-#     filas duplicadas. La segunda llamada con el mismo ID de evento debe enrutar a
-#     DLQ_DUPLICATE, no escribir una segunda fila en el libro. El libro debe tener
-#     exactamente 1 fila después de ambas llamadas.
+# EN: Core idempotency test — verifies that ON CONFLICT (transaction_id) DO NOTHING
+#     correctly prevents duplicate rows. The second call with the same event ID must
+#     route to DLQ_DUPLICATE, not write a second ledger row. The ledger must have
+#     exactly 1 row after both calls.
+# ES: Test de idempotencia central — verifica que ON CONFLICT (transaction_id) DO NOTHING
+#     evite correctamente filas duplicadas. La segunda llamada con el mismo ID de evento
+#     debe enrutar a DLQ_DUPLICATE, no escribir una segunda fila en el libro. El libro
+#     debe tener exactamente 1 fila después de ambas llamadas.
 
 conn = fresh_conn()
 ev   = fake_event()
@@ -335,11 +367,11 @@ chk("transaction_id returned",                  r1["transaction_id"] == "evt_tes
 r2 = L.process_stripe_event(conn, ev)           # EN: exact same event / ES: exactamente el mismo evento
 chk("duplicate → DLQ_DUPLICATE",               r2["outcome"] == "DLQ_DUPLICATE")
 chk("DLQ row written",
-    conn.execute("SELECT COUNT(*) FROM dlq").fetchone()[0] == 1)
+    _q1(conn, "SELECT COUNT(*) FROM dlq") == 1)
 
 # EN: The duplicate must NOT create a second ledger row — idempotency guard must hold.
 # ES: El duplicado NO debe crear una segunda fila en el libro — la guardia de idempotencia debe mantenerse.
-ledger_count = conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
+ledger_count = _q1(conn, "SELECT COUNT(*) FROM ledger")
 chk("ledger has exactly 1 row after replay",    ledger_count == 1)
 
 
@@ -351,14 +383,10 @@ print("\n── Outbox written atomically ────────────�
 #     en el mismo BEGIN...COMMIT que la fila del libro. Usa el mismo conn de arriba.
 #     La llamada duplicada de arriba NO debe haber escrito una segunda fila del outbox.
 
-outbox_count = conn.execute(
-    "SELECT COUNT(*) FROM outbox WHERE dispatched=0"
-).fetchone()[0]
+outbox_count = _q1(conn, "SELECT COUNT(*) FROM outbox WHERE dispatched=0")
 chk("outbox has 1 pending row",                 outbox_count == 1)
 
-row = conn.execute(
-    "SELECT transaction_id, event_type FROM outbox WHERE dispatched=0"
-).fetchone()
+row = _qall(conn, "SELECT transaction_id, event_type FROM outbox WHERE dispatched=0")[0]
 chk("outbox row has correct tx_id",             row[0] == "evt_test_001")
 chk("outbox row has correct event_type",        row[1] == "invoice.paid")
 
@@ -382,7 +410,7 @@ r = L.process_stripe_event(conn2, fake_event(eid="evt_x", etype="payment.created
 chk("unknown type → DLQ_INVALID",              r["outcome"] == "DLQ_INVALID",
     f"got {r['outcome']} instead of DLQ_INVALID")
 
-dlq_count = conn2.execute("SELECT COUNT(*) FROM dlq").fetchone()[0]
+dlq_count = _q1(conn2, "SELECT COUNT(*) FROM dlq")
 chk("DLQ has 2 rows",                           dlq_count == 2)
 
 
@@ -410,12 +438,16 @@ for i, (etype, expected_status) in enumerate(expected.items()):
 
 
 print("\n── Headless benchmark ───────────────────────────────────────────────")
-# EN: Throughput measurement — 5,000 unique events in-memory, no HTTP overhead.
-#     The 2,000 TPS floor is deliberately conservative — SQLite in-memory on any
-#     modern machine exceeds this by 5-8x. If this fails, something is very wrong.
-# ES: Medición de throughput — 5,000 eventos únicos en memoria, sin sobrecarga HTTP.
-#     El piso de 2,000 TPS es deliberadamente conservador — SQLite en memoria en
-#     cualquier máquina moderna supera esto por 5-8x. Si esto falla, algo está muy mal.
+# EN: Throughput measurement — 5,000 unique events, no HTTP overhead.
+#     PostgreSQL floor is 500 TPS — conservative for localhost with explicit
+#     per-event transactions (BEGIN + 2 INSERTs + COMMIT per event).
+#     SQLite in-memory was ~15,000 TPS; PostgreSQL network overhead is the delta.
+#     If this fails, the DB is unreachable or severely overloaded.
+# ES: Medición de throughput — 5,000 eventos únicos, sin sobrecarga HTTP.
+#     El piso de PostgreSQL es 500 TPS — conservador para localhost con transacciones
+#     explícitas por evento (BEGIN + 2 INSERTs + COMMIT por evento).
+#     SQLite en memoria era ~15,000 TPS; la sobrecarga de red de PostgreSQL es el delta.
+#     Si esto falla, la DB no es alcanzable o está severamente sobrecargada.
 
 N     = 5_000
 conn4 = fresh_conn()
@@ -442,9 +474,9 @@ for ev in events:
     L.process_stripe_event(conn4, ev)
 elapsed = time.perf_counter() - t0
 tps     = N / elapsed
-chk(f"throughput ≥ 2,000 TPS  (got {tps:,.0f})", tps >= 2_000)
+chk(f"throughput ≥ 500 TPS  (got {tps:,.0f})", tps >= 500)
 print(f"         {N:,} events in {elapsed:.3f}s  →  {tps:,.0f} TPS  "
-      f"(single-core, SQLite in-memory)")
+      f"(single-core, PostgreSQL localhost)")
 
 
 # =============================================================================
@@ -612,7 +644,7 @@ L.process_stripe_event(conn5, ev_dup)           # EN: replay → DUPLICATE / ES:
 ev_bad = fake_event(eid="evt_invalid_check", currency="WRONG")
 L.process_stripe_event(conn5, ev_bad)
 
-rows    = conn5.execute("SELECT reason FROM dlq ORDER BY id").fetchall()
+rows    = _qall(conn5, "SELECT reason FROM dlq ORDER BY id")
 reasons = [r[0] for r in rows]
 chk("DB DLQ has 2 rows",                        len(reasons) == 2)
 chk("First DLQ row reason is DUPLICATE",        reasons[0] == "DUPLICATE")
@@ -660,13 +692,15 @@ print("\n── Phase 5: Integration — HTTP layer (TestClient) ─────
 
 from starlette.testclient import TestClient
 
-# EN: Patch the module-level _conn to point at an in-memory DB for HTTP tests.
-#     Without this, HTTP tests would write to billing_ledger.db on disk.
-#     L._conn is the module global — replacing it affects all subsequent requests.
-# ES: Parchear el _conn a nivel de módulo para apuntar a una DB en memoria para tests HTTP.
-#     Sin esto, los tests HTTP escribirían en billing_ledger.db en disco.
-#     L._conn es el global del módulo — reemplazarlo afecta todas las solicitudes posteriores.
-http_conn = L._bootstrap(pathlib.Path(":memory:"))
+# EN: Patch the module-level _conn to a fresh, empty PostgreSQL connection.
+#     fresh_conn() truncates all tables so the HTTP tests start from a known empty state.
+#     L._conn is the module global — replacing it means the FastAPI routes use this connection.
+#     No mocking — this is a real psycopg2 connection to a real PostgreSQL database.
+# ES: Parchear el _conn a nivel de módulo a una conexión PostgreSQL fresca y vacía.
+#     fresh_conn() trunca todas las tablas para que los tests HTTP empiecen desde un estado vacío conocido.
+#     L._conn es el global del módulo — reemplazarlo significa que las rutas FastAPI usan esta conexión.
+#     Sin mocking — esta es una conexión psycopg2 real a una base de datos PostgreSQL real.
+http_conn = fresh_conn()
 L._conn   = http_conn
 client    = TestClient(L.app)
 
@@ -736,35 +770,39 @@ chk("summary outbox_pending is 1",              summary["outbox_pending"] == 1,
 
 print("\n── Phase 5: Concurrent insertion (threading) ────────────────────────────")
 # EN: The most important test in the suite. 5 threads fire the same event simultaneously.
-#     INSERT OR IGNORE at the DB level guarantees exactly 1 insert succeeds.
-#     The other 4 are silently ignored by SQLite — rowcount=0 — and routed to DLQ_DUPLICATE.
-#     This test verifies the "Ghost Payment" prevention mechanism actually works under load.
+#     INSERT INTO ledger ... ON CONFLICT (transaction_id) DO NOTHING is the idempotency guard.
+#     PostgreSQL's MVCC ensures exactly 1 insert wins the unique constraint race;
+#     the other 4 get rowcount=0 and are routed to DLQ_DUPLICATE.
+#     This test verifies the "Ghost Payment" prevention mechanism works under concurrent load.
 #
-#     WHY a temp file instead of in-memory:
-#     In-memory SQLite is per-connection — each connection sees its own empty database.
-#     A shared temp file allows multiple connections to the same physical database,
-#     which is the precondition for INSERT OR IGNORE to deduplicate across threads.
+#     WHY PostgreSQL handles this natively (vs. SQLite temp file):
+#     PostgreSQL is a multi-client server — all connections share the same data. The
+#     unique constraint on transaction_id plus ON CONFLICT DO NOTHING is the serialization
+#     point. No application-level lock needed. This is the production-correct approach.
 #
 # ES: El test más importante de la suite. 5 hilos disparan el mismo evento simultáneamente.
-#     INSERT OR IGNORE a nivel DB garantiza que exactamente 1 inserción tenga éxito.
-#     Los otros 4 son ignorados silenciosamente por SQLite — rowcount=0 — y enrutados a DLQ_DUPLICATE.
-#     Este test verifica que el mecanismo de prevención de "Pagos Fantasma" realmente funciona bajo carga.
+#     INSERT INTO ledger ... ON CONFLICT (transaction_id) DO NOTHING es la guardia de idempotencia.
+#     El MVCC de PostgreSQL asegura que exactamente 1 inserción gane la carrera de restricción única;
+#     los otros 4 obtienen rowcount=0 y son enrutados a DLQ_DUPLICATE.
+#     Este test verifica que el mecanismo de prevención de "Pagos Fantasma" funciona bajo carga concurrente.
 #
-#     POR QUÉ un archivo temporal en lugar de en memoria:
-#     SQLite en memoria es por conexión — cada conexión ve su propia base de datos vacía.
-#     Un archivo temporal compartido permite múltiples conexiones a la misma base de datos
-#     física, que es la condición previa para que INSERT OR IGNORE desduplique entre hilos.
+#     POR QUÉ PostgreSQL maneja esto nativamente (vs. archivo temporal SQLite):
+#     PostgreSQL es un servidor multi-cliente — todas las conexiones comparten los mismos datos. La
+#     restricción única en transaction_id más ON CONFLICT DO NOTHING es el punto de serialización.
+#     Sin bloqueo a nivel de aplicación necesario. Este es el enfoque correcto para producción.
 
 import threading
-import tempfile
-import os
 
-# EN: Create a shared temp file DB — one schema initialization, then each thread
-#     opens its own connection to the same file.
-# ES: Crear una DB de archivo temporal compartido — una inicialización de esquema,
-#     luego cada hilo abre su propia conexión al mismo archivo.
-tmp_db = pathlib.Path(tempfile.mktemp(suffix=".db"))
-L._bootstrap(tmp_db).close()       # EN: init schema once / ES: inicializar esquema una vez
+# EN: Fresh state before concurrent test — truncates all tables.
+#     Each thread will open its own psycopg2 connection to the same PostgreSQL database.
+#     Sharing a single connection object across threads is unsafe because _tx() issues BEGIN
+#     and concurrent threads would interleave their transactions on the same connection.
+# ES: Estado fresco antes del test concurrente — trunca todas las tablas.
+#     Cada hilo abrirá su propia conexión psycopg2 a la misma base de datos PostgreSQL.
+#     Compartir un único objeto de conexión entre hilos no es seguro porque _tx() emite BEGIN
+#     y los hilos concurrentes intercalarían sus transacciones en la misma conexión.
+_setup_conn = fresh_conn()
+_setup_conn.close()
 
 ev_concurrent      = fake_event(eid="evt_concurrent_001",
                                 customer="cus_concurrent", amount=5000)
@@ -773,15 +811,15 @@ errors_concurrent  = []
 
 def _fire():
     """
-    EN: Each thread creates its own connection (not shared) to the temp file DB.
-        Sharing one connection object across threads causes "cannot start a transaction
-        within a transaction" because _tx() calls BEGIN on an already-open transaction.
-    ES: Cada hilo crea su propia conexión (no compartida) a la DB de archivo temporal.
-        Compartir un objeto de conexión entre hilos causa "cannot start a transaction
-        within a transaction" porque _tx() llama BEGIN en una transacción ya abierta.
+    EN: Each thread gets its own psycopg2 connection to the PostgreSQL database.
+        ON CONFLICT (transaction_id) DO NOTHING at the DB level serializes concurrent
+        inserts — no application-level lock or coordination needed between threads.
+    ES: Cada hilo obtiene su propia conexión psycopg2 a la base de datos PostgreSQL.
+        ON CONFLICT (transaction_id) DO NOTHING a nivel DB serializa los inserts concurrentes —
+        sin bloqueo a nivel de aplicación ni coordinación necesaria entre hilos.
     """
     try:
-        conn = L._bootstrap(tmp_db)             # EN: own connection per thread / ES: conexión propia por hilo
+        conn = L._bootstrap()
         r    = L.process_stripe_event(conn, ev_concurrent)
         results_concurrent.append(r["outcome"])
         conn.close()
@@ -794,19 +832,12 @@ for t in threads:
 for t in threads:
     t.join()
 
-# EN: Verify final state using a fresh connection — not one of the thread connections.
-# ES: Verificar el estado final usando una conexión fresca — no una de las conexiones de los hilos.
-verify_conn = L._bootstrap(tmp_db)
-ledger_rows = verify_conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
+# EN: Verify final state using a separate connection — not one of the thread connections.
+# ES: Verificar el estado final usando una conexión separada — no una de las conexiones de los hilos.
+verify_conn = L._bootstrap()
+ledger_rows = _q1(verify_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id=%s",
+                  ("evt_concurrent_001",))
 verify_conn.close()
-
-# EN: Clean up temp files — WAL and SHM files are created alongside the main DB file.
-# ES: Limpiar archivos temporales — los archivos WAL y SHM se crean junto al archivo DB principal.
-for suffix in ("", "-wal", "-shm"):
-    try:
-        pathlib.Path(str(tmp_db) + suffix).unlink()
-    except FileNotFoundError:
-        pass
 
 chk("no exceptions from 5 concurrent inserts",
     len(errors_concurrent) == 0, str(errors_concurrent))
@@ -832,37 +863,38 @@ print("\n── Phase 5: Outbox dispatch simulation ─────────�
 #     También verifica que la idempotencia se mantiene después del despacho — reproducir el mismo
 #     evento todavía enruta a DLQ_DUPLICATE, no a una nueva escritura en el libro.
 
-dispatch_conn = L._bootstrap(pathlib.Path(":memory:"))
+dispatch_conn = fresh_conn()
 L.process_stripe_event(
     dispatch_conn,
     fake_event(eid="evt_dispatch_001", customer="cus_dispatch", amount=7500)
 )
 
-pending_before = dispatch_conn.execute(
-    "SELECT COUNT(*) FROM outbox WHERE dispatched=0"
-).fetchone()[0]
+pending_before = _q1(dispatch_conn, "SELECT COUNT(*) FROM outbox WHERE dispatched=0")
 chk("outbox has 1 pending row before dispatch", pending_before == 1)
 
 # EN: Simulate the worker flipping dispatched=0 → dispatched=1.
-#     In production this happens inside a Temporal activity after successful downstream delivery.
+#     With autocommit=True on the connection, the UPDATE commits immediately —
+#     no explicit conn.commit() needed. The AND dispatched=0 guard in the WHERE clause
+#     is what prevents a concurrent worker from double-dispatching the same row.
 # ES: Simular el worker cambiando dispatched=0 → dispatched=1.
-#     En producción esto ocurre dentro de una actividad Temporal después de entrega downstream exitosa.
-dispatch_conn.execute(
-    "UPDATE outbox SET dispatched=1 WHERE transaction_id='evt_dispatch_001'"
-)
-dispatch_conn.commit()
+#     Con autocommit=True en la conexión, el UPDATE hace commit inmediatamente —
+#     no se necesita conn.commit() explícito. La guardia AND dispatched=0 en la cláusula WHERE
+#     es lo que evita que un worker concurrente despache dos veces la misma fila.
+with dispatch_conn.cursor() as cur:
+    cur.execute(
+        "UPDATE outbox SET dispatched=1 WHERE transaction_id=%s AND dispatched=0",
+        ("evt_dispatch_001",),
+    )
 
-pending_after = dispatch_conn.execute(
-    "SELECT COUNT(*) FROM outbox WHERE dispatched=0"
-).fetchone()[0]
+pending_after = _q1(dispatch_conn, "SELECT COUNT(*) FROM outbox WHERE dispatched=0")
 chk("outbox has 0 pending rows after dispatch", pending_after == 0)
 
 # EN: Replay after dispatch — idempotency guard must still fire. The ledger PK
-#     remains, so INSERT OR IGNORE still rejects the replay even though the outbox
-#     row has been dispatched.
+#     remains, so ON CONFLICT (transaction_id) DO NOTHING still rejects the replay
+#     even though the outbox row has been dispatched.
 # ES: Reproducción después del despacho — la guardia de idempotencia todavía debe dispararse.
-#     El PK del libro permanece, así que INSERT OR IGNORE todavía rechaza la reproducción
-#     aunque la fila del outbox haya sido despachada.
+#     El PK del libro permanece, así que ON CONFLICT (transaction_id) DO NOTHING todavía
+#     rechaza la reproducción aunque la fila del outbox haya sido despachada.
 r = L.process_stripe_event(
     dispatch_conn,
     fake_event(eid="evt_dispatch_001", customer="cus_dispatch", amount=7500)
@@ -870,7 +902,7 @@ r = L.process_stripe_event(
 chk("replay after dispatch → DLQ_DUPLICATE (idempotency holds)",
     r["outcome"] == "DLQ_DUPLICATE", f"got {r['outcome']}")
 
-ledger_rows = dispatch_conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0]
+ledger_rows = _q1(dispatch_conn, "SELECT COUNT(*) FROM ledger")
 chk("ledger still has 1 row after replay post-dispatch",
     ledger_rows == 1, f"got {ledger_rows}")
 
@@ -887,7 +919,7 @@ print("\n── Phase 5: DLQ queryability and payload preservation ────�
 #     Si raw_payload está corrupto (doble codificado, truncado, etc.), la recuperación
 #     manual es imposible — lo que anula el propósito entero de tener un DLQ.
 
-dlq_conn = L._bootstrap(pathlib.Path(":memory:"))
+dlq_conn = fresh_conn()
 
 # EN: Three distinct invalid events → three DLQ entries with distinct event IDs.
 # ES: Tres eventos inválidos distintos → tres entradas DLQ con IDs de evento distintos.
@@ -895,9 +927,7 @@ L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_1", currency="WRONG"))
 L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_2", amount=0))
 L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_3", customer=""))
 
-rows = dlq_conn.execute(
-    "SELECT transaction_id, reason, raw_payload FROM dlq ORDER BY id"
-).fetchall()
+rows = _qall(dlq_conn, "SELECT transaction_id, reason, raw_payload FROM dlq ORDER BY id")
 
 chk("DLQ has 3 rows",                           len(rows) == 3,   f"got {len(rows)}")
 chk("all 3 reasons are INVALID",

@@ -75,18 +75,17 @@ COPY --from=builder /install /usr/local
 #     En producción, ledger.py es el único archivo que necesita estar en el contenedor.
 COPY ledger.py .
 
-# EN: Create the /data directory for SQLite WAL files and give ownership to billing user.
-#     Mount a volume here in production: docker run -v /host/data:/data ...
-#     Without a volume, the SQLite DB lives inside the container and is lost on restart.
-#     BILLING_DB_PATH env var tells ledger.py to use /data/billing_ledger.db instead of
-#     the default ./billing_ledger.db — keeping data outside the app directory.
-# ES: Crear el directorio /data para archivos WAL de SQLite y dar propiedad al usuario billing.
-#     Montar un volumen aquí en producción: docker run -v /host/data:/data ...
-#     Sin un volumen, la DB SQLite vive dentro del contenedor y se pierde al reiniciar.
-#     La variable de entorno BILLING_DB_PATH le dice a ledger.py que use /data/billing_ledger.db
-#     en lugar del default ./billing_ledger.db — manteniendo datos fuera del directorio app.
-RUN mkdir -p /data && chown billing:billing /data
-ENV BILLING_DB_PATH=/data/billing_ledger.db
+# EN: DATABASE_URL tells ledger.py where the PostgreSQL instance lives.
+#     Override at runtime: docker run -e DATABASE_URL=postgresql://user:pass@host:5432/db ...
+#     In production, point this at a managed PostgreSQL service (RDS, Cloud SQL, Supabase, etc.).
+#     The default here connects to a postgres container in the same Docker network.
+#     Never hardcode credentials — pass DATABASE_URL as an environment variable at deploy time.
+# ES: DATABASE_URL le dice a ledger.py dónde vive la instancia PostgreSQL.
+#     Sobreescribir en tiempo de ejecución: docker run -e DATABASE_URL=postgresql://user:pass@host:5432/db ...
+#     En producción, apuntar esto a un servicio PostgreSQL administrado (RDS, Cloud SQL, Supabase, etc.).
+#     El default aquí se conecta a un contenedor postgres en la misma red Docker.
+#     Nunca hardcodear credenciales — pasar DATABASE_URL como variable de entorno al desplegar.
+ENV DATABASE_URL=postgresql://postgres:postgres@postgres:5432/billing
 
 # EN: Switch to the non-root billing user. All subsequent commands (including CMD)
 #     run as billing, not root. Defence in depth.

@@ -48,6 +48,6 @@ pydantic==2.9.2
 #     Están comentados para que el PoC permanezca mínimo e instalable sin servicios externos.
 #
 # stripe==10.12.0         # EN: Stripe webhook signature verification (BLUEPRINT §2 CRITICAL) / ES: Verificación de firma de webhook Stripe (BLUEPRINT §2 CRÍTICO)
-# psycopg2-binary==2.9.9  # EN: PostgreSQL sync driver (BLUEPRINT §1 CRITICAL) / ES: Driver sync PostgreSQL (BLUEPRINT §1 CRÍTICO)
+psycopg2-binary==2.9.9  # EN: PostgreSQL sync driver — ACTIVE. Binary package includes libpq; no OS headers needed. / ES: Driver sync PostgreSQL — ACTIVO. El paquete binary incluye libpq; sin headers del SO necesarios.
 # prometheus-client==0.21.0  # EN: /metrics endpoint with Prometheus counters (BLUEPRINT §7 MEDIUM) / ES: Endpoint /metrics con contadores Prometheus (BLUEPRINT §7 MEDIO)
 # ---------------------------------------------------------------------------
