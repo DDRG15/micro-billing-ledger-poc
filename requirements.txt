@@ -1,3 +1,53 @@
+# requirements.txt — Micro-Billing-Ledger PoC
+# =============================================
+# EN: All production dependencies pinned to exact versions.
+#     Pinning prevents "it worked yesterday" surprises when a new minor version
+#     ships a breaking change. Update pins intentionally, not accidentally.
+#     Install with: pip install -r requirements.txt
+#
+# ES: Todas las dependencias de producción fijadas a versiones exactas.
+#     Fijar previene las sorpresas de "funcionó ayer" cuando una nueva versión menor
+#     envía un cambio que rompe algo. Actualizar los pins intencionalmente, no accidentalmente.
+#     Instalar con: pip install -r requirements.txt
+
+# EN: FastAPI 0.115.0 — HTTP framework for the webhook endpoint and summary/DLQ routes.
+#     Chosen over Flask because it ships async support, automatic OpenAPI docs, and
+#     Pydantic v2 integration out of the box. 0.115.0 is stable and tested.
+# ES: FastAPI 0.115.0 — framework HTTP para el endpoint de webhook y rutas de resumen/DLQ.
+#     Elegido sobre Flask porque incluye soporte async, docs OpenAPI automáticas, e
+#     integración con Pydantic v2 fuera de la caja. 0.115.0 es estable y probado.
 fastapi==0.115.0
+
+# EN: uvicorn[standard] 0.30.6 — ASGI server that runs the FastAPI app.
+#     [standard] includes uvloop (faster event loop, C extension) and httptools
+#     (faster HTTP parsing). Both require the gcc/musl-dev in the builder Dockerfile stage.
+#     For production with PostgreSQL and multiple workers, consider Gunicorn + uvicorn workers.
+# ES: uvicorn[standard] 0.30.6 — servidor ASGI que ejecuta la app FastAPI.
+#     [standard] incluye uvloop (event loop más rápido, extensión C) y httptools
+#     (parseo HTTP más rápido). Ambos requieren gcc/musl-dev en la etapa builder del Dockerfile.
+#     Para producción con PostgreSQL y múltiples workers, considerar Gunicorn + workers uvicorn.
 uvicorn[standard]==0.30.6
+
+# EN: Pydantic 2.9.2 — the entire validation stack runs on this.
+#     v2 (not v1) is required because we use model_dump() (not deprecated dict()),
+#     model_validator(mode='after'), and Field constraints with ge=0/pattern/min_length.
+#     DO NOT downgrade to v1 — the API is incompatible and the validators will silently fail.
+# ES: Pydantic 2.9.2 — toda la pila de validación corre sobre esto.
+#     Se requiere v2 (no v1) porque usamos model_dump() (no el obsoleto dict()),
+#     model_validator(mode='after'), y restricciones de Field con ge=0/pattern/min_length.
+#     NO bajar de versión a v1 — la API es incompatible y los validadores fallarán silenciosamente.
 pydantic==2.9.2
+
+# ---------------------------------------------------------------------------
+# FUTURE DEPENDENCIES (not yet added — see BLUEPRINT_ANALYSIS.md for details)
+# DEPENDENCIAS FUTURAS (aún no agregadas — ver BLUEPRINT_ANALYSIS.md para detalles)
+#
+# EN: These are the packages needed to close the production gaps identified in the Blueprint PDF.
+#     They are commented out so the PoC stays minimal and installable without external services.
+# ES: Estos son los paquetes necesarios para cerrar las brechas de producción identificadas en el PDF de Arquitectura.
+#     Están comentados para que el PoC permanezca mínimo e instalable sin servicios externos.
+#
+# stripe==10.12.0         # EN: Stripe webhook signature verification (BLUEPRINT §2 CRITICAL) / ES: Verificación de firma de webhook Stripe (BLUEPRINT §2 CRÍTICO)
+# psycopg2-binary==2.9.9  # EN: PostgreSQL sync driver (BLUEPRINT §1 CRITICAL) / ES: Driver sync PostgreSQL (BLUEPRINT §1 CRÍTICO)
+# prometheus-client==0.21.0  # EN: /metrics endpoint with Prometheus counters (BLUEPRINT §7 MEDIUM) / ES: Endpoint /metrics con contadores Prometheus (BLUEPRINT §7 MEDIO)
+# ---------------------------------------------------------------------------

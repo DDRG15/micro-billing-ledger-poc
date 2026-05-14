@@ -456,3 +456,92 @@ has negligible overhead compared to the SQLite write.
 ---
 
 *Diego Alonso Del Río García — PostHog Billing PoC — Mayo 2026*
+
+---
+
+## Bilingual Comments + Blueprint Analysis Session (Mayo 2026)
+## Sesión de Comentarios Bilingües + Análisis del Blueprint (Mayo 2026)
+
+**Commit:** `docs: bilingual comments, BLUEPRINT_ANALYSIS, README/IMPLEMENTATION_REPORT updates`
+**Tests:** 101/101 — unchanged / sin cambios
+
+### What we did / Lo que hicimos
+
+This session added zero new features and changed zero behavior. What it did:
+Esta sesión no agregó nuevas características y no cambió ningún comportamiento. Lo que hizo:
+
+**1. `instrucciones 1.1.txt` — deleted / eliminado**
+
+EN: Historical Copilot session transcript. Everything in it had already been implemented
+    in Phases 1–5. Keeping it was misleading (it ended mid-sentence at 92% token limit)
+    and added no value. Not tracked in git — deleted cleanly.
+
+ES: Transcripción histórica de sesión de Copilot. Todo lo que contenía ya había sido
+    implementado en las Fases 1–5. Mantenerlo era engañoso (terminaba a mitad de oración
+    al 92% del límite de tokens) y no agregaba valor. No rastreado en git — eliminado limpiamente.
+
+---
+
+**2. `BLUEPRINT_ANALYSIS.md` — created / creado**
+
+EN: New file. Full bilingual feasibility report for all 9 production gaps identified
+    in the Architectural Blueprint PDF. Each gap has: what it is, how to implement it,
+    what breaks, what improves, files touched, effort estimate, and priority.
+    Diego's name is prominent in the header — it's designed to be the first thing
+    you open when someone asks "what's left before production?"
+
+ES: Archivo nuevo. Reporte de factibilidad bilingüe completo para las 9 brechas de
+    producción identificadas en el PDF de Arquitectura. Cada brecha tiene: qué es,
+    cómo implementarla, qué se rompe, qué mejora, archivos afectados, estimado de
+    esfuerzo y prioridad. El nombre de Diego está prominente en el encabezado — está
+    diseñado para ser lo primero que abres cuando alguien pregunta "¿qué falta antes de producción?"
+
+Gaps covered / Brechas cubiertas:
+- §1 CRITICAL: PostgreSQL migration + ON CONFLICT DO NOTHING
+- §2 CRITICAL: Stripe webhook signature verification (code already written, needs uncommenting)
+- §3 HIGH: Asynchronous outbox worker (FastAPI lifespan or Temporal)
+- §4 HIGH: DLQ backoff retry budget engine
+- §5 LOW: Currency .lower() normalization (30-minute fix)
+- §6 MEDIUM: Structured JSON logging
+- §7 MEDIUM: Prometheus /metrics endpoint
+- §8 LOW: WAL checkpoint every N commits
+- §9 HIGH: Per-event-type strict amount extraction
+
+---
+
+**3. Bilingual `#` comments — all source files / Comentarios `#` bilingües — todos los archivos fuente**
+
+EN: Every meaningful block in every source file now has two comment lines: one English,
+    one Spanish. Each comment covers WHAT the code does AND WHY. The goal: any reader —
+    recruiter, engineer, auditor — can read a line number and need zero follow-up questions.
+    No jargon without explanation. No "obvious" code without context.
+
+ES: Cada bloque significativo en cada archivo fuente ahora tiene dos líneas de comentario:
+    una en inglés, una en español. Cada comentario cubre QUÉ hace el código Y POR QUÉ.
+    El objetivo: cualquier lector — reclutador, ingeniero, auditor — puede leer un número
+    de línea y no necesitar preguntas de seguimiento. Sin jerga sin explicación. Sin código
+    "obvio" sin contexto.
+
+Files updated / Archivos actualizados:
+- `ledger.py` — 6 full sections, module docstring, all models, all functions, all routes
+- `test_ledger.py` — every test section header, every chk() call group, all helpers
+- `Dockerfile` — every RUN/COPY/ENV/CMD instruction
+- `requirements.txt` — every dependency with version rationale + future deps commented
+- `.gitignore` — every rule group with security rationale (especially .env)
+
+---
+
+### What did NOT change / Lo que NO cambió
+
+EN: The 101 tests still pass. The TPS numbers are unchanged. The API surface is identical.
+    The database schema is identical. This was a documentation and readability session,
+    not a feature session. If something broke, it's a comment formatting issue — not logic.
+
+ES: Los 101 tests todavía pasan. Los números TPS no cambiaron. La superficie de la API
+    es idéntica. El esquema de la base de datos es idéntico. Esta fue una sesión de
+    documentación y legibilidad, no una sesión de características. Si algo se rompió,
+    es un problema de formato de comentario — no de lógica.
+
+---
+
+*Diego Alonso Del Río García — PostHog Billing PoC — Mayo 2026*

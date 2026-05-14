@@ -677,6 +677,48 @@ SQLite WAL mode accumulates write-ahead log entries without checkpointing. On a 
 
 ---
 
+## 📋 Blueprint Analysis & Full Code Documentation (May 14, 2026)
+
+**Status:** Every file now speaks to you. No more "what does this do?" questions. 101/101 tests still passing. Zero behavior changes — pure readability upgrade.
+
+### What got added
+
+**`BLUEPRINT_ANALYSIS.md` — The "What's Left Before Production?" document.**
+
+Nine production gaps. All bilingual (English + Spanish). All with how-to-implement, what-breaks, what-improves, files-touched, and effort estimates. If someone asks you "is this production-ready?" in a technical interview, you open this document and let it do the talking.
+
+Gaps covered:
+- §1 **CRITICAL** — PostgreSQL migration (`ON CONFLICT DO NOTHING`)
+- §2 **CRITICAL** — Stripe webhook signature verification (the code is already written — just uncomment it)
+- §3 **HIGH** — Asynchronous outbox worker (FastAPI lifespan or Temporal activity)
+- §4 **HIGH** — DLQ backoff retry budget engine (so the DLQ is a quarantine, not a graveyard)
+- §5 **LOW** — Currency `.lower()` normalization (30-minute fix, prevents valid payments from DLQ'ing on uppercase "USD")
+- §6 **MEDIUM** — Structured JSON logging (Grafana/Datadog/CloudWatch can't parse plain text)
+- §7 **MEDIUM** — Prometheus `/metrics` endpoint
+- §8 **LOW** — WAL checkpoint every N commits (bounded WAL file size on long runs)
+- §9 **HIGH** — Per-event-type strict amount extraction (no silent $0 records in the ledger)
+
+**Bilingual `#` comments — every source file, every meaningful block.**
+
+English + Spanish. WHAT the code does + WHY it does it that way. The rule: any reader — recruiter, engineer, external auditor — reads a line number and needs zero follow-up questions. No jargon without explanation. No "obvious" code left without context.
+
+Files documented:
+- `ledger.py` — 6 full sections: module docstring, all Pydantic models, database bootstrap, core logic, FastAPI routes, benchmark mode
+- `test_ledger.py` — every test section, every assertion group, every helper function
+- `Dockerfile` — every instruction: why multi-stage, why non-root, why the volume mount
+- `requirements.txt` — every dependency with version rationale + future deps commented in place
+- `.gitignore` — every rule, including the security-critical `.env` exclusion with explicit warning
+
+**`instrucciones 1.1.txt` — deleted.**
+
+Historical Copilot session transcript from the original planning phase. Everything in it was implemented in Phases 1–5. It ended mid-sentence at 92% token limit. Not tracked in git — removed cleanly.
+
+### What did NOT change
+
+The 101 tests still pass. The TPS numbers are unchanged. The API surface is identical. The database schema is identical. This was a documentation session, not a feature session.
+
+---
+
 ## 🧬 Origin
 
 The fault-tolerance patterns here — idempotent inserts, transactional outbox, and dead-lettering — are stripped from [Aequitas](https://github.com/DDRG15/aequitas-privacy-engine), my high-throughput engine built to process 75k+ events per second with zero data loss under hard kills.
