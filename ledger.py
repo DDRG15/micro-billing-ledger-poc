@@ -33,12 +33,23 @@ Usage
 
 import argparse
 import json
+import logging
 import sqlite3
 import time
 import pathlib
 from contextlib import contextmanager
 from typing import Generator, Optional
 from enum import Enum
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("billing_ledger.log"),
+    ],
+)
+_log = logging.getLogger("ledger")
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -87,8 +98,6 @@ class StripeObject(BaseModel):
             raise ValueError(
                 "Either amount_paid or amount must be provided and non-null"
             )
-        if actual_amount < 0:
-            raise ValueError(f"Amount cannot be negative: {actual_amount}")
         return self
 
     def get_amount(self) -> int:
@@ -295,9 +304,6 @@ def _tx(conn: sqlite3.Connection) -> Generator[sqlite3.Cursor, None, None]:
 # Core ledger logic  (framework-agnostic — easy to unit-test)
 # ---------------------------------------------------------------------------
 
-# SUPPORTED_EVENT_TYPES now defined via EventType enum (above)
-SUPPORTED_EVENT_TYPES = {e.value for e in EventType}
-
 # Maps EventType -> ledger status (type-safe via Enum)
 _STATUS_MAP: dict[EventType, LedgerStatus] = {
     EventType.INVOICE_PAID:     LedgerStatus.POSTED,
@@ -417,7 +423,9 @@ def process_stripe_event(conn: sqlite3.Connection, event: dict) -> dict:
 
 
 def _write_dlq(conn: sqlite3.Connection, entry: DLQEntry) -> None:
-    """Best-effort DLQ append — never raises so the main path is unaffected."""
+    """Best-effort DLQ append — never raises so the main path is unaffected.
+    On failure, the full raw payload is preserved in the log — no data is lost.
+    """
     try:
         with _tx(conn) as cur:
             cur.execute(
@@ -425,8 +433,18 @@ def _write_dlq(conn: sqlite3.Connection, entry: DLQEntry) -> None:
                 " VALUES (?,?,?,?)",
                 entry.to_db(),
             )
-    except Exception:
-        pass   # DLQ write failure must never kill the hot path
+    except Exception as exc:
+        # DB write failed — the hot path must not die, but the payload MUST be
+        # recoverable. Log at ERROR so alerts fire; include the full raw payload
+        # so operators can manually replay or insert it.
+        _log.error(
+            "DLQ write failed — payload preserved here for manual recovery. "
+            "transaction_id=%s reason=%s error=%r raw_payload=%s",
+            entry.transaction_id,
+            entry.reason.value,
+            exc,
+            json.dumps(entry.raw_payload),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +513,31 @@ async def ledger_summary() -> JSONResponse:
     })
 
 
+@app.get("/dlq/entries")
+async def dlq_entries(limit: int = 50) -> JSONResponse:
+    """Inspect DLQ entries — newest first. Default limit 50, max via ?limit=N.
+    Raw payload is deserialized so callers get a proper JSON object, not a string.
+    """
+    rows = _conn.execute(
+        "SELECT id, transaction_id, reason, raw_payload, received_at "
+        "FROM dlq ORDER BY id DESC LIMIT ?",
+        (min(limit, 1000),),
+    ).fetchall()
+    return JSONResponse(content={
+        "entries": [
+            {
+                "id":             r[0],
+                "transaction_id": r[1],
+                "reason":         r[2],
+                "raw_payload":    json.loads(r[3]),
+                "received_at":    r[4],
+            }
+            for r in rows
+        ],
+        "count": len(rows),
+    })
+
+
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse(content={"status": "ok"})
@@ -515,7 +558,7 @@ def _run_headless_benchmark(n: int = 10_000) -> None:
     def _fake_event(i: int) -> dict:
         return {
             "id":   f"evt_{''.join(random.choices(string.ascii_lowercase, k=16))}",
-            "type": random.choice(list(SUPPORTED_EVENT_TYPES)),
+            "type": random.choice(list(EventType)).value,
             "data": {"object": {
                 "customer":    f"cus_{i:06d}",
                 "amount_paid": random.randint(100, 100_000),
