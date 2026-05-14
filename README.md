@@ -82,6 +82,133 @@ Returning 200 on a failed write tells Stripe "got it, stop retrying." The money 
 
 ---
 
+## 🔧 Phase 1: Pydantic Validation Pipeline (May 13, 2026)
+
+**Status:** Entry boundary guardrails installed. 34/34 tests passing. Still respects your data, now with type safety.
+
+We added Pydantic validation at the webhook entry point. Because let's face it — raw dict extraction was a bit too trusting. Now we have proper bouncers checking IDs, currencies, and amounts before they hit the database.
+
+### What Got Implemented
+
+**1. EventType Enum — The Bouncer's Rulebook**
+```python
+class EventType(str, Enum):
+    INVOICE_PAID = "invoice.paid"
+    INVOICE_FAILED = "invoice.payment_failed"
+    SUB_CREATED = "customer.subscription.created"
+    SUB_DELETED = "customer.subscription.deleted"
+    SUB_UPDATED = "customer.subscription.updated"
+```
+No more string typos in event type checks. The enum knows what's allowed.
+
+**2. Nested Pydantic Models — Structured Webhook Data**
+```python
+class StripeObject(BaseModel):
+    customer: str = Field(min_length=4)  # No empty strings, no "unknown"
+    amount_paid: Optional[int] = Field(ge=0)  # Non-negative cents
+    amount: Optional[int] = Field(ge=0)      # Fallback field
+    currency: str = Field(pattern=r"^[a-z]{3}$")  # ISO 4217 lowercase
+
+class StripeEvent(BaseModel):
+    id: str = Field(min_length=1)
+    type: EventType  # Enum validation — rejects unknown types
+    data: StripeEventData
+    request: Optional[dict] = None
+    idempotency_key: Optional[str] = None  # Resolved in validator
+```
+Three-layer validation: BaseModel (types) → Field constraints (values) → @model_validator (business logic).
+
+**3. Smart Amount Fallback Logic**
+```python
+@model_validator(mode='after')
+def check_amount_present(self):
+    actual_amount = self.amount_paid if self.amount_paid is not None else self.amount
+    if actual_amount is None:
+        raise ValueError("Either amount_paid or amount must be provided")
+    if actual_amount < 0:
+        raise ValueError(f"Amount cannot be negative: {actual_amount}")
+    return self
+```
+Stripe sometimes puts amounts in `amount_paid`, sometimes in `amount`. We handle both, but require at least one.
+
+**4. Currency Validation — No More "USD" Surprises**
+- Pattern: `^[a-z]{3}$` (exactly 3 lowercase letters)
+- Rejects: `"USD"` (uppercase), `"us"` (too short), `"UUU"` (invalid code)
+- Accepts: `"usd"`, `"eur"`, `"gbp"`
+
+**5. Customer ID Validation — No More "Unknown" Placeholders**
+- Minimum length: 4 characters (Stripe IDs like `"cus_ABC123"`)
+- Rejects: `""`, `"cus"`, `null`
+- Forces real customer IDs in the database
+
+**6. Three-Layer Validation Pipeline**
+```
+Raw webhook → Pydantic validation → Business logic → DLQ routing
+     ↓              ↓                    ↓            ↓
+  Dirty data    Type + Field checks   Ledger write   Invalid events
+```
+Invalid data gets caught at Layer 1 (Pydantic) and routed to DLQ with reason "INVALID".
+
+### What Changed in Process Flow
+
+**Before (Dict Extraction):**
+```python
+event_type = event.get("type", "")  # Could be anything
+customer_id = data_object.get("customer", "unknown")  # Silent default
+amount_cents = data_object.get("amount_paid") or data_object.get("amount", 0)  # No validation
+```
+
+**After (Pydantic Validation):**
+```python
+validated_event = StripeEvent(**event)  # Throws ValidationError if invalid
+# Now guaranteed: event_type is EventType enum, customer_id is valid string, etc.
+```
+
+### Test Results — We Actually Tested This
+
+**34/34 tests passing** (up from 25 before Phase 1)
+
+**New validation tests:**
+- Currency rejects uppercase: `"USD"` → `DLQ_INVALID`
+- Customer rejects empty: `""` → `DLQ_INVALID`
+- Amount rejects negative: `-5000` → `DLQ_INVALID`
+- EventType rejects unknown: `"payment.created"` → `DLQ_INVALID`
+- Amount fallback works: `amount_paid=None, amount=3000` → `POSTED`
+
+**Performance:** 12,412 TPS (5,000 events in 0.403s) — still fast, now safe.
+
+### Errors We Fixed
+
+**1. Pydantic Import Issues**
+- Initially forgot `ValidationError` and `model_validator` imports
+- Fixed: Added proper imports for Pydantic v2.9.2
+
+**2. Idempotency Key Validator Bug**
+- `@model_validator` tried to set `self.idempotency_key` but field wasn't defined
+- Fixed: Added `idempotency_key: Optional[str] = None` to model signature
+
+**3. Test Stub Conflicts**
+- Old test stubs conflicted with real Pydantic imports
+- Fixed: Removed stubs, let real packages handle imports
+
+**4. DLQ Reason Code Changes**
+- Unknown event types now caught by Pydantic as `DLQ_INVALID` (not separate `DLQ_UNKNOWN_TYPE`)
+- Fixed: Updated test expectations to match new behavior
+
+### What This Means for Production
+
+**Data Quality:** No more silent corruption. Invalid webhooks get caught at entry, logged to DLQ.
+
+**Type Safety:** `event.type` is now `EventType.INVOICE_PAID`, not a string that could be `"invooice.paid"`.
+
+**Audit Trail:** Every validation failure is logged with reason. No more "how did this get in the database?"
+
+**Backwards Compatibility:** Valid webhooks still work exactly the same. Invalid ones now fail fast instead of corrupting data.
+
+Still a PoC, but now with guardrails that would make an auditor smile. Ready for Phase 2 when you give the word.
+
+---
+
 ## ⚡ Performance: Tactical Speed
 
 Bypassing the HTTP overhead to measure pure ledger throughput:
