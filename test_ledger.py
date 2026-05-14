@@ -285,7 +285,7 @@ import random, string
 def _fake(i):
     return fake_event(
         eid=f"evt_{''.join(random.choices(string.ascii_lowercase, k=12))}_{i}",
-        etype=random.choice(list(L.SUPPORTED_EVENT_TYPES)),
+        etype=random.choice(list(L.EventType)).value,
         customer=f"cus_{i}",
         amount=random.randint(100, 50_000),
     )
