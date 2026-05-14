@@ -470,13 +470,12 @@ def _fake(i):
 
 events  = [_fake(i) for i in range(N)]
 t0      = time.perf_counter()
-for ev in events:
-    L.process_stripe_event(conn4, ev)
+L.process_stripe_event_batch(conn4, events)
 elapsed = time.perf_counter() - t0
 tps     = N / elapsed
 chk(f"throughput ≥ 500 TPS  (got {tps:,.0f})", tps >= 500)
 print(f"         {N:,} events in {elapsed:.3f}s  →  {tps:,.0f} TPS  "
-      f"(single-core, PostgreSQL localhost)")
+      f"(batch via execute_values, PostgreSQL localhost)")
 
 
 # =============================================================================

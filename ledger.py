@@ -52,6 +52,7 @@ import logging        # EN: Structured log output to file and stderr / ES: Salid
 import os             # EN: DATABASE_URL env var lookup / ES: Lectura de la variable de entorno DATABASE_URL
 import time           # EN: Unix timestamps for created_at and received_at fields / ES: Timestamps Unix para campos created_at y received_at
 import psycopg2       # EN: PostgreSQL driver — replaces SQLite for production-grade storage / ES: Driver PostgreSQL — reemplaza SQLite para almacenamiento de grado producción
+from psycopg2.extras import execute_values  # EN: Bulk INSERT — collapses N round trips to ceil(N/page_size) / ES: INSERT en bloque — colapsa N round trips a ceil(N/page_size)
 from contextlib import contextmanager  # EN: @contextmanager for _tx() BEGIN/COMMIT wrapper / ES: @contextmanager para el wrapper BEGIN/COMMIT de _tx()
 from typing import Generator, Optional  # EN: Type hints for static analysis / ES: Hints de tipo para análisis estático
 from enum import Enum  # EN: Enums for EventType, LedgerStatus, DLQReason — prevents raw string drift / ES: Enums para EventType, LedgerStatus, DLQReason — previene drift de strings crudos
@@ -879,6 +880,149 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
             exc,
             json.dumps(entry.raw_payload),
         )
+
+
+def process_stripe_event_batch(
+    conn: "psycopg2.extensions.connection",
+    events: list[dict],
+    page_size: int = 1000,
+) -> list[dict]:
+    """
+    EN: Batch variant of process_stripe_event(). Collapses N single-event round trips
+        down to 4 + ceil(N/page_size)*3 round trips: one BEGIN, one bulk ledger INSERT,
+        one bulk outbox INSERT, one bulk DLQ INSERT, one COMMIT. At page_size=1000 and
+        N=5000, that is ~12 total round trips vs 20,000 for the per-event path.
+
+        Atomicity guarantee: all valid new events land in both ledger and outbox, or none
+        do. ON CONFLICT (transaction_id) DO NOTHING is preserved per-row within the batch —
+        the RETURNING clause reveals exactly which rows were inserted vs skipped.
+
+        Returns a list of result dicts indexed by input position, matching the shape
+        returned by process_stripe_event() for drop-in compatibility.
+
+    ES: Variante en lote de process_stripe_event(). Colapsa N round trips por evento
+        a 4 + ceil(N/page_size)*3 round trips: un BEGIN, un INSERT masivo en el libro,
+        un INSERT masivo en el outbox, un INSERT masivo en el DLQ, un COMMIT. Con
+        page_size=1000 y N=5000, son ~12 round trips totales vs 20,000 para la ruta
+        por evento.
+
+        Garantía de atomicidad: todos los eventos nuevos válidos aterrizan en el libro
+        y en el outbox, o ninguno lo hace. ON CONFLICT (transaction_id) DO NOTHING se
+        preserva por fila dentro del lote — la cláusula RETURNING revela exactamente
+        qué filas se insertaron vs se omitieron.
+    """
+    if not events:
+        return []
+
+    now = time.time()
+    results: list = [None] * len(events)
+    valid: list[tuple[int, dict, LedgerEntry]] = []
+    invalid_dlq_rows: list[tuple] = []
+
+    # ── Phase 1: Pydantic validation (no DB touch) ────────────────────────────
+    for idx, event in enumerate(events):
+        try:
+            validated = StripeEvent(**event)
+        except ValidationError as e:
+            tid = event.get("id") or "unknown"
+            invalid_dlq_rows.append(
+                DLQEntry(transaction_id=tid, reason=DLQReason.INVALID, raw_payload=event).to_db()
+            )
+            results[idx] = {
+                "outcome":        "DLQ_INVALID",
+                "transaction_id": tid,
+                "reason":         f"Pydantic validation failed: {e.error_count()} errors",
+            }
+            continue
+        data_obj = validated.data.object
+        entry = LedgerEntry(
+            transaction_id=validated.id,
+            event_type=validated.type,
+            customer_id=data_obj.customer,
+            amount_cents=data_obj.get_amount(),
+            currency=data_obj.currency,
+            status=_STATUS_MAP[validated.type],
+            idempotency_key=validated.idempotency_key,
+            payload=json.dumps(event),
+            created_at=now,
+        )
+        valid.append((idx, event, entry))
+
+    # ── Phase 2: Single atomic transaction — bulk ledger + outbox + DLQ ───────
+    try:
+        with _tx(conn) as cur:
+            inserted_ids: set[str] = set()
+            if valid:
+                # EN: execute_values expands VALUES %s into (row1),(row2),...
+                #     ON CONFLICT DO NOTHING skips duplicate transaction_ids silently.
+                #     RETURNING gives back only the rows that actually landed — not conflicts.
+                #     fetch=True accumulates RETURNING rows across all page_size batches.
+                returned = execute_values(
+                    cur,
+                    """
+                    INSERT INTO ledger
+                      (transaction_id, event_type, customer_id, amount_cents,
+                       currency, status, idempotency_key, payload, created_at)
+                    VALUES %s
+                    ON CONFLICT (transaction_id) DO NOTHING
+                    RETURNING transaction_id
+                    """,
+                    [entry.to_db() for _, _, entry in valid],
+                    page_size=page_size,
+                    fetch=True,
+                )
+                inserted_ids = {row[0] for row in returned}
+
+            outbox_rows: list[tuple] = []
+            dup_dlq_rows: list[tuple] = []
+
+            for idx, event, entry in valid:
+                if entry.transaction_id in inserted_ids:
+                    outbox_rows.append(
+                        (entry.transaction_id, entry.event_type.value, entry.payload, now)
+                    )
+                    results[idx] = {
+                        "outcome":        entry.status.value,
+                        "transaction_id": entry.transaction_id,
+                        "reason":         None,
+                    }
+                else:
+                    dup_dlq_rows.append(
+                        DLQEntry(
+                            transaction_id=entry.transaction_id,
+                            reason=DLQReason.DUPLICATE,
+                            raw_payload=event,
+                        ).to_db()
+                    )
+                    results[idx] = {
+                        "outcome":        "DLQ_DUPLICATE",
+                        "transaction_id": entry.transaction_id,
+                        "reason":         "Already processed — idempotency guard fired",
+                    }
+
+            if outbox_rows:
+                execute_values(
+                    cur,
+                    "INSERT INTO outbox"
+                    " (transaction_id, event_type, payload, created_at) VALUES %s",
+                    outbox_rows,
+                    page_size=page_size,
+                )
+
+            all_dlq = invalid_dlq_rows + dup_dlq_rows
+            if all_dlq:
+                execute_values(
+                    cur,
+                    "INSERT INTO dlq"
+                    " (transaction_id, reason, raw_payload, received_at) VALUES %s",
+                    all_dlq,
+                    page_size=page_size,
+                )
+
+    except psycopg2.OperationalError as exc:
+        raise RuntimeError(f"DB batch write failed: {exc}") from exc
+
+    return results
 
 
 # ===========================================================================
