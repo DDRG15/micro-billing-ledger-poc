@@ -454,6 +454,51 @@ assert raw["id"] == original_event["id"]   # Byte-perfect preservation
 
 ---
 
+## 🔧 Audit Trail Hardening (May 13, 2026)
+
+**Status:** 101/101 tests still passing. Four changes — two are cleanup, two are "no data ever goes missing."
+
+### What Got Fixed
+
+**1. DLQ write failure now leaves a recoverable trail**
+
+Before:
+```python
+except Exception:
+    pass   # silent. payload gone. good luck at month-end.
+```
+
+After:
+```python
+except Exception as exc:
+    _log.error(
+        "DLQ write failed — payload preserved here for manual recovery. "
+        "transaction_id=%s reason=%s error=%r raw_payload=%s",
+        entry.transaction_id, entry.reason.value, exc,
+        json.dumps(entry.raw_payload),
+    )
+```
+
+The hot path still never raises — Stripe gets its 200. But the full raw payload is now logged at ERROR level to both stderr and `billing_ledger.log`. If the DB is down, you can grep the log file and manually replay every entry that didn't make it into the DLQ table. No data disappears quietly.
+
+**2. `GET /dlq/entries` — inspect the DLQ over HTTP**
+
+```bash
+curl http://localhost:8000/dlq/entries?limit=20
+```
+
+Returns newest entries first, raw payload deserialized to a proper JSON object (not an escaped string). Before this, the only DLQ visibility was a count in `/ledger/summary`. Now operators can see what's in there without touching SQLite directly.
+
+**3. Dead code removed — `SUPPORTED_EVENT_TYPES`**
+
+A `{e.value for e in EventType}` set that was never referenced after the Pydantic refactor. The `EventType` enum handles rejection at the boundary. The set was a maintenance hazard — a reader might assume it was the authoritative list and miss that the enum is.
+
+**4. Unreachable branch removed — `amount < 0` check**
+
+`amount_paid` and `amount` fields both have `ge=0` on their Field definitions. Pydantic rejects negative values there before the `@model_validator` ever runs. The `if actual_amount < 0` branch in `check_amount_present` could never fire. Removed.
+
+---
+
 ## 🔑 Where the API Key Goes
 
 The Stripe webhook secret is in [ledger.py](ledger.py) — two spots, both marked:
