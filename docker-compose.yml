@@ -35,6 +35,7 @@ services:
       # EN: 5432 exposed to localhost so tests can reach it without going through the API container.
       # ES: 5432 expuesto a localhost para que los tests puedan alcanzarlo sin pasar por el contenedor API.
       - "5432:5432"
+    restart: unless-stopped
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -60,9 +61,16 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/billing
-      STRIPE_WEBHOOK_SECRET: whsec_YOUR_SECRET_HERE
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      # EN: Set STRIPE_WEBHOOK_SECRET in your shell or a .env file before running.
+      #     Format: whsec_xxxx  (from Stripe Dashboard → Developers → Webhooks → Signing secret)
+      #     Never hardcode the real secret here — rotate ALL secrets if this file is committed.
+      # ES: Establecer STRIPE_WEBHOOK_SECRET en tu shell o archivo .env antes de ejecutar.
+      #     Formato: whsec_xxxx  (desde Stripe Dashboard → Developers → Webhooks → Signing secret)
+      #     Nunca hardcodear el secreto real aquí — rotar TODOS los secretos si este archivo se commitea.
     ports:
       - "8000:8000"
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy

@@ -39,15 +39,23 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 
 # ---------------------------------------------------------------------------
-# FUTURE DEPENDENCIES (not yet added — see BLUEPRINT_ANALYSIS.md for details)
-# DEPENDENCIAS FUTURAS (aún no agregadas — ver BLUEPRINT_ANALYSIS.md para detalles)
-#
-# EN: These are the packages needed to close the production gaps identified in the Blueprint PDF.
-#     They are commented out so the PoC stays minimal and installable without external services.
-# ES: Estos son los paquetes necesarios para cerrar las brechas de producción identificadas en el PDF de Arquitectura.
-#     Están comentados para que el PoC permanezca mínimo e instalable sin servicios externos.
-#
-# stripe==10.12.0         # EN: Stripe webhook signature verification (BLUEPRINT §2 CRITICAL) / ES: Verificación de firma de webhook Stripe (BLUEPRINT §2 CRÍTICO)
+# ---------------------------------------------------------------------------
+# ACTIVE DEPENDENCIES / DEPENDENCIAS ACTIVAS
+# ---------------------------------------------------------------------------
+
+# EN: Stripe 10.12.0 — SDK for webhook signature verification.
+#     stripe.Webhook.construct_event() validates the HMAC-SHA256 signature in the
+#     Stripe-Signature header. Without this, anyone who knows the URL can POST fake events.
+#     Set STRIPE_WEBHOOK_SECRET in the environment to activate enforcement.
+# ES: Stripe 10.12.0 — SDK para verificación de firma de webhook.
+#     stripe.Webhook.construct_event() valida la firma HMAC-SHA256 en el header Stripe-Signature.
+#     Sin esto, cualquiera que conozca la URL puede enviar eventos falsos.
+#     Establecer STRIPE_WEBHOOK_SECRET en el entorno para activar la aplicación.
+stripe==10.12.0
+
 psycopg2-binary==2.9.9  # EN: PostgreSQL sync driver — ACTIVE. Binary package includes libpq; no OS headers needed. / ES: Driver sync PostgreSQL — ACTIVO. El paquete binary incluye libpq; sin headers del SO necesarios.
-# prometheus-client==0.21.0  # EN: /metrics endpoint with Prometheus counters (BLUEPRINT §7 MEDIUM) / ES: Endpoint /metrics con contadores Prometheus (BLUEPRINT §7 MEDIO)
+
+# EN: Uncomment when adding Prometheus /metrics endpoint.
+# ES: Descomentar al agregar el endpoint /metrics de Prometheus.
+# prometheus-client==0.21.0
 # ---------------------------------------------------------------------------
