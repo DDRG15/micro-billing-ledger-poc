@@ -1,163 +1,127 @@
-# LOGIC_AUDIT.md — Architectural Delta Report
-# =============================================
-# EN: Audit document answering three specific questions about what was and was not changed.
-#     Written by Claude Sonnet 4.6 — May 14, 2026.
-#     Author/Owner: Diego Alonso Del Río García
-#
-# ES: Documento de auditoría que responde tres preguntas específicas sobre qué se cambió y qué no.
-#     Escrito por Claude Sonnet 4.6 — 14 de mayo de 2026.
-#     Autor/Propietario: Diego Alonso Del Río García
+# LOGIC_AUDIT.md — Architectural State Reference
+## Micro-Billing-Ledger PoC
+### Diego Alonso Del Río García — Mayo 2026
 
 ---
 
-## Preface / Prefacio
+## Purpose / Propósito
 
-**EN:** This document answers three direct questions about the architectural changes made in this session.
-The answers are blunt. Where nothing was implemented, this document says so explicitly.
-The distinction between *analyzed and documented* vs *implemented and committed* is the entire point.
+EN: This document is the authoritative reference for the current architectural state of the
+    repository. It is a living document — update it when the architecture changes. It answers
+    three questions: what is implemented, how it works, and what is not yet implemented.
 
-**ES:** Este documento responde tres preguntas directas sobre los cambios arquitectónicos realizados en esta sesión.
-Las respuestas son directas. Donde no se implementó nada, este documento lo dice explícitamente.
-La distinción entre *analizado y documentado* vs *implementado y commiteado* es el punto central.
-
----
-
-## Question 1 — Test Assertions
-### Did you alter the assertions or expected outcomes of any of the original 101 tests to make them pass?
-
-**Answer: No. Zero test assertions were changed.**
-
-Every `chk(...)` call in `test_ledger.py` carries the exact same condition, expected value, and
-message it had before this session began. What changed in that file was commentary only —
-bilingual `#` comments explaining the *why* behind each test block were added above test groups.
-
-The 101/101 pass rate is not a product of softened expectations. It was the pass rate before
-any changes were made and it remains the same pass rate after. The comments were added
-*after* a full test run confirmed the existing logic was correct, not as a cover for failures.
-
-To verify this claim yourself:
-
-```bash
-git diff d95a6ce HEAD -- test_ledger.py | grep "^[-+]" | grep -v "^[-+]#" | grep -v "^---" | grep -v "^+++"
-```
-
-That command strips comment-only diff lines. The output will show zero changes to any
-`chk()` call, any assertion value, or any test logic. The only additions are `#` lines.
-
-**What was NOT done:** No expected value was widened. No `chk()` condition was weakened from
-`==` to `in` or from strict to loose. No test was deleted to hide a failure. No mock was
-introduced to bypass a real check. Every test still hits the same real in-memory SQLite
-instance with the same real validation stack.
+ES: Este documento es la referencia autoritativa para el estado arquitectónico actual del
+    repositorio. Es un documento vivo — actualizarlo cuando la arquitectura cambie. Responde
+    tres preguntas: qué está implementado, cómo funciona, y qué aún no está implementado.
 
 ---
 
-## Question 2 — PostgreSQL ON CONFLICT Idempotency Guard
-### Show me the exact SQL syntax used for the Postgres ON CONFLICT idempotency guard.
+## Current Engine / Motor Actual
 
-**Answer: This was not implemented. No PostgreSQL code exists in this repository.**
+EN: **PostgreSQL 16** (via psycopg2-binary). SQLite was used during Phases 1–3 for
+    in-memory test speed. It was fully replaced by PostgreSQL in commit `6554181`.
+    There is no SQLite code anywhere in this repository. All tests hit a live
+    PostgreSQL instance running in Docker (postgres:16-alpine).
 
-The current `ledger.py` at line 770 contains this SQLite statement:
-
-```sql
-INSERT OR IGNORE INTO ledger
-  (transaction_id, event_type, customer_id, amount_cents,
-   currency, status, idempotency_key, payload, created_at)
-VALUES (?,?,?,?,?,?,?,?,?)
-```
-
-`INSERT OR IGNORE` is SQLite syntax. It is not valid PostgreSQL. There is no
-`psycopg2` driver, no `asyncpg`, no connection string, no `ON CONFLICT` clause,
-and no PostgreSQL migration anywhere in the committed codebase.
-
-The phrase `ON CONFLICT DO NOTHING` appears exactly once in the entire project —
-in the `ledger.py` module docstring as a forward-looking comment:
-
-```
-# Pattern ports directly to Postgres (ON CONFLICT DO NOTHING) for production
-```
-
-That is documentation of future work, not executed SQL.
-
-**What the PostgreSQL equivalent would look like** (from `BLUEPRINT_ANALYSIS.md §1`,
-where this was analyzed but not implemented):
-
-```sql
-INSERT INTO ledger
-  (transaction_id, event_type, customer_id, amount_cents,
-   currency, status, idempotency_key, payload, created_at)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-ON CONFLICT (transaction_id) DO NOTHING
-```
-
-The `rowcount` check after this statement serves the same role as `INSERT OR IGNORE` +
-`rowcount` in SQLite: zero rows inserted means a duplicate was silently dropped and the
-event should be routed to the DLQ with `DLQReason.DUPLICATE`.
-
-This SQL does not exist in `ledger.py`. It exists in `BLUEPRINT_ANALYSIS.md` as
-a design specification for a future sprint. The estimated implementation effort is
-6–8 hours and is tracked as a CRITICAL-priority gap in that document.
+ES: **PostgreSQL 16** (vía psycopg2-binary). SQLite se usó durante las Fases 1–3 para
+    velocidad de tests en memoria. Fue completamente reemplazado por PostgreSQL en el
+    commit `6554181`. No hay código SQLite en ningún lugar de este repositorio. Todos
+    los tests golpean una instancia PostgreSQL real corriendo en Docker (postgres:16-alpine).
 
 ---
 
-## Question 3 — Outbox Temporal-Style Polling Loop
-### How was the outbox Temporal-style polling loop implemented without introducing a new race condition?
+## Idempotency Guard / Guardia de Idempotencia
 
-**Answer: It was not implemented. No polling loop exists in this repository.**
+EN: The idempotency mechanism is `INSERT INTO ledger (...) VALUES (...) ON CONFLICT
+    (transaction_id) DO NOTHING`. The `transaction_id` column is the PRIMARY KEY.
+    PostgreSQL's constraint engine serializes concurrent inserts — exactly one INSERT
+    wins the race; all others produce `rowcount=0` (single-event path) or are absent
+    from the `RETURNING` set (batch path). No application-level lock is needed.
 
-Search the entire codebase right now:
-
-```bash
-grep -n "outbox_worker\|asyncio\|lifespan\|create_task\|polling\|Temporal" ledger.py
-```
-
-The result is zero matches in executable code. The words appear only in `#` comments
-added this session to explain the *intent* of the existing outbox table, not to
-describe a running worker.
-
-The outbox table (`CREATE TABLE outbox`) was created in a previous session (Phase 3).
-Rows are written to it atomically inside the same `BEGIN...COMMIT` block as ledger rows.
-That guarantees the dual-write gap is zero — if the ledger write commits, the outbox
-row commits too. This is the transactional outbox pattern and it is fully implemented.
-
-**What is NOT implemented is the consumer side** — the worker that reads `WHERE dispatched=0`
-rows and ships them to a downstream system. That worker was designed in `BLUEPRINT_ANALYSIS.md §3`
-with the following approach to avoid a new race condition:
-
-```
-SELECT id, payload FROM outbox WHERE dispatched=0 ORDER BY id LIMIT 100
-→ dispatch each row to downstream (idempotent endpoint or queue)
-→ UPDATE outbox SET dispatched=1 WHERE id=? AND dispatched=0
-   (the AND dispatched=0 predicate ensures only one worker claims each row)
-→ sleep(1) and repeat
-```
-
-The `AND dispatched=0` guard in the UPDATE is the race-condition fence. Without it,
-two concurrent workers polling the same batch could both attempt dispatch. With it,
-the second UPDATE matches zero rows and the second worker silently skips — no
-duplicate delivery.
-
-This design exists as pseudocode in `BLUEPRINT_ANALYSIS.md §3`. It does not exist
-as running Python. No `asyncio.create_task()`, no FastAPI `lifespan` hook,
-no background thread, no scheduled job is present in the committed code.
-
-The estimated implementation effort is 4–6 hours and is tracked as a HIGH-priority
-gap in `BLUEPRINT_ANALYSIS.md`.
+ES: El mecanismo de idempotencia es `INSERT INTO ledger (...) VALUES (...) ON CONFLICT
+    (transaction_id) DO NOTHING`. La columna `transaction_id` es la PRIMARY KEY.
+    El motor de restricciones de PostgreSQL serializa las inserciones concurrentes — exactamente
+    un INSERT gana la carrera; todos los demás producen `rowcount=0` (ruta por evento) o
+    están ausentes del conjunto `RETURNING` (ruta en lote). No se necesita bloqueo a nivel
+    de aplicación.
 
 ---
 
-## Summary Table / Tabla Resumen
+## Transaction Model / Modelo de Transacción
 
-| Claim | Implemented? | Where it lives |
-|---|---|---|
-| 101 tests pass with original assertions | ✅ Yes — verified | `test_ledger.py` — unchanged `chk()` calls |
-| Postgres `ON CONFLICT` idempotency | ❌ No | `BLUEPRINT_ANALYSIS.md §1` — design only |
-| Outbox polling worker | ❌ No | `BLUEPRINT_ANALYSIS.md §3` — design only |
-| Transactional outbox write (atomic) | ✅ Yes | `ledger.py` — `_write_ledger()` + `_write_outbox()` in same tx |
-| SQLite `INSERT OR IGNORE` idempotency | ✅ Yes | `ledger.py:770` — currently live |
-| Bilingual comments on all source files | ✅ Yes | All 5 source files — committed in `9712cd0` |
-| `BLUEPRINT_ANALYSIS.md` gap analysis | ✅ Yes | New file — 9 gaps with effort estimates |
+EN: All three tables (ledger, outbox, dlq) are written inside a single `BEGIN…COMMIT`
+    block provided by `_tx()`. The `_tx()` context manager uses `conn.autocommit = True`
+    at the connection level, then issues explicit `BEGIN` / `COMMIT` or `ROLLBACK` to
+    group multiple statements into one atomic unit. A crash before COMMIT leaves nothing;
+    a crash after COMMIT leaves all rows intact. This is the Transactional Outbox pattern.
+
+ES: Las tres tablas (ledger, outbox, dlq) se escriben dentro de un único bloque
+    `BEGIN…COMMIT` proporcionado por `_tx()`. El gestor de contexto `_tx()` usa
+    `conn.autocommit = True` a nivel de conexión, luego emite `BEGIN` / `COMMIT` o
+    `ROLLBACK` explícitos para agrupar múltiples sentencias en una unidad atómica.
+    Un crash antes del COMMIT no deja nada; un crash después del COMMIT deja todas las
+    filas intactas. Este es el patrón Outbox Transaccional.
 
 ---
 
-*This document was generated by Claude Sonnet 4.6 at the explicit request of Diego Alonso Del Río García
-on May 14, 2026. It reflects the state of the repository as of commit `9712cd0`.*
+## Batch Path / Ruta en Lote
+
+EN: `process_stripe_event_batch()` uses `psycopg2.extras.execute_values` to collapse N
+    individual INSERT round trips into `ceil(N/page_size)` bulk statements. At
+    `page_size=1000` and N=5,000: ~12 round trips vs 20,000 for the per-event path.
+    Throughput: 26 TPS (per-event, Docker-WSL2) → ~5,000 TPS (batch). The 192×
+    improvement comes entirely from reducing synchronous network round trips.
+
+    Duplicate partitioning uses `RETURNING transaction_id`: PostgreSQL reports exactly
+    what THIS transaction inserted — atomic, no race window, no extra round trip.
+
+ES: `process_stripe_event_batch()` usa `psycopg2.extras.execute_values` para colapsar N
+    round trips de INSERT individuales en `ceil(N/page_size)` sentencias masivas. Con
+    `page_size=1000` y N=5,000: ~12 round trips vs 20,000 para la ruta por evento.
+    Throughput: 26 TPS (por evento, Docker-WSL2) → ~5,000 TPS (lote). La mejora de 192×
+    viene enteramente de reducir los round trips de red síncronos.
+
+    La partición de duplicados usa `RETURNING transaction_id`: PostgreSQL reporta exactamente
+    lo que ESTA transacción insertó — atómico, sin ventana de carrera, sin round trip extra.
+
+---
+
+## Test Isolation / Aislamiento de Tests
+
+EN: Each test section calls `fresh_conn()` which issues `TRUNCATE TABLE outbox, dlq,
+    ledger RESTART IDENTITY`. This resets all table data and BIGSERIAL sequences.
+    No mocking. No stubs. Every assertion hits a real PostgreSQL database.
+
+ES: Cada sección de test llama `fresh_conn()` que emite `TRUNCATE TABLE outbox, dlq,
+    ledger RESTART IDENTITY`. Esto resetea todos los datos de tablas y secuencias BIGSERIAL.
+    Sin mocking. Sin stubs. Cada aserción golpea una base de datos PostgreSQL real.
+
+---
+
+## What Is NOT Implemented / Lo que NO Está Implementado
+
+| Feature / Característica | Status / Estado |
+|---|---|
+| Stripe webhook signature verification | Code written, commented out — `stripe` SDK not in requirements |
+| Outbox worker (dispatch loop) | Schema exists (dispatched=0/1), worker not implemented |
+| Connection pooling | Single `psycopg2` connection — `ThreadedConnectionPool` is the next step |
+| Prometheus `/metrics` endpoint | Not implemented |
+| Structured JSON logging | Plain text logging only |
+| DLQ retry budget (retry_count, max_retries) | DLQ is append-only — no retry mechanism |
+
+---
+
+## Commit History / Historial de Commits
+
+```
+478bd29  docs: full bilingual rewrite of IMPLEMENTATION_REPORT, remove BLUEPRINT_ANALYSIS
+5e47362  docs: Phase 6 — lead architect documentation pass
+c8f1b30  perf: batch ingestion via execute_values — 26 TPS → 4,992 TPS
+6554181  feat: PostgreSQL migration — rip out SQLite, implement ON CONFLICT idempotency
+0d86845  docs: Add LOGIC_AUDIT.md — honest architectural delta report (SQLite era, now superseded)
+9712cd0  docs: bilingual comments, BLUEPRINT_ANALYSIS.md, README and IMPLEMENTATION_REPORT updates
+```
+
+---
+
+*Diego Alonso Del Río García — PostHog Billing PoC — Mayo 2026*
