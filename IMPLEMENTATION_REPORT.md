@@ -322,11 +322,11 @@ Every webhook now passes through this stack in order:
 
 4. Business logic
    _STATUS_MAP[event_type]      — what ledger status does this event get?
-   INSERT OR IGNORE              — is this a duplicate?
+   INSERT ... ON CONFLICT DO NOTHING  — DB-level idempotency guard (PostgreSQL)
 
 5. DLQ routing
    ValidationError → DLQ_INVALID
-   rowcount == 0   → DLQ_DUPLICATE
+   rowcount == 0 / absent from RETURNING set → DLQ_DUPLICATE
 ```
 
 If any layer throws, the event goes to DLQ. The raw payload is always preserved.
@@ -441,17 +441,129 @@ e4724e7  chore: add .gitignore and cleanup local artifacts
 
 ## Numbers
 
-| Phase | Tests | TPS |
-|---|---|---|
-| Before | ~25 | ~12,000 |
-| After Phase 1 | 34 | 12,412 |
-| After Phase 2 | 60 | 16,628 |
-| After Phase 3 | 69 | 16,609 |
-| After Phase 5 | 101 | 16,600+ |
+| Phase | Tests | TPS | Engine |
+|---|---|---|---|
+| Before | ~25 | ~12,000 | SQLite in-memory |
+| After Phase 1 | 34 | 12,412 | SQLite in-memory |
+| After Phase 2 | 60 | 16,628 | SQLite in-memory |
+| After Phase 3 | 69 | 16,609 | SQLite in-memory |
+| After Phase 5 | 101 | 16,600+ | SQLite in-memory |
+| After PostgreSQL migration | 101 | **26** | PostgreSQL (per-event, Docker-WSL2) |
+| After batch processing | 101 | **~5,000** | PostgreSQL (execute_values batch) |
 
-TPS fluctuates between runs — it's SQLite in-memory on a single core.
-The trend is flat, which is correct: adding validation at model creation
-has negligible overhead compared to the SQLite write.
+The jump from 16,600 to 26 is not a regression — it is the cost of switching from
+an in-memory SQLite engine (no network, no fsync) to a real PostgreSQL server (network
+round trips + WAL fsync). The 26 TPS number is honest. The ~5,000 TPS number is the
+engineered answer to it.
+
+---
+
+## PostgreSQL Migration (May 14, 2026)
+
+**Commits:** `6554181` (migration), `c8f1b30` (batch)
+**Tests:** 101/101 — real PostgreSQL, no mocks
+
+### Why We Migrated
+
+SQLite is a single-writer engine. Under concurrent load, all writes serialize behind a
+file-level lock. `check_same_thread=False` suppresses the Python warning — it does not
+fix the underlying problem. More importantly, SQLite's `INSERT OR IGNORE` does not give
+us `RETURNING` support, which is required for O(1) duplicate partitioning in batch mode.
+PostgreSQL gives us true concurrent writers, WAL, MVCC, and `ON CONFLICT DO NOTHING RETURNING`.
+
+### What Changed
+
+**`sqlite3` → `psycopg2`**
+
+Every import, every connection, every placeholder. `?` → `%s`. `conn.execute()` →
+`conn.cursor(); cur.execute()`. `INSERT OR IGNORE` → `INSERT ... ON CONFLICT (transaction_id) DO NOTHING`.
+
+**`_bootstrap(path)` → `_bootstrap(dsn)`**
+
+Instead of a file path, the function takes a DSN string from `DATABASE_URL`. The same
+three `CREATE TABLE IF NOT EXISTS` blocks — just PostgreSQL DDL syntax instead of SQLite.
+
+**`_tx()` unchanged in structure**
+
+`BEGIN` / yield cursor / `COMMIT` or `ROLLBACK` on exception. The PostgreSQL version uses
+`conn.autocommit = True` at the connection level, so `BEGIN` starts an explicit transaction
+that overrides autocommit for the duration of the block. Identical semantics, different driver.
+
+**Test isolation: `TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY`**
+
+SQLite used `DROP TABLE / CREATE TABLE`. PostgreSQL uses `TRUNCATE ... RESTART IDENTITY`
+which also resets BIGSERIAL sequences. Each test section calls `fresh_conn()` to start
+from a guaranteed empty state. No mocking. Real database. Real truncation.
+
+### The Concurrency Test Difference
+
+SQLite required each thread to open its own connection to a **shared temp file** — in-memory
+SQLite is per-connection and can't be shared across threads. PostgreSQL is a server:
+multiple clients connect to the same instance independently. Each thread calls
+`L._bootstrap()` to get its own `psycopg2` connection to the same server. The idempotency
+guard (`ON CONFLICT DO NOTHING`) handles the race at the DB level. The test result is
+identical: exactly 1 POSTED, 4 DLQ_DUPLICATE.
+
+---
+
+## Batch Performance Engineering (May 14, 2026)
+
+**Commit:** `c8f1b30`
+**Tests:** 101/101 — 500 TPS floor enforced as a hard assertion
+
+### The Problem
+
+After the PostgreSQL migration, the benchmark failed at 26 TPS (floor: 500 TPS).
+
+Root cause diagnosis:
+- Each `process_stripe_event()` call opens one `_tx()` block
+- One `_tx()` block = `BEGIN` + `INSERT ledger` + `INSERT outbox` + `COMMIT` = 4 round trips
+- Docker-on-Windows WSL2 ≈ 8ms per round trip (loopback through the WSL2 network stack)
+- 5,000 events × 4 round trips × 8ms = **160 seconds → 26 TPS**
+
+Lowering the threshold was not an option. Engineering our way out was.
+
+### The Solution: `process_stripe_event_batch()`
+
+**Key insight:** The bottleneck is not CPU. It is not the PostgreSQL constraint check.
+It is not Pydantic validation. It is the number of synchronous network round trips.
+Every `BEGIN` / `COMMIT` pair is two round trips. Collapsing 5,000 transactions into
+one transaction collapses 10,000 round trips into 2.
+
+**Why `execute_values` and not a loop:**
+
+`psycopg2.extras.execute_values` generates a multi-row `INSERT INTO ledger VALUES (row1), (row2), ...`
+statement. At `page_size=1000`, 5,000 rows become 5 SQL statements instead of 5,000.
+Combined with a single `BEGIN...COMMIT`, the round trip count drops from 20,000 to ~12.
+
+**Why `RETURNING transaction_id` and not a post-INSERT SELECT:**
+
+After a bulk `INSERT ... ON CONFLICT DO NOTHING`, we need to know which rows
+actually landed vs were silently skipped. A second `SELECT` after the INSERT adds a
+round trip and has a race window: between our `INSERT` and our `SELECT`, another
+concurrent connection could have inserted the same ID. We'd misclassify it.
+
+`RETURNING` is evaluated inside the same transaction: it reports exactly what THIS
+transaction inserted — atomic, no race window, no extra round trip. The resulting
+`inserted_ids` set enables O(1) partition of the valid events into
+`(new → write to outbox)` vs `(duplicate → write to DLQ)` in a single linear pass.
+
+**Atomicity at batch scale:**
+
+The Transactional Outbox rule holds: all three tables (ledger, outbox, DLQ) are written
+in one `BEGIN...COMMIT`. A crash before `COMMIT` leaves nothing. A crash after `COMMIT`
+leaves all outbox rows intact for the downstream worker. The guarantee is identical to
+the single-event path — just applied to N events instead of 1.
+
+### Result
+
+```
+Before:  5,000 events in ~195s  →  26 TPS   (per-event, 4 round trips each)
+After:   5,000 events in  ~1.0s →  ~5,000 TPS  (batch, 12 round trips total)
+```
+
+192× throughput improvement. Same idempotency guarantee. Same atomicity guarantee.
+Same DLQ semantics. Same 101 tests. All passing.
 
 ---
 
@@ -544,4 +656,4 @@ ES: Los 101 tests todavía pasan. Los números TPS no cambiaron. La superficie d
 
 ---
 
-*Diego Alonso Del Río García — PostHog Billing PoC — Mayo 2026*
+*Diego Alonso Del Río García — Billing PoC — Mayo 2026*
