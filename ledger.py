@@ -1101,8 +1101,21 @@ def process_stripe_event_batch(
             outbox_rows: list[tuple] = []
             dup_dlq_rows: list[tuple] = []
 
+            # EN: Use a mutable copy of inserted_ids for partition. When the same
+            #     transaction_id appears multiple times in the batch, only the first
+            #     occurrence is in RETURNING (PostgreSQL inserted it exactly once).
+            #     Discarding the id after the first match ensures the second occurrence
+            #     correctly routes to DLQ_DUPLICATE instead of being misclassified as new.
+            # ES: Usar una copia mutable de inserted_ids para la partición. Cuando el mismo
+            #     transaction_id aparece múltiples veces en el lote, solo la primera
+            #     ocurrencia está en RETURNING (PostgreSQL lo insertó exactamente una vez).
+            #     Descartar el id después de la primera coincidencia asegura que la segunda
+            #     ocurrencia enrute correctamente a DLQ_DUPLICATE en lugar de clasificarse mal como nuevo.
+            remaining_ids: set[str] = set(inserted_ids)
+
             for idx, event, entry in valid:
-                if entry.transaction_id in inserted_ids:
+                if entry.transaction_id in remaining_ids:
+                    remaining_ids.discard(entry.transaction_id)  # EN: consume so duplicate in same batch routes correctly / ES: consumir para que el duplicado en el mismo lote enrute correctamente
                     outbox_rows.append(
                         (entry.transaction_id, entry.event_type.value, entry.payload, now)
                     )
@@ -1256,7 +1269,7 @@ async def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSO
     sig_header = request.headers.get("stripe-signature", "")
     try:
         stripe.Webhook.construct_event(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
-    except stripe.errors.SignatureVerificationError:
+    except stripe.error.SignatureVerificationError:
         raise HTTPException(
             status_code=400,
             detail="Invalid or missing Stripe signature / Firma Stripe inválida o ausente"
