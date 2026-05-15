@@ -24,6 +24,8 @@ Two concurrent retries pass the `exists()` check before either commits. The resu
 
 ## Quick Start
 
+**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) · Python 3.12+
+
 ```bash
 # 1. Start PostgreSQL
 docker compose up -d postgres
@@ -37,8 +39,13 @@ pip install -r requirements.txt
 python test_ledger.py
 
 # 4. Start the API
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/billing \
-  uvicorn ledger:app --port 8000
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/billing
+export STRIPE_WEBHOOK_SECRET=whsec_YOUR_SECRET_HERE  # replace before receiving live Stripe traffic
+uvicorn ledger:app --port 8000
+
+# 5. Teardown — stop containers and remove volumes
+docker compose down          # keeps pgdata volume (data survives)
+docker compose down -v       # wipes pgdata volume (full clean slate)
 ```
 
 ### Send test webhooks
