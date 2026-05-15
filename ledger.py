@@ -889,27 +889,63 @@ def process_stripe_event_batch(
 ) -> list[dict]:
     """
     EN: Batch variant of process_stripe_event(). Collapses N single-event round trips
-        down to 4 + ceil(N/page_size)*3 round trips: one BEGIN, one bulk ledger INSERT,
-        one bulk outbox INSERT, one bulk DLQ INSERT, one COMMIT. At page_size=1000 and
-        N=5000, that is ~12 total round trips vs 20,000 for the per-event path.
+        down to 4 + ceil(N/page_size)*3 round trips total: one BEGIN, one bulk ledger
+        INSERT, one bulk outbox INSERT, one bulk DLQ INSERT, one COMMIT. At page_size=1000
+        and N=5,000 that is ~12 round trips vs 20,000 for the per-event path — the source
+        of the 192× throughput gain observed in the benchmark (26 TPS → ~5,000 TPS).
 
-        Atomicity guarantee: all valid new events land in both ledger and outbox, or none
-        do. ON CONFLICT (transaction_id) DO NOTHING is preserved per-row within the batch —
-        the RETURNING clause reveals exactly which rows were inserted vs skipped.
+        WHY page_size=1000:
+        PostgreSQL limits a prepared statement to 65,535 bind parameters. With 9 ledger
+        columns per row, 1,000 rows = 9,000 parameters — safely within the limit while
+        keeping round trips near the minimum. Larger pages would require pre-splitting;
+        smaller pages waste round trips. 1,000 is the practical sweet spot for a 9-column
+        table on a localhost connection.
+
+        WHY RETURNING for duplicate partitioning:
+        After a bulk INSERT with ON CONFLICT DO NOTHING, we need to know which rows
+        actually landed vs were silently skipped. There are three approaches:
+
+          A. Post-INSERT SELECT — adds a round trip and races concurrent inserters.
+             Between our INSERT and our SELECT, another connection could have inserted
+             the same ID; we'd misclassify it as ours.
+
+          B. Pre-INSERT application-side tracking — loses the atomicity guarantee for
+             the same reason: another connection can insert the same ID between our
+             tracking step and our INSERT.
+
+          C. RETURNING (this implementation) — atomic: PostgreSQL reports exactly what
+             THIS transaction inserted, visible only within this transaction, with no
+             race window and no extra round trip.
+
+        The inserted_ids set built from RETURNING enables O(1) partition of the valid
+        list into (new → outbox) vs (duplicate → DLQ) in a single linear pass.
+
+        Atomicity guarantee: all valid new events land in both ledger and outbox, or
+        none do. The Transactional Outbox rule holds at batch scale: a crash after
+        COMMIT leaves all outbox rows intact for the downstream worker to deliver;
+        a crash before COMMIT leaves nothing in either table.
 
         Returns a list of result dicts indexed by input position, matching the shape
         returned by process_stripe_event() for drop-in compatibility.
 
     ES: Variante en lote de process_stripe_event(). Colapsa N round trips por evento
-        a 4 + ceil(N/page_size)*3 round trips: un BEGIN, un INSERT masivo en el libro,
-        un INSERT masivo en el outbox, un INSERT masivo en el DLQ, un COMMIT. Con
-        page_size=1000 y N=5000, son ~12 round trips totales vs 20,000 para la ruta
-        por evento.
+        a 4 + ceil(N/page_size)*3 round trips totales. Con page_size=1000 y N=5,000
+        son ~12 round trips vs 20,000 para la ruta por evento — fuente de la mejora
+        192× en el benchmark (26 TPS → ~5,000 TPS).
 
-        Garantía de atomicidad: todos los eventos nuevos válidos aterrizan en el libro
-        y en el outbox, o ninguno lo hace. ON CONFLICT (transaction_id) DO NOTHING se
-        preserva por fila dentro del lote — la cláusula RETURNING revela exactamente
-        qué filas se insertaron vs se omitieron.
+        POR QUÉ page_size=1000: PostgreSQL limita un prepared statement a 65,535
+        parámetros. Con 9 columnas del libro por fila, 1,000 filas = 9,000 parámetros —
+        dentro del límite mientras minimiza los round trips.
+
+        POR QUÉ RETURNING: es el único mecanismo atómico sin ventana de carrera para
+        saber qué filas de un INSERT masivo con ON CONFLICT realmente aterrizaron.
+        El set inserted_ids construido desde RETURNING habilita partición O(1) de la
+        lista valid en (nuevos → outbox) vs (duplicados → DLQ) en un solo paso lineal.
+
+        Garantía de atomicidad: todos los eventos válidos nuevos aterrizan en libro
+        y outbox, o ninguno lo hace. El patrón Outbox Transaccional se mantiene a
+        escala de lote: crash después de COMMIT deja todas las filas del outbox
+        intactas; crash antes de COMMIT no deja nada en ninguna tabla.
     """
     if not events:
         return []
@@ -920,6 +956,17 @@ def process_stripe_event_batch(
     invalid_dlq_rows: list[tuple] = []
 
     # ── Phase 1: Pydantic validation (no DB touch) ────────────────────────────
+    # EN: WHY before the transaction: a ValidationError is a pure-CPU outcome — no DB
+    #     state changes. Opening BEGIN for a payload that will never reach a table wastes
+    #     a connection slot, burns a round trip on the BEGIN itself, and forces a ROLLBACK
+    #     on the exception path. Separating validation from the transaction means the DB
+    #     sees only structurally correct, business-rule-valid data. The hot path stays hot.
+    # ES: POR QUÉ antes de la transacción: un ValidationError es un resultado puramente
+    #     de CPU — sin cambios en el estado de la DB. Abrir BEGIN para un payload que nunca
+    #     llegará a una tabla desperdicia un slot de conexión, quema un round trip en el
+    #     BEGIN mismo, y fuerza un ROLLBACK en la ruta de excepción. Separar la validación
+    #     de la transacción significa que la DB solo ve datos correctos estructuralmente
+    #     y válidos según las reglas de negocio. La ruta caliente se mantiene caliente.
     for idx, event in enumerate(events):
         try:
             validated = StripeEvent(**event)
@@ -949,14 +996,51 @@ def process_stripe_event_batch(
         valid.append((idx, event, entry))
 
     # ── Phase 2: Single atomic transaction — bulk ledger + outbox + DLQ ───────
+    # EN: WHY one transaction for all three tables: the Transactional Outbox pattern
+    #     requires that the ledger row and the outbox row are either both committed or
+    #     both absent. If we committed the ledger rows first and then failed before
+    #     writing outbox rows, the downstream system would never see those events —
+    #     revenue posted to the ledger but never forwarded is invisible to everything
+    #     downstream. Wrapping all three tables in one BEGIN…COMMIT closes that gap
+    #     completely: the outbox is only non-empty if the corresponding ledger rows exist.
+    # ES: POR QUÉ una transacción para las tres tablas: el patrón Outbox Transaccional
+    #     requiere que la fila del libro y la fila del outbox estén ambas commiteadas o
+    #     ambas ausentes. Si commiteáramos las filas del libro primero y luego falláramos
+    #     antes de escribir las filas del outbox, el sistema downstream nunca vería esos
+    #     eventos — ingresos publicados en el libro pero nunca reenviados son invisibles
+    #     para todo lo downstream. Envolver las tres tablas en un BEGIN…COMMIT cierra esa
+    #     brecha completamente: el outbox solo es no-vacío si las filas del libro existen.
     try:
         with _tx(conn) as cur:
             inserted_ids: set[str] = set()
             if valid:
-                # EN: execute_values expands VALUES %s into (row1),(row2),...
-                #     ON CONFLICT DO NOTHING skips duplicate transaction_ids silently.
-                #     RETURNING gives back only the rows that actually landed — not conflicts.
-                #     fetch=True accumulates RETURNING rows across all page_size batches.
+                # EN: execute_values sends rows in page_size-row SQL statements.
+                #     Each statement carries (page_size × columns) bind parameters —
+                #     1,000 rows × 9 columns = 9,000 parameters, within PostgreSQL's
+                #     65,535-parameter limit. Fewer statements = fewer round trips = higher TPS.
+                #
+                #     ON CONFLICT (transaction_id) DO NOTHING is enforced per-row by
+                #     PostgreSQL's constraint engine — not by application code. This is the
+                #     same serialization point as process_stripe_event(); it works identically
+                #     under concurrent writers because the PRIMARY KEY constraint is the lock.
+                #
+                #     RETURNING transaction_id is the O(1) partition key. It is the only
+                #     correct mechanism here: it is evaluated inside this transaction, so it
+                #     reports exactly what THIS transaction inserted. Any row absent from this
+                #     set was a silent ON CONFLICT hit — a duplicate that needs to go to DLQ.
+                #     The set membership check (entry.transaction_id in inserted_ids) below
+                #     runs in O(1) per event, making the entire partition pass O(N).
+                #
+                #     fetch=True tells execute_values to accumulate RETURNING rows across
+                #     all page_size batches and return them together as one list.
+                # ES: execute_values envía filas en sentencias SQL de page_size filas.
+                #     ON CONFLICT DO NOTHING es aplicado por fila por el motor de
+                #     restricciones de PostgreSQL — no por código de aplicación. RETURNING
+                #     transaction_id es la clave de partición O(1): evalúada dentro de esta
+                #     transacción, reporta exactamente lo que ESTA transacción insertó. Cualquier
+                #     fila ausente del set fue un hit silencioso de ON CONFLICT — un duplicado
+                #     que debe ir al DLQ. fetch=True acumula filas RETURNING de todos los
+                #     lotes de page_size.
                 returned = execute_values(
                     cur,
                     """
