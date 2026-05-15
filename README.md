@@ -2,7 +2,7 @@
 ### Idempotent Stripe Webhook Ingestion — PostgreSQL · Pydantic v2 · FastAPI
 
 **Stack:** Python 3.12 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 101 / 101 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 108 / 108 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** ~5,000 TPS (batch) · 500+ TPS (single-event) · both on Docker-on-Windows localhost
 
 ---
@@ -35,7 +35,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 3. Run the full test suite — 101 tests, live PostgreSQL, no mocks
+# 3. Run the full test suite — 108 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 4. Start the API
@@ -107,6 +107,22 @@ flowchart TD
 ### Why this handles concurrent load correctly
 
 `INSERT INTO ledger ... ON CONFLICT (transaction_id) DO NOTHING` is a **database-level serialization point** — not an application lock, not a SELECT-then-INSERT race. Five threads firing the same `event_id` simultaneously all enter the transaction; PostgreSQL's PRIMARY KEY constraint ensures exactly one INSERT wins; all others produce `rowcount=0` (single-event path) or are absent from the `RETURNING` set (batch path). Zero application-level coordination required.
+
+---
+
+## Enterprise Security & SOC 2 Compliance
+
+**Stripe HMAC-SHA256 Signature Verification** — Every inbound webhook is authenticated via `stripe.Webhook.construct_event()` using the endpoint's signing secret. Unsigned or tampered requests return HTTP 400 before touching the database. Satisfies ISO 27001 A.14.1.2 — the first control a SOC 2 auditor checks on a payment ingestion endpoint.
+
+**API Key Authentication** — `/ledger/summary` and `/dlq/entries` require an `X-API-Key` header validated against the `BILLING_API_KEY` environment variable. Missing or invalid keys return HTTP 401. Satisfies ISO 27001 A.9.4.1.
+
+---
+
+## Infrastructure Resilience
+
+**Connection Pooling** — `psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=20)` replaces the single module-level connection. Each request leases a connection via `getconn()` and returns it in a `finally` block via `putconn()`. No connection exhaustion under concurrent load; no leaked connections on exception paths.
+
+**Async/Sync Thread Dispatch** — Database-hitting routes (`/ledger/summary`, `/dlq/entries`) are declared `def`, not `async def`. FastAPI runs synchronous routes in an external thread pool, preventing psycopg2 blocking calls from stalling the asyncio event loop. The webhook handler remains `async def` to support `await request.body()`.
 
 ---
 
@@ -183,39 +199,45 @@ The 500 TPS floor is a hard test assertion in `test_ledger.py` — not a metric,
 ```sql
 -- Financial record. transaction_id is PRIMARY KEY and the idempotency guard.
 -- ON CONFLICT (transaction_id) DO NOTHING makes replay a zero-lock no-op at DB level.
+-- BIGINT: covers amounts up to ~$92 quadrillion (INTEGER max is only ~$21M).
+-- CHECK (length(payload) < 50000): prevents unbounded growth from malicious payloads.
 CREATE TABLE ledger (
-    transaction_id  TEXT             PRIMARY KEY,
-    event_type      TEXT             NOT NULL,
-    customer_id     TEXT             NOT NULL,
-    amount_cents    INTEGER          NOT NULL,
-    currency        TEXT             NOT NULL DEFAULT 'usd',
-    status          TEXT             NOT NULL,   -- POSTED | VOID | PENDING
-    idempotency_key TEXT             NOT NULL,
-    payload         TEXT             NOT NULL,   -- full original JSON, audit copy
-    created_at      DOUBLE PRECISION NOT NULL
+    transaction_id  TEXT        PRIMARY KEY,
+    event_type      TEXT        NOT NULL,
+    customer_id     TEXT        NOT NULL,
+    amount_cents    BIGINT      NOT NULL,
+    currency        TEXT        NOT NULL DEFAULT 'usd',
+    status          TEXT        NOT NULL,   -- POSTED | VOID | PENDING
+    idempotency_key TEXT        NOT NULL,
+    payload         TEXT        NOT NULL CHECK (length(payload) < 50000),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Written in the same BEGIN...COMMIT as the ledger row.
 -- dispatched=0 = pending downstream delivery.
 -- A worker flips to dispatched=1 in the same TX as delivery confirmation.
 CREATE TABLE outbox (
-    id             BIGSERIAL        PRIMARY KEY,
-    transaction_id TEXT             NOT NULL,
-    event_type     TEXT             NOT NULL,
-    payload        TEXT             NOT NULL,
-    dispatched     INTEGER          NOT NULL DEFAULT 0,
-    created_at     DOUBLE PRECISION NOT NULL
+    id             BIGSERIAL   PRIMARY KEY,
+    transaction_id TEXT        NOT NULL,
+    event_type     TEXT        NOT NULL,
+    payload        TEXT        NOT NULL,
+    dispatched     INTEGER     NOT NULL DEFAULT 0,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Every rejection lands here. raw_payload is never corrected, never truncated.
 -- Humans review DLQ entries. The system never assumes a DLQ entry is unimportant.
 CREATE TABLE dlq (
-    id             BIGSERIAL        PRIMARY KEY,
-    transaction_id TEXT             NOT NULL,
-    reason         TEXT             NOT NULL,   -- DUPLICATE | INVALID
-    raw_payload    TEXT             NOT NULL,
-    received_at    DOUBLE PRECISION NOT NULL
+    id             BIGSERIAL   PRIMARY KEY,
+    transaction_id TEXT        NOT NULL,
+    reason         TEXT        NOT NULL,   -- DUPLICATE | INVALID
+    raw_payload    TEXT        NOT NULL,
+    received_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Indexes for hot query paths
+CREATE INDEX IF NOT EXISTS idx_ledger_customer_id ON ledger(customer_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WHERE dispatched=0;
 ```
 
 | Status | Event types | Meaning |
@@ -240,12 +262,13 @@ CREATE TABLE dlq (
 ## Test Coverage
 
 ```
-101 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+108 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1  (34 tests)   Entry boundary — Pydantic type + Field + enum validation
 Phase 2  (26 tests)   Output models  — DLQEntry, LedgerEntry, to_db() serialization
 Phase 3  ( 9 tests)   Cross-field    — invoice amount > 0, customer ID format
 Phase 5  (32 tests)   Full stack     — HTTP, concurrent idempotency, outbox dispatch, DLQ queryability
+Phase 7  ( 7 tests)   Security & SRE — HMAC signature rejection, BIGINT overflow, batch duplicate, limit validation
 ```
 
 **Concurrent idempotency test:**
@@ -266,11 +289,9 @@ assert ledger_row_count == 1               # verified by a separate connection
 
 | Gap | Priority | Fix |
 |---|---|---|
-| Stripe signature verification | **CRITICAL** | Uncomment 3 lines in `stripe_webhook()`, add `stripe` to requirements. Without this, anyone who knows the URL can POST fake events. |
 | Outbox worker | **HIGH** | Temporal activity polling `WHERE dispatched=0 ORDER BY id LIMIT 100`, delivering each event, flipping `dispatched=1` in the same TX. |
 | DLQ retry budget | **HIGH** | Add `retry_count`, `next_retry_at`, `max_retries` columns. Without this, DLQ is a graveyard, not a quarantine. |
 | Per-event-type amount extraction | **HIGH** | Unknown amount → DLQ instead of silently recording $0. |
-| Connection pooling | **MEDIUM** | Replace module-level single connection with `psycopg2.pool.ThreadedConnectionPool`. |
 | Structured JSON logging | **MEDIUM** | JSON logs with `transaction_id`, `outcome`, `duration_ms` per request. |
 | Prometheus `/metrics` | **MEDIUM** | `webhooks_received_total`, `webhooks_posted_total`, `dlq_depth`, `outbox_pending`. |
 | Currency normalization | **LOW** | `.lower()` on ingest. One line. Mixed-case breaks `GROUP BY currency` in finance reports. |
