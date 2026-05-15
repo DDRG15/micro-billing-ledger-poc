@@ -49,10 +49,13 @@ Usage / Uso:
 import argparse       # EN: CLI argument parsing for --silent/--events flags / ES: Parseo de argumentos CLI para las banderas --silent/--events
 import json           # EN: JSON serialization for raw payload archiving / ES: Serialización JSON para archivo del payload crudo
 import logging        # EN: Structured log output to file and stderr / ES: Salida de log estructurado a archivo y stderr
-import os             # EN: DATABASE_URL env var lookup / ES: Lectura de la variable de entorno DATABASE_URL
-import time           # EN: Unix timestamps for created_at and received_at fields / ES: Timestamps Unix para campos created_at y received_at
-import psycopg2       # EN: PostgreSQL driver — replaces SQLite for production-grade storage / ES: Driver PostgreSQL — reemplaza SQLite para almacenamiento de grado producción
+import os             # EN: DATABASE_URL, STRIPE_WEBHOOK_SECRET, BILLING_API_KEY env var lookup / ES: Lectura de variables de entorno DATABASE_URL, STRIPE_WEBHOOK_SECRET, BILLING_API_KEY
+import time           # EN: perf_counter for benchmark timing / ES: perf_counter para temporización del benchmark
+import stripe         # EN: Stripe SDK for HMAC-SHA256 webhook signature verification / ES: SDK de Stripe para verificación de firma HMAC-SHA256 de webhook
+import psycopg2       # EN: PostgreSQL driver — production-grade relational storage / ES: Driver PostgreSQL — almacenamiento relacional de grado producción
+from datetime import datetime, timezone  # EN: Timezone-aware timestamps for TIMESTAMPTZ columns — financial audit trail requires tz / ES: Timestamps con zona horaria para columnas TIMESTAMPTZ — la auditoría financiera requiere tz
 from psycopg2.extras import execute_values  # EN: Bulk INSERT — collapses N round trips to ceil(N/page_size) / ES: INSERT en bloque — colapsa N round trips a ceil(N/page_size)
+from psycopg2.pool import ThreadedConnectionPool  # EN: Thread-safe connection pool — replaces single module-level connection / ES: Pool de conexiones thread-safe — reemplaza la conexión única a nivel de módulo
 from contextlib import contextmanager  # EN: @contextmanager for _tx() BEGIN/COMMIT wrapper / ES: @contextmanager para el wrapper BEGIN/COMMIT de _tx()
 from typing import Generator, Optional  # EN: Type hints for static analysis / ES: Hints de tipo para análisis estático
 from enum import Enum  # EN: Enums for EventType, LedgerStatus, DLQReason — prevents raw string drift / ES: Enums para EventType, LedgerStatus, DLQReason — previene drift de strings crudos
@@ -84,7 +87,7 @@ _log = logging.getLogger("ledger")
 # ES: FastAPI para enrutamiento HTTP, Pydantic para validación, starlette para respuestas.
 #     Todas fijadas en requirements.txt — sin cambios de versión sorpresa.
 # ---------------------------------------------------------------------------
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -167,11 +170,11 @@ class StripeObject(BaseModel):
     )
 
     # EN: ISO 4217 currency code. Regex enforces exactly 3 lowercase letters.
-    #     "USD" (uppercase) fails — Stripe should send lowercase, but if they don't,
-    #     see BLUEPRINT_ANALYSIS.md §5 for the .lower() normalization fix.
+    #     "USD" (uppercase) fails — currency normalization (.lower() on ingest) is a
+    #     known gap listed in the Production Gap Checklist in the README.
     # ES: Código de moneda ISO 4217. El regex aplica exactamente 3 letras minúsculas.
-    #     "USD" (mayúsculas) falla — Stripe debería enviar minúsculas, pero si no lo
-    #     hace, ver BLUEPRINT_ANALYSIS.md §5 para la corrección de normalización .lower().
+    #     "USD" (mayúsculas) falla — la normalización de moneda (.lower() en ingesta) es
+    #     una brecha conocida listada en el Production Gap Checklist del README.
     currency: str = Field(
         default="usd",
         pattern=r"^[a-z]{3}$",
@@ -406,7 +409,7 @@ class DLQEntry(BaseModel):
     transaction_id: str   = Field(min_length=1)   # EN: Stripe event ID or "unknown" if missing / ES: ID de evento Stripe o "unknown" si falta
     reason:         DLQReason                      # EN: Typed rejection code — not a freeform string / ES: Código de rechazo tipado — no un string libre
     raw_payload:    dict                           # EN: The full original webhook payload, untouched / ES: El payload original completo del webhook, sin tocar
-    received_at:    float = Field(default_factory=time.time)  # EN: Unix timestamp of when we received it / ES: Timestamp Unix de cuándo lo recibimos
+    received_at:    datetime = Field(default_factory=lambda: datetime.now(timezone.utc))  # EN: Timezone-aware receipt timestamp (TIMESTAMPTZ) / ES: Timestamp de recepción con zona horaria (TIMESTAMPTZ)
 
     def to_db(self) -> tuple:
         """
@@ -446,7 +449,7 @@ class LedgerEntry(BaseModel):
     status:          LedgerStatus                                  # EN: POSTED / PENDING / VOID / ES: POSTED / PENDING / VOID
     idempotency_key: str          = Field(min_length=1)            # EN: Network safety reference / ES: Referencia de seguridad de red
     payload:         str                                           # EN: Full JSON string — the outbox uses this for replay / ES: String JSON completo — el outbox lo usa para reproducción
-    created_at:      float                                         # EN: Unix timestamp of ingestion / ES: Timestamp Unix de ingesta
+    created_at:      datetime                                      # EN: Timezone-aware ingestion timestamp (TIMESTAMPTZ) / ES: Timestamp de ingesta con zona horaria (TIMESTAMPTZ)
 
     def to_db(self) -> tuple:
         """
@@ -477,12 +480,12 @@ class LedgerEntry(BaseModel):
 # SECTION 2: CONFIGURATION
 # SECCIÓN 2: CONFIGURACIÓN
 #
-# EN: Application-level constants. STRIPE_WEBHOOK_SECRET is the only one that
-#     must change before production. See BLUEPRINT_ANALYSIS.md §2 for full
-#     instructions on activating signature verification.
-# ES: Constantes a nivel de aplicación. STRIPE_WEBHOOK_SECRET es la única que
-#     debe cambiar antes de producción. Ver BLUEPRINT_ANALYSIS.md §2 para
-#     instrucciones completas sobre activar la verificación de firma.
+# EN: Application-level constants sourced from environment variables.
+#     STRIPE_WEBHOOK_SECRET and BILLING_API_KEY must be set before production.
+#     Never hardcode secrets here — pass them via environment at deploy time.
+# ES: Constantes a nivel de aplicación obtenidas de variables de entorno.
+#     STRIPE_WEBHOOK_SECRET y BILLING_API_KEY deben establecerse antes de producción.
+#     Nunca hardcodear secretos aquí — pasarlos vía entorno al momento del despliegue.
 # ===========================================================================
 
 # EN: PostgreSQL connection string. Set DATABASE_URL in your environment or .env file.
@@ -498,17 +501,27 @@ DATABASE_URL: str = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/billing"
 )
 
-# EN: Stripe webhook signing secret. Replace with the real value from:
-#     Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret
+# EN: Stripe webhook signing secret — sourced from environment, never hardcoded.
+#     Get from: Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret
 #     Format: whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#     Without this, anyone who discovers your URL can POST fake events.
-#     See the commented-out verification block in stripe_webhook() below.
-# ES: Secreto de firma de webhooks de Stripe. Reemplazar con el valor real de:
-#     Stripe Dashboard → Developers → Webhooks → tu endpoint → Signing secret
+#     Without this set to a real value, stripe.Webhook.construct_event() will reject
+#     ALL incoming requests with 400. Set it before receiving live Stripe traffic.
+# ES: Secreto de firma de webhooks de Stripe — obtenido del entorno, nunca hardcodeado.
+#     Obtener de: Stripe Dashboard → Developers → Webhooks → tu endpoint → Signing secret
 #     Formato: whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#     Sin esto, cualquiera que descubra tu URL puede enviar eventos falsos.
-#     Ver el bloque de verificación comentado en stripe_webhook() abajo.
-STRIPE_WEBHOOK_SECRET: str = "whsec_YOUR_SECRET_HERE"  # <-- REPLACE BEFORE PRODUCTION / REEMPLAZAR ANTES DE PRODUCCIÓN
+#     Sin esto establecido a un valor real, stripe.Webhook.construct_event() rechazará
+#     TODAS las solicitudes entrantes con 400. Establecerlo antes de recibir tráfico real de Stripe.
+STRIPE_WEBHOOK_SECRET: str = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_YOUR_SECRET_HERE")
+
+# EN: API key for ops endpoints (/ledger/summary, /dlq/entries).
+#     If empty (env var not set), the check is skipped — dev-mode convenience.
+#     In production: set to a strong random value, e.g., openssl rand -hex 32.
+#     ISO 27001 A.9.4.1: access to operational data must be access-controlled.
+# ES: Clave de API para endpoints de operaciones (/ledger/summary, /dlq/entries).
+#     Si está vacía (variable de entorno no establecida), el check se omite — conveniencia en dev.
+#     En producción: establecer a un valor aleatorio fuerte, ej., openssl rand -hex 32.
+#     ISO 27001 A.9.4.1: el acceso a datos operacionales debe estar controlado por acceso.
+BILLING_API_KEY: str = os.environ.get("BILLING_API_KEY", "")
 
 
 # ===========================================================================
@@ -558,17 +571,27 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         #     es lo que hace la deduplicación sin bloqueo a nivel de base de datos.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ledger (
-                transaction_id  TEXT             PRIMARY KEY,
-                event_type      TEXT             NOT NULL,
-                customer_id     TEXT             NOT NULL,
-                amount_cents    INTEGER          NOT NULL,
-                currency        TEXT             NOT NULL DEFAULT 'usd',
-                status          TEXT             NOT NULL,
-                idempotency_key TEXT             NOT NULL,
-                payload         TEXT             NOT NULL,
-                created_at      DOUBLE PRECISION NOT NULL
+                transaction_id  TEXT    PRIMARY KEY,
+                event_type      TEXT    NOT NULL,
+                customer_id     TEXT    NOT NULL,
+                amount_cents    BIGINT  NOT NULL,
+                currency        TEXT    NOT NULL DEFAULT 'usd',
+                status          TEXT    NOT NULL,
+                idempotency_key TEXT    NOT NULL,
+                payload         TEXT    NOT NULL CHECK (length(payload) < 50000),
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # EN: amount_cents BIGINT: PostgreSQL INTEGER max = 2,147,483,647 (~$21M). BIGINT
+        #     handles up to ~$92 trillion — required for B2B enterprise subscription amounts.
+        #     payload CHECK: prevents malicious payloads from causing unbounded table growth.
+        #     created_at TIMESTAMPTZ: timezone-aware; mandatory for financial audit trails and
+        #     correct date_trunc() GROUP BY queries across billing periods.
+        # ES: amount_cents BIGINT: máximo de INTEGER en PostgreSQL = 2,147,483,647 (~$21M).
+        #     BIGINT maneja hasta ~$92 billones — requerido para montos de suscripción B2B.
+        #     payload CHECK: previene que payloads maliciosos causen crecimiento ilimitado de la tabla.
+        #     created_at TIMESTAMPTZ: con zona horaria; obligatorio para auditorías financieras y
+        #     consultas correctas de date_trunc() GROUP BY a través de períodos de facturación.
 
         # EN: outbox — dispatched=0 rows are pending forwarding to a downstream system.
         #     BIGSERIAL gives a monotonically increasing id for ordered processing.
@@ -576,12 +599,12 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         #     BIGSERIAL da un id monotónicamente creciente para procesamiento ordenado.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS outbox (
-                id              BIGSERIAL        PRIMARY KEY,
-                transaction_id  TEXT             NOT NULL,
-                event_type      TEXT             NOT NULL,
-                payload         TEXT             NOT NULL,
-                dispatched      INTEGER          NOT NULL DEFAULT 0,
-                created_at      DOUBLE PRECISION NOT NULL
+                id              BIGSERIAL   PRIMARY KEY,
+                transaction_id  TEXT        NOT NULL,
+                event_type      TEXT        NOT NULL,
+                payload         TEXT        NOT NULL,
+                dispatched      INTEGER     NOT NULL DEFAULT 0,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
 
@@ -591,12 +614,30 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         #     raw_payload es el JSON original completo, preservado byte-perfecto para reproducción.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS dlq (
-                id              BIGSERIAL        PRIMARY KEY,
-                transaction_id  TEXT             NOT NULL,
-                reason          TEXT             NOT NULL,
-                raw_payload     TEXT             NOT NULL,
-                received_at     DOUBLE PRECISION NOT NULL
+                id              BIGSERIAL   PRIMARY KEY,
+                transaction_id  TEXT        NOT NULL,
+                reason          TEXT        NOT NULL,
+                raw_payload     TEXT        NOT NULL,
+                received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
+        """)
+
+        # EN: Indexes for the two production query patterns:
+        #     idx_ledger_customer_id — used by revenue-by-customer GROUP BY queries.
+        #     idx_outbox_dispatched_id — partial index covering only undispatched rows;
+        #       the outbox worker always queries WHERE dispatched=0 ORDER BY id.
+        # ES: Índices para los dos patrones de consulta de producción:
+        #     idx_ledger_customer_id — usado por consultas GROUP BY de ingresos por cliente.
+        #     idx_outbox_dispatched_id — índice parcial que cubre solo filas no despachadas;
+        #       el worker del outbox siempre consulta WHERE dispatched=0 ORDER BY id.
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ledger_customer_id
+            ON ledger(customer_id)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id
+            ON outbox(dispatched, id)
+            WHERE dispatched = 0
         """)
 
     return conn
@@ -694,7 +735,7 @@ def process_stripe_event(conn: "psycopg2.extensions.connection", event: dict) ->
           DLQ_INVALID    — falló validación Pydantic; evento en DLQ
           DLQ_DUPLICATE  — ya procesado; guardia de idempotencia disparada; evento en DLQ
     """
-    now = time.time()
+    now = datetime.now(timezone.utc)
 
     # ── LAYER 1: Pydantic Validation ─────────────────────────────────────────
     # EN: StripeEvent(**event) runs all Field constraints AND all @model_validators.
@@ -950,7 +991,7 @@ def process_stripe_event_batch(
     if not events:
         return []
 
-    now = time.time()
+    now = datetime.now(timezone.utc)
     results: list = [None] * len(events)
     valid: list[tuple[int, dict, LedgerEntry]] = []
     invalid_dlq_rows: list[tuple] = []
@@ -1122,17 +1163,46 @@ def process_stripe_event_batch(
 #     y probable de forma independiente.
 # ===========================================================================
 
-app   = FastAPI(title="Micro-Billing-Ledger PoC", version="1.0.0")
+app = FastAPI(title="Micro-Billing-Ledger PoC", version="1.0.0")
 
-# EN: Module-level PostgreSQL connection — shared across all requests in a single process.
-#     In tests, this is patched to a dedicated test connection: L._conn = test_conn.
-#     For production at scale, replace with psycopg2.pool.ThreadedConnectionPool or asyncpg.
-#     DATABASE_URL controls which PostgreSQL instance this connects to.
-# ES: Conexión PostgreSQL a nivel de módulo — compartida entre todas las solicitudes en un
-#     solo proceso. En tests, esto se parchea a una conexión de test dedicada: L._conn = test_conn.
-#     Para producción a escala, reemplazar con psycopg2.pool.ThreadedConnectionPool o asyncpg.
-#     DATABASE_URL controla a qué instancia PostgreSQL se conecta.
-_conn = _bootstrap()
+# EN: Ensure all three tables and their indexes exist before the pool opens connections.
+#     The bootstrap connection is closed immediately — it is not reused.
+# ES: Asegurar que las tres tablas y sus índices existen antes de que el pool abra conexiones.
+#     La conexión de bootstrap se cierra inmediatamente — no se reutiliza.
+_bootstrap_conn = _bootstrap()
+_bootstrap_conn.close()
+
+# EN: Thread-safe connection pool for the FastAPI route handlers.
+#     minconn=1 — always keep one connection warm to avoid cold-start latency on first request.
+#     maxconn=20 — cap concurrent DB connections; tune to your PostgreSQL max_connections budget.
+#     In tests, replace _pool with a _MockPool that wraps the test connection (see test_ledger.py).
+# ES: Pool de conexiones thread-safe para los manejadores de rutas FastAPI.
+#     minconn=1 — siempre mantener una conexión caliente para evitar latencia de arranque en frío.
+#     maxconn=20 — limitar conexiones DB concurrentes; ajustar al presupuesto max_connections de PostgreSQL.
+#     En tests, reemplazar _pool con un _MockPool que envuelve la conexión de test (ver test_ledger.py).
+_pool: ThreadedConnectionPool = ThreadedConnectionPool(minconn=1, maxconn=20, dsn=DATABASE_URL)
+
+
+def _require_api_key(x_api_key: str = Header(default="")) -> None:
+    """
+    EN: FastAPI dependency for ops endpoints. If BILLING_API_KEY is configured in the
+        environment, the X-Api-Key request header must match exactly. If BILLING_API_KEY
+        is empty (not configured), the check is skipped — dev-mode convenience without
+        requiring env setup for every developer.
+        ISO 27001 A.9.4.1: access to sensitive operational data (DLQ, ledger summary)
+        must be access-controlled in production.
+    ES: Dependencia FastAPI para endpoints de operaciones. Si BILLING_API_KEY está configurado
+        en el entorno, el header de solicitud X-Api-Key debe coincidir exactamente. Si BILLING_API_KEY
+        está vacío (no configurado), el check se omite — conveniencia en modo dev sin requerir
+        configuración de entorno para cada desarrollador.
+        ISO 27001 A.9.4.1: el acceso a datos operacionales sensibles (DLQ, resumen del libro)
+        debe estar controlado por acceso en producción.
+    """
+    if BILLING_API_KEY and x_api_key != BILLING_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key / Clave de API inválida o faltante"
+        )
 
 
 class StripeWebhookPayload(BaseModel):
@@ -1161,32 +1231,40 @@ async def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSO
         Always returns HTTP 200 for valid JSON — even for duplicates and invalid
         events that end up in DLQ. Returning non-200 tells Stripe to retry,
         which is only correct for transient failures (e.g., DB down → 503).
-        Signature verification is commented out — see BLUEPRINT_ANALYSIS.md §2
-        for activation instructions. Do not ship to production without it.
+        HMAC signature verification is active — stripe.Webhook.construct_event()
+        validates the Stripe-Signature header before any business logic runs.
+        ISO 27001 A.14.1.2: authentication enforced at all ingestion entry points.
     ES: Recibe un webhook de Stripe y lo compromete en el libro de facturación.
         Siempre retorna HTTP 200 para JSON válido — incluso para duplicados y
         eventos inválidos que terminan en DLQ. Retornar no-200 le dice a Stripe
         que reintente, lo cual solo es correcto para fallos transitorios (ej., DB caída → 503).
-        La verificación de firma está comentada — ver BLUEPRINT_ANALYSIS.md §2
-        para instrucciones de activación. No enviar a producción sin esto.
+        La verificación de firma HMAC está activa — stripe.Webhook.construct_event()
+        valida el header Stripe-Signature antes de que corra cualquier lógica de negocio.
+        ISO 27001 A.14.1.2: autenticación aplicada en todos los puntos de entrada de ingesta.
     """
-    # EN: ── SIGNATURE VERIFICATION (commented out — activate before production) ──
-    #     This is the difference between "secure endpoint" and "open door for anyone."
-    #     Uncomment when you add `stripe` to requirements.txt and set STRIPE_WEBHOOK_SECRET.
-    # ES: ── VERIFICACIÓN DE FIRMA (comentada — activar antes de producción) ──
-    #     Esta es la diferencia entre "endpoint seguro" y "puerta abierta para cualquiera."
-    #     Descomentar cuando agregues `stripe` a requirements.txt y establezcas STRIPE_WEBHOOK_SECRET.
-    #
-    # import stripe
-    # sig_header = request.headers.get("stripe-signature")
-    # raw_body   = await request.body()
-    # try:
-    #     stripe.WebhookSignature.verify_header(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
-    # except stripe.error.SignatureVerificationError:
-    #     raise HTTPException(status_code=400, detail="Invalid Stripe signature / Firma Stripe inválida")
-
+    # EN: ── HMAC SIGNATURE VERIFICATION ─────────────────────────────────────
+    #     stripe.Webhook.construct_event() validates the HMAC-SHA256 in the
+    #     Stripe-Signature header against the raw request body. Any body tampering
+    #     or wrong/missing signature raises SignatureVerificationError → 400.
+    #     ISO 27001 A.14.1.2: authentication at all ingestion entry points.
+    # ES: ── VERIFICACIÓN DE FIRMA HMAC ────────────────────────────────────────
+    #     stripe.Webhook.construct_event() valida el HMAC-SHA256 en el header
+    #     Stripe-Signature contra el cuerpo crudo de la solicitud. Cualquier
+    #     manipulación del cuerpo o firma incorrecta/ausente lanza SignatureVerificationError → 400.
+    #     ISO 27001 A.14.1.2: autenticación en todos los puntos de entrada de ingesta.
+    raw_body   = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
     try:
-        result = process_stripe_event(_conn, payload.model_dump())
+        stripe.Webhook.construct_event(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
+    except stripe.errors.SignatureVerificationError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or missing Stripe signature / Firma Stripe inválida o ausente"
+        )
+
+    conn = _pool.getconn()
+    try:
+        result = process_stripe_event(conn, payload.model_dump())
     except RuntimeError as exc:
         # EN: RuntimeError from _tx() means a DB-level failure (locked, corrupt, disk full).
         #     503 tells Stripe to back off and retry — the correct behavior for transient errors.
@@ -1195,67 +1273,81 @@ async def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSO
         #     503 le dice a Stripe que retroceda y reintente — el comportamiento correcto para errores transitorios.
         #     NO retornar 200 aquí — eso le diría a Stripe "recibido" cuando no lo recibimos.
         raise HTTPException(status_code=503, detail=str(exc))
+    finally:
+        _pool.putconn(conn)
 
     return JSONResponse(content=result)
 
 
 @app.get("/ledger/summary")
-async def ledger_summary() -> JSONResponse:
+def ledger_summary(_: None = Depends(_require_api_key)) -> JSONResponse:
     """
-    EN: Quick sanity-check endpoint. Returns row counts per ledger status and
-        the current DLQ depth and outbox pending count. Use this for manual
-        inspection and smoke tests. For production monitoring, use /metrics
-        (see BLUEPRINT_ANALYSIS.md §7 for Prometheus implementation).
-    ES: Endpoint de verificación rápida de cordura. Retorna conteos de filas por
-        estado del libro, la profundidad actual del DLQ y el conteo pendiente del outbox.
-        Usar para inspección manual y pruebas de humo. Para monitoreo en producción,
-        usar /metrics (ver BLUEPRINT_ANALYSIS.md §7 para implementación de Prometheus).
+    EN: Quick sanity-check endpoint. Returns row counts per ledger status, DLQ depth,
+        and outbox pending count. Requires X-Api-Key header when BILLING_API_KEY is set.
+        sync def: FastAPI runs this in its thread pool — psycopg2 blocking calls do not
+        block the asyncio event loop.
+    ES: Endpoint de verificación rápida de cordura. Retorna conteos de filas por estado
+        del libro, profundidad del DLQ y conteo pendiente del outbox. Requiere header
+        X-Api-Key cuando BILLING_API_KEY está establecido.
+        sync def: FastAPI ejecuta esto en su thread pool — las llamadas bloqueantes de
+        psycopg2 no bloquean el event loop de asyncio.
     """
-    # EN: GROUP BY status gives {POSTED: N, VOID: N, PENDING: N} in one query.
-    #     All three SELECT statements are reads — no explicit transaction needed
-    #     because autocommit=True on the module-level _conn.
-    # ES: GROUP BY status da {POSTED: N, VOID: N, PENDING: N} en una sola consulta.
-    #     Las tres sentencias SELECT son lecturas — no se necesita transacción explícita
-    #     porque autocommit=True en el _conn a nivel de módulo.
-    with _conn.cursor() as cur:
-        cur.execute("SELECT status, COUNT(*) FROM ledger GROUP BY status")
-        counts = {row[0]: row[1] for row in cur.fetchall()}
+    conn = _pool.getconn()
+    try:
+        # EN: GROUP BY status gives {POSTED: N, VOID: N, PENDING: N} in one query.
+        # ES: GROUP BY status da {POSTED: N, VOID: N, PENDING: N} en una sola consulta.
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, COUNT(*) FROM ledger GROUP BY status")
+            counts = {row[0]: row[1] for row in cur.fetchall()}
 
-    with _conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM dlq")
-        dlq_depth = cur.fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM dlq")
+            dlq_depth = cur.fetchone()[0]
 
-    with _conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
-        outbox_pending = cur.fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
+            outbox_pending = cur.fetchone()[0]
+    finally:
+        _pool.putconn(conn)
 
     return JSONResponse(content={
         "ledger":         counts,
-        "dlq_depth":      dlq_depth,       # EN: Total entries in DLQ (all reasons) / ES: Total de entradas en DLQ (todas las razones)
-        "outbox_pending": outbox_pending,  # EN: Events not yet dispatched downstream / ES: Eventos aún no enviados downstream
+        "dlq_depth":      dlq_depth,      # EN: Total entries in DLQ (all reasons) / ES: Total de entradas en DLQ (todas las razones)
+        "outbox_pending": outbox_pending, # EN: Events not yet dispatched downstream / ES: Eventos aún no enviados downstream
     })
 
 
 @app.get("/dlq/entries")
-async def dlq_entries(limit: int = 50) -> JSONResponse:
+def dlq_entries(limit: int = 50, _: None = Depends(_require_api_key)) -> JSONResponse:
     """
     EN: Inspect DLQ entries over HTTP — newest first. This is the ops endpoint:
         without it, "check the DLQ" means "SSH into the box and run a psql query."
         Default limit 50; capped at 1000 to prevent accidental full-table dumps.
         raw_payload is deserialized so callers get a JSON object, not a string.
+        Requires X-Api-Key header when BILLING_API_KEY is set.
+        sync def: runs in FastAPI's thread pool — no event loop blocking.
     ES: Inspeccionar entradas del DLQ por HTTP — más recientes primero. Este es
         el endpoint de ops: sin él, "revisar el DLQ" significa "SSH a la máquina
         y ejecutar una consulta psql". Límite por defecto 50; limitado a 1000 para prevenir
-        volcados accidentales de tabla completa. raw_payload está deserializado
-        para que los llamadores obtengan un objeto JSON, no un string.
+        volcados accidentales de tabla completa. raw_payload está deserializado para que
+        los llamadores obtengan un objeto JSON, no un string.
+        Requiere header X-Api-Key cuando BILLING_API_KEY está establecido.
+        sync def: corre en el thread pool de FastAPI — sin bloqueo del event loop.
     """
-    with _conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, transaction_id, reason, raw_payload, received_at "
-            "FROM dlq ORDER BY id DESC LIMIT %s",
-            (min(limit, 1000),),  # EN: cap at 1000 — never dump the entire table / ES: limitar a 1000 — nunca volcar toda la tabla
-        )
-        rows = cur.fetchall()
+    if limit < 1:
+        raise HTTPException(status_code=422, detail="limit must be >= 1 / limit debe ser >= 1")
+
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, transaction_id, reason, raw_payload, received_at "
+                "FROM dlq ORDER BY id DESC LIMIT %s",
+                (min(limit, 1000),),  # EN: cap at 1000 — never dump the entire table / ES: limitar a 1000 — nunca volcar toda la tabla
+            )
+            rows = cur.fetchall()
+    finally:
+        _pool.putconn(conn)
 
     return JSONResponse(content={
         "entries": [
@@ -1264,7 +1356,7 @@ async def dlq_entries(limit: int = 50) -> JSONResponse:
                 "transaction_id": r[1],
                 "reason":         r[2],
                 "raw_payload":    json.loads(r[3]),  # EN: string → dict for clean JSON response / ES: string → dict para respuesta JSON limpia
-                "received_at":    r[4],
+                "received_at":    r[4].isoformat() if hasattr(r[4], "isoformat") else r[4],
             }
             for r in rows
         ],

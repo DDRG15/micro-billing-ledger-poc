@@ -75,6 +75,14 @@ COPY --from=builder /install /usr/local
 #     En producción, ledger.py es el único archivo que necesita estar en el contenedor.
 COPY ledger.py .
 
+# EN: Grant ownership of /app to the billing user BEFORE switching to it.
+#     WORKDIR /app was created by root, so without this chown the billing user cannot
+#     write billing_ledger.log — the app crashes on startup with a PermissionError.
+# ES: Otorgar propiedad de /app al usuario billing ANTES de cambiar a él.
+#     WORKDIR /app fue creado por root, sin este chown el usuario billing no puede
+#     escribir billing_ledger.log — la aplicación falla al inicio con PermissionError.
+RUN chown -R billing:billing /app
+
 # EN: DATABASE_URL tells ledger.py where the PostgreSQL instance lives.
 #     Override at runtime: docker run -e DATABASE_URL=postgresql://user:pass@host:5432/db ...
 #     In production, point this at a managed PostgreSQL service (RDS, Cloud SQL, Supabase, etc.).
@@ -100,15 +108,15 @@ USER billing
 EXPOSE 8000
 
 # EN: Start the FastAPI application with uvicorn.
-#     --workers 1: single worker because SQLite is a single-writer engine.
-#       With PostgreSQL, increase workers to match CPU core count.
+#     --workers 1: single process shares the ThreadedConnectionPool (maxconn=20).
+#       For higher concurrency, switch to Gunicorn + uvicorn workers — each worker
+#       gets its own pool, so connections = workers × maxconn.
 #     --no-access-log: reduces log noise; structured application logs handle observability.
-#     See BLUEPRINT_ANALYSIS.md §1 for the PostgreSQL migration path (enables multi-worker).
 # ES: Iniciar la aplicación FastAPI con uvicorn.
-#     --workers 1: worker único porque SQLite es un motor de escritura única.
-#       Con PostgreSQL, aumentar workers para coincidir con el conteo de núcleos CPU.
-#     --no-access-log: reduce el ruido de logs; los logs estructurados de la aplicación manejan la observabilidad.
-#     Ver BLUEPRINT_ANALYSIS.md §1 para la ruta de migración a PostgreSQL (habilita multi-worker).
+#     --workers 1: un proceso comparte el ThreadedConnectionPool (maxconn=20).
+#       Para mayor concurrencia, cambiar a Gunicorn + workers uvicorn — cada worker
+#       obtiene su propio pool, así que conexiones = workers × maxconn.
+#     --no-access-log: reduce el ruido de logs; los logs estructurados manejan la observabilidad.
 CMD ["python", "-m", "uvicorn", "ledger:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "1", "--no-access-log"]
