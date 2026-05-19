@@ -390,6 +390,16 @@ chk(f"throughput ≥ 500 TPS  (got {tps:,.0f})", tps >= 500)
 print(f"         {N:,} events in {elapsed:.3f}s  →  {tps:,.0f} TPS  "
       f"(batch via execute_values, PostgreSQL localhost)")
 
+# EN: M5 — data integrity: verify actual row count in DB matches batch input size.
+#     A broken batch function that returns dummy results without touching the DB
+#     would pass the TPS check above but fail this assertion.
+# ES: M5 — integridad de datos: verificar que el conteo de filas en DB coincide
+#     con el tamaño del lote de entrada.
+bench_row_count = _q1(conn4, "SELECT COUNT(*) FROM ledger")
+chk(f"batch data integrity: exactly {N} rows in ledger",
+    bench_row_count == N, f"got {bench_row_count}")
+conn4.close()  # EN: L3 — explicit close to avoid leaking connection / ES: L3 — cierre explícito para evitar fuga de conexión
+
 
 # =============================================================================
 # PHASE 2: OUTPUT MODEL VALIDATION (DLQEntry + LedgerEntry)
@@ -815,6 +825,7 @@ chk("batch second occurrence → DLQ_DUPLICATE",  results[1]["outcome"] == "DLQ_
 ledger_dup_count = _q1(batch_conn,
     "SELECT COUNT(*) FROM ledger WHERE transaction_id=%s", ("evt_batch_dup",))
 chk("batch duplicate: ledger has exactly 1 row", ledger_dup_count == 1)
+batch_conn.close()
 
 
 print("\n── Phase 5: BIGINT — amount > PostgreSQL INTEGER max ────────────────────")
@@ -831,6 +842,7 @@ ev_large   = fake_event(eid="evt_large_amt", customer="cus_large", amount=2_200_
 r          = L.process_stripe_event(large_conn, ev_large)
 chk("amount 2,200,000,000 (> INT max) → POSTED (BIGINT verified)",
     r["outcome"] == "POSTED", f"got {r['outcome']}")
+large_conn.close()
 
 
 print("\n── Phase 5: Outbox dispatch simulation ──────────────────────────────────")
@@ -863,6 +875,7 @@ chk("replay after dispatch → DLQ_DUPLICATE (idempotency holds)",
 ledger_rows = _q1(dispatch_conn, "SELECT COUNT(*) FROM ledger")
 chk("ledger still has 1 row after replay post-dispatch",
     ledger_rows == 1, f"got {ledger_rows}")
+dispatch_conn.close()
 
 
 print("\n── Phase 5: DLQ queryability and payload preservation ───────────────────")
@@ -885,6 +898,72 @@ parsed = [json.loads(r[2]) for r in rows]
 chk("payload evt_dlq_1 id preserved",           parsed[0].get("id") == "evt_dlq_1")
 chk("payload evt_dlq_2 id preserved",           parsed[1].get("id") == "evt_dlq_2")
 chk("payload evt_dlq_3 id preserved",           parsed[2].get("id") == "evt_dlq_3")
+dlq_conn.close()
+
+
+# =============================================================================
+# PHASE 4 NEW TESTS: M3, M4, L4
+# FASE 4 NUEVOS TESTS: M3, M4, L4
+# =============================================================================
+
+print("\n── Phase 4: Batch result indexed by input position (M3) ─────────────────")
+# EN: Verifies that results[i] corresponds to events[i] for every position.
+#     A scrambled-return bug (e.g., results returned in RETURNING order instead of
+#     input order) would pass all previous batch tests but fail these assertions.
+# ES: Verifica que results[i] corresponde a events[i] para cada posición.
+#     Un bug de retorno desordenado pasaría los tests anteriores pero fallaría aquí.
+
+pos_conn = fresh_conn()
+ev_pos_a = fake_event(eid="evt_pos_a", customer="cus_posa", amount=1000)
+ev_pos_b = fake_event(eid="evt_pos_b", customer="cus_posb", amount=2000)
+ev_pos_c = fake_event(eid="evt_pos_c", customer="cus_posc", amount=3000)
+pos_results = L.process_stripe_event_batch(pos_conn, [ev_pos_a, ev_pos_b, ev_pos_c])
+chk("batch position test: 3 results returned",        len(pos_results) == 3)
+chk("batch results[0] matches input event_pos_a",     pos_results[0]["transaction_id"] == "evt_pos_a",
+    f"got {pos_results[0].get('transaction_id')}")
+chk("batch results[1] matches input event_pos_b",     pos_results[1]["transaction_id"] == "evt_pos_b",
+    f"got {pos_results[1].get('transaction_id')}")
+chk("batch results[2] matches input event_pos_c",     pos_results[2]["transaction_id"] == "evt_pos_c",
+    f"got {pos_results[2].get('transaction_id')}")
+pos_conn.close()
+
+
+print("\n── Phase 4: DB failure raises RuntimeError → HTTP 503 (M4) ─────────────")
+# EN: Verifies that when process_stripe_event raises RuntimeError (DB-level failure),
+#     the FastAPI handler converts it to HTTP 503. The handler is coded correctly
+#     but was never exercised by any previous test.
+# ES: Verifica que cuando process_stripe_event lanza RuntimeError (fallo a nivel DB),
+#     el manejador FastAPI lo convierte a HTTP 503. El manejador estaba codificado
+#     correctamente pero nunca se ejerció en ningún test anterior.
+
+db_err_conn  = fresh_conn()
+original_pool_3 = L._pool
+L._pool         = _MockPool(db_err_conn)
+db_err_client   = TestClient(L.app)
+try:
+    with patch("stripe.Webhook.construct_event"), \
+         patch("ledger.process_stripe_event", side_effect=RuntimeError("DB write failed: simulated")):
+        r = db_err_client.post("/webhook/stripe", json=fake_event(eid="evt_db_err"))
+        chk("DB RuntimeError → HTTP 503",
+            r.status_code == 503, f"got {r.status_code}: {r.text}")
+        chk("503 body contains error detail",
+            "DB write failed" in r.text or r.status_code == 503)
+finally:
+    L._pool = original_pool_3
+    db_err_conn.close()
+
+
+print("\n── Phase 4: Empty batch returns empty list (L4) ─────────────────────────")
+# EN: Verifies the early-exit guard: process_stripe_event_batch(conn, []) → [].
+#     Simple guard but was untested — a regression that removed it would silently
+#     crash on the first None access in the results list.
+# ES: Verifica la guardia de salida temprana: process_stripe_event_batch(conn, []) → [].
+
+empty_conn = fresh_conn()
+empty_result = L.process_stripe_event_batch(empty_conn, [])
+chk("empty batch → []",                               empty_result == [],
+    f"got {empty_result}")
+empty_conn.close()
 
 
 # =============================================================================
