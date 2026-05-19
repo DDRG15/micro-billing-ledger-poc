@@ -640,6 +640,14 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
             )
         """)
 
+        # EN: Add dispatched_at column if the outbox table predates Phase 7.
+        #     ADD COLUMN IF NOT EXISTS is idempotent — safe on every startup.
+        # ES: Agrega dispatched_at si la tabla outbox fue creada antes de la Fase 7. Idempotente.
+        cur.execute("""
+            ALTER TABLE outbox
+            ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ
+        """)
+
         # EN: dlq — every rejected event lands here with a structured reason code.
         #     raw_payload is the full original JSON, preserved byte-perfect for replay.
         # ES: dlq — cada evento rechazado aterriza aquí con un código de razón estructurado.

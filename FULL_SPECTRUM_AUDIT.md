@@ -15,6 +15,7 @@
 | 2026-05-13 | Original PREFLIGHT_AUDIT.md — 3 blockers, NO-GO verdict | — |
 | 2026-05-13 | Phases 1–7 remediation (CRITICAL/HIGH from prior audit) | `03a4226` → `6e36e67` |
 | 2026-05-18 | Full-spectrum re-audit; Phases 1–6 implemented; PRIVATE_README written | `8dfe1cf` → `bb6479c` |
+| 2026-05-19 | Phase 7 — Outbox worker (standalone Docker service); .dockerignore, .gitignore updates | pending |
 
 ---
 
@@ -50,7 +51,7 @@ Reason: Existing codebase, partially remediated from a prior audit.
 | LOW | L3 | `test_ledger.py` | ~12 leaked psycopg2 connections | ✅ Fixed `49f5bd2` |
 | LOW | L4 | `test_ledger.py` | Empty batch untested | ✅ Fixed `49f5bd2` |
 
-**ALL 17 FINDINGS RESOLVED.**
+**ALL 17 FINDINGS RESOLVED. Phase 7 adds outbox worker (architectural feature, not a finding).**
 
 ---
 
@@ -123,8 +124,19 @@ Reason: Existing codebase, partially remediated from a prior audit.
 - **L2:** `requirements-dev.txt` with `ruff==0.4.4`, `mypy==1.10.0`, `bandit==1.7.8`
 
 ### Phase 6 — Living report + PRIVATE_README
-- **Commit:** this commit
+- **Commit:** `6d7d2f7`
 - **Files:** `FULL_SPECTRUM_AUDIT.md` (this file), `PRIVATE_README.md`
+
+### Phase 7 — Outbox worker (standalone Docker service)
+- **Commit:** pending
+- **Files:** `worker.py` (new), `ledger.py`, `docker-compose.yml`, `test_ledger.py`, `.dockerignore` (new), `.gitignore`
+- **worker.py:** Standalone Python process — `drain_batch()` reads up to 100 `dispatched=0` rows with `SELECT FOR UPDATE SKIP LOCKED`, dispatches each (HTTP POST if `DOWNSTREAM_URL` set, else structured log), marks rows `dispatched=1, dispatched_at=NOW()` inside the same `BEGIN/COMMIT`. Exponential backoff on DB errors (5→10→20→60s). SIGTERM-safe — finishes current batch then exits 0.
+- **ledger.py:** Added `ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ` in `_bootstrap()` — idempotent migration for existing databases.
+- **docker-compose.yml:** Added `worker` service — same image as billing, `command: python worker.py`, no port mapping, `depends_on: postgres: condition: service_healthy`, `restart: unless-stopped`.
+- **test_ledger.py:** 3 new worker tests — empty queue, dispatch + verify dispatched=1/dispatched_at, idempotency (second drain returns 0).
+- **.dockerignore:** New file — excludes `.git`, `.env`, `__pycache__`, test files, audit docs, `.venv`, log files, `.claude/` from Docker build context.
+- **.gitignore:** Added `.pytest_cache/`, `.mypy_cache/`, `*.egg-info/`, `dist/`, `build/`, `*.whl`.
+- **requirements.txt:** No changes needed — `worker.py` uses only stdlib (`urllib.request`, `signal`, `time`, `logging`) plus `psycopg2` already pinned.
 
 ---
 
@@ -161,7 +173,7 @@ Reason: Existing codebase, partially remediated from a prior audit.
 
 ## KNOWN REMAINING LIMITATIONS
 
-1. **Outbox worker not implemented** — `dispatched=0` rows accumulate forever. The schema supports it but the dispatch loop itself does not exist. This is the highest-priority feature gap after security.
+1. ~~**Outbox worker not implemented**~~ — **RESOLVED in Phase 7.** `worker.py` + Docker service drain the outbox every 5 seconds. Set `DOWNSTREAM_URL` in production to forward events to a real endpoint.
 
 2. **Structured JSON logging not implemented** — Logs are plain text. Cloud environments (Datadog, CloudWatch) require JSON logs with consistent keys for alerting.
 
@@ -175,12 +187,14 @@ Reason: Existing codebase, partially remediated from a prior audit.
 
 ## MOST LIKELY SILENT FAILURE IN PRODUCTION
 
-**The outbox accumulates without bound. There is no worker draining it.**
+~~**The outbox accumulates without bound. There is no worker draining it.**~~ — Fixed in Phase 7.
 
-At 500 TPS sustained: 43 million `dispatched=0` rows/day. Storage exhaustion within days.
-Revenue posted to the ledger is never forwarded to downstream systems.
+**New most likely silent failure: `DOWNSTREAM_URL` left empty in production.**
+`worker.py` defaults to log-only mode when `DOWNSTREAM_URL=""`. Events are marked `dispatched=1`
+but never actually forwarded. Revenue data is logged but never reaches the downstream system.
 
 **Monitor:** `SELECT COUNT(*) FROM outbox WHERE dispatched=0`. Alert at > 10,000 rows.
+**Verify:** Set `DOWNSTREAM_URL` to a real endpoint and confirm downstream system receives events.
 
 ---
 

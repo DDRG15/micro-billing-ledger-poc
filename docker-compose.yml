@@ -100,6 +100,38 @@ services:
           memory: 256M
           cpus: "0.50"
 
+  # ---------------------------------------------------------------------------
+  # worker — Transactional Outbox drain worker (Phase 7)
+  # EN: Polls outbox WHERE dispatched=0, forwards events downstream, marks them
+  #     dispatched=1. Runs as a separate process so its lifecycle is independent
+  #     of the billing API. Uses SELECT FOR UPDATE SKIP LOCKED — safe to scale
+  #     to multiple replicas without row contention.
+  #     Set DOWNSTREAM_URL to a real HTTP endpoint in production; leave empty
+  #     for log-only mode (useful during development and integration tests).
+  # ES: Sondea outbox WHERE dispatched=0, reenvía eventos downstream, los marca
+  #     dispatched=1. Corre como proceso separado — su ciclo de vida es independiente
+  #     de la API. Usa SELECT FOR UPDATE SKIP LOCKED — seguro para múltiples réplicas.
+  #     Configurar DOWNSTREAM_URL para un endpoint HTTP real en producción; dejar
+  #     vacío para modo log-only (útil en desarrollo y pruebas de integración).
+  # ---------------------------------------------------------------------------
+  worker:
+    build: .
+    command: python worker.py
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/billing
+      DOWNSTREAM_URL: ""
+      # EN: Leave DOWNSTREAM_URL empty to run in log-only mode (no real HTTP forwarding).
+      #     Set to your analytics/CRM endpoint in production, e.g.:
+      #       DOWNSTREAM_URL: https://analytics.internal/billing-events
+      # ES: Dejar DOWNSTREAM_URL vacío para modo log-only (sin reenvío HTTP real).
+      #     Configurar al endpoint de analytics/CRM en producción.
+      WORKER_BATCH_SIZE: "100"
+      WORKER_POLL_INTERVAL: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   # EN: Named volume — persists PostgreSQL data between docker-compose down/up cycles.
   #     To wipe all data and start fresh: docker-compose down -v
