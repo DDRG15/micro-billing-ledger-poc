@@ -59,6 +59,13 @@ DATABASE_URL: str = os.environ.get(
 DOWNSTREAM_URL: str = os.environ.get("DOWNSTREAM_URL", "")
 WORKER_BATCH_SIZE: int = int(os.environ.get("WORKER_BATCH_SIZE", "100"))
 WORKER_POLL_INTERVAL: float = float(os.environ.get("WORKER_POLL_INTERVAL", "5"))
+# EN: WORKER_LOG_ONLY=true enables log-only mode (no HTTP forwarding).
+#     Must be set explicitly — the worker refuses to start without a DOWNSTREAM_URL
+#     unless this flag is "true", preventing silent data loss in production.
+# ES: WORKER_LOG_ONLY=true habilita el modo log-only (sin reenvío HTTP).
+#     Debe configurarse explícitamente — el worker rehúsa iniciar sin DOWNSTREAM_URL
+#     a menos que esta bandera sea "true", previniendo pérdida silenciosa de datos en producción.
+WORKER_LOG_ONLY: bool = os.environ.get("WORKER_LOG_ONLY", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -273,11 +280,31 @@ def run_loop(conn: psycopg2.extensions.connection) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # EN: Guard against silent production misconfiguration.
+    #     Without a real DOWNSTREAM_URL the worker would mark rows dispatched=1
+    #     while forwarding nothing — revenue data silently never reaches downstream.
+    #     The operator must either set DOWNSTREAM_URL or explicitly opt in to
+    #     log-only mode with WORKER_LOG_ONLY=true.
+    # ES: Guardia contra mala configuración silenciosa en producción.
+    if not DOWNSTREAM_URL and not WORKER_LOG_ONLY:
+        log.error(
+            "startup_error: DOWNSTREAM_URL is not set and WORKER_LOG_ONLY is not 'true'. "
+            "Set DOWNSTREAM_URL to a real endpoint, or set WORKER_LOG_ONLY=true to "
+            "run in log-only mode (events logged but not forwarded — dev/POC only)."
+        )
+        sys.exit(1)
+
+    mode = DOWNSTREAM_URL if DOWNSTREAM_URL else "LOG_ONLY (no HTTP forwarding — WORKER_LOG_ONLY=true)"
+    if WORKER_LOG_ONLY and not DOWNSTREAM_URL:
+        log.warning(
+            "running in LOG_ONLY mode — events will be logged and marked dispatched=1 "
+            "but NOT forwarded to any downstream system. Set DOWNSTREAM_URL in production."
+        )
     log.info(
         "starting batch_size=%d poll_interval=%.0fs downstream=%s",
         WORKER_BATCH_SIZE,
         WORKER_POLL_INTERVAL,
-        DOWNSTREAM_URL or "(log-only mode)",
+        mode,
     )
     conn: Optional[psycopg2.extensions.connection] = None
     backoff: float = 5.0

@@ -120,11 +120,15 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/billing
       DOWNSTREAM_URL: ""
-      # EN: Leave DOWNSTREAM_URL empty to run in log-only mode (no real HTTP forwarding).
-      #     Set to your analytics/CRM endpoint in production, e.g.:
+      # EN: Set DOWNSTREAM_URL to your analytics/CRM endpoint in production:
       #       DOWNSTREAM_URL: https://analytics.internal/billing-events
-      # ES: Dejar DOWNSTREAM_URL vacío para modo log-only (sin reenvío HTTP real).
-      #     Configurar al endpoint de analytics/CRM en producción.
+      #     WORKER_LOG_ONLY=true is set here because this is a POC with no real downstream.
+      #     In production: set DOWNSTREAM_URL and remove WORKER_LOG_ONLY (or set it to false).
+      #     Without one of these two set, the worker will refuse to start (fail-fast guard).
+      # ES: Configurar DOWNSTREAM_URL al endpoint de analytics/CRM en producción.
+      #     WORKER_LOG_ONLY=true se configura aquí porque este es un POC sin downstream real.
+      #     En producción: configurar DOWNSTREAM_URL y eliminar WORKER_LOG_ONLY.
+      WORKER_LOG_ONLY: "true"
       WORKER_BATCH_SIZE: "100"
       WORKER_POLL_INTERVAL: "5"
     depends_on:
