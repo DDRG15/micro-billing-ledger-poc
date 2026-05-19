@@ -78,3 +78,7 @@ Thumbs.db
 # EN: Claude Code workspace — tool-specific state, plans, and memory. Not app code.
 # ES: Espacio de trabajo de Claude Code — estado, planes y memoria de la herramienta. No es código de la app.
 .claude/
+
+# EN: Local-only notes — personal working documents that stay on this machine.
+# ES: Notas solo locales — documentos de trabajo personales que quedan en esta máquina.
+BUG_REPORT.md
