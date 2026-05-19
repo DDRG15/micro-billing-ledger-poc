@@ -15,7 +15,7 @@
 | 2026-05-13 | Original PREFLIGHT_AUDIT.md — 3 blockers, NO-GO verdict | — |
 | 2026-05-13 | Phases 1–7 remediation (CRITICAL/HIGH from prior audit) | `03a4226` → `6e36e67` |
 | 2026-05-18 | Full-spectrum re-audit; Phases 1–6 implemented; PRIVATE_README written | `8dfe1cf` → `bb6479c` |
-| 2026-05-19 | Phase 7 — Outbox worker (standalone Docker service); .dockerignore, .gitignore updates | pending |
+| 2026-05-19 | Phase 7 — Outbox worker (standalone Docker service); .dockerignore, .gitignore updates | `ae6e9f4` |
 
 ---
 
@@ -128,7 +128,7 @@ Reason: Existing codebase, partially remediated from a prior audit.
 - **Files:** `FULL_SPECTRUM_AUDIT.md` (this file), `PRIVATE_README.md`
 
 ### Phase 7 — Outbox worker (standalone Docker service)
-- **Commit:** pending
+- **Commit:** `ae6e9f4`
 - **Files:** `worker.py` (new), `ledger.py`, `docker-compose.yml`, `test_ledger.py`, `.dockerignore` (new), `.gitignore`
 - **worker.py:** Standalone Python process — `drain_batch()` reads up to 100 `dispatched=0` rows with `SELECT FOR UPDATE SKIP LOCKED`, dispatches each (HTTP POST if `DOWNSTREAM_URL` set, else structured log), marks rows `dispatched=1, dispatched_at=NOW()` inside the same `BEGIN/COMMIT`. Exponential backoff on DB errors (5→10→20→60s). SIGTERM-safe — finishes current batch then exits 0.
 - **ledger.py:** Added `ALTER TABLE outbox ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ` in `_bootstrap()` — idempotent migration for existing databases.
