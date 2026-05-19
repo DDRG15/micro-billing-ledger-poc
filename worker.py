@@ -155,6 +155,13 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow) -> None:
                 status = resp.status
         except urllib.error.HTTPError as exc:
             status = exc.code
+        except urllib.error.URLError as exc:
+            # B2: URLError (DNS failure, connection refused, timeout) is a distinct
+            # exception from HTTPError — must be caught explicitly and surfaced as
+            # dispatch_failed, not allowed to bubble up as unexpected_error.
+            raise RuntimeError(
+                f"downstream unreachable for transaction_id={row['transaction_id']}: {exc.reason}"
+            )
         if not (200 <= status < 300):
             raise RuntimeError(
                 f"downstream HTTP {status} for transaction_id={row['transaction_id']}"
@@ -265,10 +272,20 @@ def run_loop(conn: psycopg2.extensions.connection) -> None:
             log.error("db_error retrying in %.0fs: %s", backoff, exc)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
-            try:
-                conn = _connect()
-            except psycopg2.OperationalError:
-                pass
+            # B1: keep trying until we actually get a new connection.
+            # The old `except: pass` left conn pointing at the broken connection,
+            # causing an infinite tight loop of immediate failures.
+            new_conn = None
+            while new_conn is None and not _stop:
+                try:
+                    new_conn = _connect()
+                    log.info("reconnected to database")
+                except psycopg2.OperationalError as reconnect_exc:
+                    log.error("reconnect_failed retrying in %.0fs: %s", backoff, reconnect_exc)
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60.0)
+            if new_conn is not None:
+                conn = new_conn
         except Exception as exc:
             log.error("unexpected_error retrying in %.0fs: %s", backoff, exc)
             time.sleep(backoff)
@@ -317,6 +334,7 @@ def main() -> None:
             time.sleep(backoff)
             backoff = min(backoff * 2, 60.0)
 
+    assert conn is not None  # B6: narrow Optional → connection for mypy
     run_loop(conn)
     log.info("stopped cleanly")
 
