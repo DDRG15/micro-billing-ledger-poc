@@ -1,88 +1,72 @@
 # docker-compose.yml — Micro-Billing-Ledger PoC
 # ===============================================
-# EN: Spins up two services: a PostgreSQL database and the billing API.
+# EN: All secrets and configuration are read from the .env file.
+#     Copy .env.example to .env and fill in your values before running.
+#
 #     For running tests locally, start only the postgres service:
 #       docker-compose up -d postgres
 #       python test_ledger.py
-#     For running the full stack (API + DB together):
+#     For the full stack:
 #       docker-compose up
 #
-# ES: Levanta dos servicios: una base de datos PostgreSQL y la API de facturación.
+# ES: Todos los secretos y configuración se leen del archivo .env.
+#     Copia .env.example a .env y llena tus valores antes de ejecutar.
+#
 #     Para ejecutar tests localmente, iniciar solo el servicio postgres:
 #       docker-compose up -d postgres
 #       python test_ledger.py
-#     Para ejecutar el stack completo (API + DB juntos):
+#     Para el stack completo:
 #       docker-compose up
 
 services:
 
   # ---------------------------------------------------------------------------
   # postgres — the database backend
-  # EN: PostgreSQL 16 Alpine. Data is persisted in a named volume (pgdata) so
-  #     it survives container restarts. The billing database and user are created
-  #     automatically by the POSTGRES_* environment variables.
-  # ES: PostgreSQL 16 Alpine. Los datos se persisten en un volumen con nombre (pgdata)
-  #     para que sobrevivan reinicios del contenedor. La base de datos y el usuario
-  #     billing se crean automáticamente por las variables de entorno POSTGRES_*.
   # ---------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER:     postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB:       billing
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
     ports:
-      # EN: Bound to 127.0.0.1 — only the local machine can connect. Prevents any other host
-      #     on the same LAN from reaching PostgreSQL with the default postgres:postgres credentials.
-      #     Tests connect via localhost:5432 — no change needed in test runner.
-      # ES: Vinculado a 127.0.0.1 — solo la máquina local puede conectarse. Previene que cualquier
-      #     otro host en la misma LAN alcance PostgreSQL con las credenciales postgres:postgres por defecto.
+      # EN: Bound to 127.0.0.1 — only this machine can connect directly.
+      #     All external DB access must go through the billing/worker services.
+      # ES: Vinculado a 127.0.0.1 — solo esta máquina puede conectarse directamente.
       - "127.0.0.1:5432:5432"
     restart: unless-stopped
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      # EN: pg_isready -U postgres exits 0 when PostgreSQL is accepting connections.
-      #     The billing service depends_on this healthcheck so it won't start until the DB is ready.
-      # ES: pg_isready -U postgres sale con 0 cuando PostgreSQL acepta conexiones.
-      #     El servicio billing depends_on este healthcheck para no iniciar hasta que la DB esté lista.
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   # ---------------------------------------------------------------------------
   # billing — the FastAPI application
-  # EN: Built from the Dockerfile in this directory. Connects to the postgres service
-  #     using the DATABASE_URL environment variable. Waits for postgres to be healthy
-  #     before starting (depends_on condition: service_healthy).
-  # ES: Construido desde el Dockerfile en este directorio. Se conecta al servicio postgres
-  #     usando la variable de entorno DATABASE_URL. Espera a que postgres esté saludable
-  #     antes de iniciar (depends_on condición: service_healthy).
   # ---------------------------------------------------------------------------
   billing:
     build: .
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/billing
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
-      # EN: Set STRIPE_WEBHOOK_SECRET in your shell or a .env file before running.
-      #     Format: whsec_xxxx  (from Stripe Dashboard → Developers → Webhooks → Signing secret)
-      #     Never hardcode the real secret here — rotate ALL secrets if this file is committed.
-      # ES: Establecer STRIPE_WEBHOOK_SECRET en tu shell o archivo .env antes de ejecutar.
-      #     Formato: whsec_xxxx  (desde Stripe Dashboard → Developers → Webhooks → Signing secret)
-      #     Nunca hardcodear el secreto real aquí — rotar TODOS los secretos si este archivo se commitea.
+      DATABASE_URL:            ${DATABASE_URL}
+      STRIPE_WEBHOOK_SECRET:   ${STRIPE_WEBHOOK_SECRET}
+      BILLING_API_KEY:         ${BILLING_API_KEY}
     ports:
-      - "8000:8000"
+      # EN: Exposed on localhost only for local development and tests.
+      #     In production, traffic reaches billing through Caddy (port 443).
+      #     To harden production: remove this port mapping so billing is
+      #     only reachable internally via the Docker network.
+      # ES: Expuesto solo en localhost para desarrollo local y tests.
+      #     En producción, el tráfico llega a billing a través de Caddy (puerto 443).
+      #     Para endurecer producción: elimina este mapeo para que billing solo
+      #     sea accesible internamente a través de la red Docker.
+      - "127.0.0.1:8000:8000"
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      # EN: wget is available in Alpine — checks the /health endpoint every 10s.
-      #     start_period=10s gives uvicorn time to import ledger.py and connect the pool.
-      #     Kubernetes readiness probe should use this same endpoint.
-      # ES: wget disponible en Alpine — verifica el endpoint /health cada 10s.
-      #     start_period=10s da tiempo a uvicorn para importar ledger.py y conectar el pool.
       test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
       interval: 10s
       timeout: 5s
@@ -91,54 +75,57 @@ services:
     deploy:
       resources:
         limits:
-          # EN: 256 MB RAM cap — prevents an OOM in the billing container from taking
-          #     down the Docker host. Tune upward if batch ingestion of large payloads
-          #     causes RSS to exceed this limit under production load.
-          # ES: Límite de 256 MB de RAM — previene que un OOM en el contenedor billing
-          #     derribe el host Docker. Ajustar al alza si la ingesta en lote de payloads
-          #     grandes hace que RSS exceda este límite bajo carga de producción.
           memory: 256M
           cpus: "0.50"
 
   # ---------------------------------------------------------------------------
-  # worker — Transactional Outbox drain worker (Phase 7)
-  # EN: Polls outbox WHERE dispatched=0, forwards events downstream, marks them
-  #     dispatched=1. Runs as a separate process so its lifecycle is independent
-  #     of the billing API. Uses SELECT FOR UPDATE SKIP LOCKED — safe to scale
-  #     to multiple replicas without row contention.
-  #     Set DOWNSTREAM_URL to a real HTTP endpoint in production; leave empty
-  #     for log-only mode (useful during development and integration tests).
-  # ES: Sondea outbox WHERE dispatched=0, reenvía eventos downstream, los marca
-  #     dispatched=1. Corre como proceso separado — su ciclo de vida es independiente
-  #     de la API. Usa SELECT FOR UPDATE SKIP LOCKED — seguro para múltiples réplicas.
-  #     Configurar DOWNSTREAM_URL para un endpoint HTTP real en producción; dejar
-  #     vacío para modo log-only (útil en desarrollo y pruebas de integración).
+  # worker — Transactional Outbox drain worker
   # ---------------------------------------------------------------------------
   worker:
     build: .
     command: python worker.py
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/billing
-      DOWNSTREAM_URL: ""
-      # EN: Set DOWNSTREAM_URL to your analytics/CRM endpoint in production:
-      #       DOWNSTREAM_URL: https://analytics.internal/billing-events
-      #     WORKER_LOG_ONLY=true is set here because this is a POC with no real downstream.
-      #     In production: set DOWNSTREAM_URL and remove WORKER_LOG_ONLY (or set it to false).
-      #     Without one of these two set, the worker will refuse to start (fail-fast guard).
-      # ES: Configurar DOWNSTREAM_URL al endpoint de analytics/CRM en producción.
-      #     WORKER_LOG_ONLY=true se configura aquí porque este es un POC sin downstream real.
-      #     En producción: configurar DOWNSTREAM_URL y eliminar WORKER_LOG_ONLY.
-      WORKER_LOG_ONLY: "true"
-      WORKER_BATCH_SIZE: "100"
-      WORKER_POLL_INTERVAL: "5"
+      DATABASE_URL:        ${DATABASE_URL}
+      DOWNSTREAM_URL:      ${DOWNSTREAM_URL}
+      WORKER_LOG_ONLY:     ${WORKER_LOG_ONLY}
+      WORKER_BATCH_SIZE:   ${WORKER_BATCH_SIZE}
+      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL}
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # caddy — reverse proxy + automatic HTTPS (Phase 8)
+  # EN: Handles TLS termination via Let's Encrypt. Set CADDY_DOMAIN in .env
+  #     to your real domain and Caddy provisions the certificate automatically.
+  #     For local dev with CADDY_DOMAIN=localhost, access via https://localhost
+  #     (browser will warn about self-signed cert — expected for localhost).
+  #     Or skip Caddy locally and use http://localhost:8000 directly.
+  # ES: Maneja terminación TLS via Let's Encrypt. Configura CADDY_DOMAIN en .env
+  #     con tu dominio real y Caddy provisiona el certificado automáticamente.
+  #     Para dev local con CADDY_DOMAIN=localhost, accede via https://localhost
+  #     (el navegador advertirá del cert autofirmado — esperado en localhost).
+  #     O salta Caddy localmente y usa http://localhost:8000 directamente.
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - billing
+    restart: unless-stopped
+
 volumes:
-  # EN: Named volume — persists PostgreSQL data between docker-compose down/up cycles.
-  #     To wipe all data and start fresh: docker-compose down -v
-  # ES: Volumen con nombre — persiste datos PostgreSQL entre ciclos docker-compose down/up.
-  #     Para borrar todos los datos y empezar de nuevo: docker-compose down -v
   pgdata:
+  # EN: caddy_data persists TLS certificates — prevents hitting Let's Encrypt
+  #     rate limits on container restarts.
+  # ES: caddy_data persiste los certificados TLS — evita alcanzar los límites
+  #     de tasa de Let's Encrypt en reinicios del contenedor.
+  caddy_data:
+  caddy_config:
