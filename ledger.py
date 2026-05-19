@@ -218,14 +218,17 @@ class StripeObject(BaseModel):
             )
         return self
 
-    def get_amount(self) -> int:
+    def get_amount(self) -> Optional[int]:
         """
         EN: Returns the effective billing amount in cents. Prefers amount_paid
-            (Stripe invoice events) over amount (fallback). Always returns an
-            int — model_validator guarantees at least one is non-null.
-        ES: Retorna el monto de facturación efectivo en centavos. Prefiere amount_paid
-            (eventos de factura Stripe) sobre amount (respaldo). Siempre retorna un
-            int — el model_validator garantiza que al menos uno no es nulo.
+            (Stripe invoice events) over amount (fallback). Returns None only if
+            both fields are None — check_amount_present prevents this when the
+            model is constructed via StripeEvent, but direct StripeObject()
+            construction bypasses that validator, so Optional[int] is the honest type.
+        ES: Retorna el monto de facturación efectivo en centavos. Retorna None solo
+            si ambos campos son None — check_amount_present previene esto cuando el
+            modelo se construye vía StripeEvent, pero la construcción directa de
+            StripeObject() omite ese validador, por lo que Optional[int] es el tipo honesto.
         """
         return self.amount_paid if self.amount_paid is not None else self.amount
 
