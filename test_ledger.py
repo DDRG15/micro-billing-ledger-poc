@@ -44,6 +44,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 # ES: Importar el módulo ledger directamente — todos los tests llaman a sus funciones
 #     y usan sus modelos. Este es el módulo bajo prueba.
 import ledger as L
+import worker as W  # Phase 7: outbox drain worker
 
 # ---------------------------------------------------------------------------
 # Test infrastructure / Infraestructura de tests
@@ -964,6 +965,92 @@ empty_result = L.process_stripe_event_batch(empty_conn, [])
 chk("empty batch → []",                               empty_result == [],
     f"got {empty_result}")
 empty_conn.close()
+
+
+# =============================================================================
+# Phase 7: Outbox worker — drain_batch tests
+# EN: Tests the drain_batch() function from worker.py directly (no HTTP server).
+#     Three tests: empty queue, normal dispatch, and idempotency.
+# ES: Tests de la función drain_batch() de worker.py directamente (sin servidor HTTP).
+#     Tres tests: cola vacía, despacho normal, e idempotencia.
+# =============================================================================
+print("\n── Phase 7: drain_batch — empty queue ───────────────────────────────────")
+worker_conn1 = fresh_conn()
+drained_empty = W.drain_batch(worker_conn1)
+chk("drain_batch on empty outbox returns 0",
+    drained_empty == 0, f"got {drained_empty}")
+with worker_conn1.cursor() as _wc:
+    _wc.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
+    remaining = _wc.fetchone()[0]
+chk("outbox still empty after drain on empty queue",
+    remaining == 0, f"got {remaining}")
+worker_conn1.close()
+
+print("\n── Phase 7: drain_batch — dispatches rows and marks dispatched=1 ────────")
+worker_conn2 = fresh_conn()
+# EN: Manually insert ledger rows first (FK constraint requires them), then outbox rows.
+# ES: Insertar filas de ledger primero (FK lo requiere), luego filas de outbox.
+with worker_conn2.cursor() as _wc2:
+    _wc2.execute("BEGIN")
+    for i in range(1, 4):
+        _wc2.execute(
+            """
+            INSERT INTO ledger
+              (transaction_id, event_type, customer_id, amount_cents,
+               currency, status, idempotency_key, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (f"evt_w{i}", "invoice.paid", "cus_worker",
+             1000 * i, "usd", "paid", f"evt_w{i}", "{}"),
+        )
+        _wc2.execute(
+            """
+            INSERT INTO outbox (transaction_id, event_type, payload)
+            VALUES (%s, %s, %s)
+            """,
+            (f"evt_w{i}", "invoice.paid", "{}"),
+        )
+    _wc2.execute("COMMIT")
+
+drained_count = W.drain_batch(worker_conn2)
+chk("drain_batch returns 3 for 3 pending rows",
+    drained_count == 3, f"got {drained_count}")
+
+with worker_conn2.cursor() as _wc2:
+    _wc2.execute(
+        "SELECT COUNT(*) FROM outbox WHERE dispatched=1 AND dispatched_at IS NOT NULL"
+    )
+    done = _wc2.fetchone()[0]
+chk("all 3 outbox rows marked dispatched=1 with dispatched_at set",
+    done == 3, f"got {done}")
+worker_conn2.close()
+
+print("\n── Phase 7: drain_batch — idempotency (second call returns 0) ───────────")
+worker_conn3 = fresh_conn()
+with worker_conn3.cursor() as _wc3:
+    _wc3.execute("BEGIN")
+    _wc3.execute(
+        """
+        INSERT INTO ledger
+          (transaction_id, event_type, customer_id, amount_cents,
+           currency, status, idempotency_key, payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        ("evt_idem", "invoice.paid", "cus_idem", 500, "usd", "paid", "evt_idem", "{}"),
+    )
+    _wc3.execute(
+        "INSERT INTO outbox (transaction_id, event_type, payload) VALUES (%s, %s, %s)",
+        ("evt_idem", "invoice.paid", "{}"),
+    )
+    _wc3.execute("COMMIT")
+
+first_drain  = W.drain_batch(worker_conn3)
+second_drain = W.drain_batch(worker_conn3)
+chk("first drain_batch call returns 1",
+    first_drain == 1, f"got {first_drain}")
+chk("second drain_batch call returns 0 (idempotent — no double-dispatch)",
+    second_drain == 0, f"got {second_drain}")
+worker_conn3.close()
 
 
 # =============================================================================

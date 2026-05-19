@@ -1,0 +1,62 @@
+# .dockerignore — Micro-Billing-Ledger PoC
+# ==========================================
+# EN: Excludes files from the Docker build context.
+#     A smaller context = faster builds and no accidental secret leaks into images.
+#     Rule: only source code and package manifests belong inside the image.
+#
+# ES: Excluye archivos del contexto de build de Docker.
+#     Un contexto más pequeño = builds más rápidos y sin fugas accidentales de secretos en imágenes.
+#     Regla: solo el código fuente y los manifiestos de paquetes pertenecen dentro de la imagen.
+
+# EN: Git history — never include in the image. Large, irrelevant to runtime, and leaks commit metadata.
+# ES: Historial de git — nunca incluir en la imagen. Grande, irrelevante para runtime, y filtra metadatos.
+.git/
+.gitignore
+
+# EN: Secrets — critical exclusion. .env must NEVER enter a Docker image.
+#     If an image with .env is pushed to a registry, the secret is compromised.
+# ES: Secretos — exclusión crítica. .env nunca debe entrar a una imagen Docker.
+#     Si una imagen con .env se sube a un registro, el secreto queda comprometido.
+.env
+.env.local
+.env.production
+
+# EN: Python bytecode and virtual environments — machine-specific, rebuilt inside the container.
+# ES: Bytecode Python y entornos virtuales — específicos de la máquina, se reconstruyen dentro del contenedor.
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# EN: Test suite and audit/planning documents — not needed at runtime.
+# ES: Suite de tests y documentos de auditoría/planificación — no necesarios en runtime.
+test_ledger.py
+PREFLIGHT_AUDIT.md
+FULL_SPECTRUM_AUDIT.md
+PRIVATE_README.md
+LOGIC_AUDIT.md
+IMPLEMENTATION_REPORT.md
+README.md
+*.md
+
+# EN: Development toolchain config and cache.
+# ES: Configuración y caché de la cadena de herramientas de desarrollo.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# EN: Log files — runtime artefacts, not source. Could contain PII.
+# ES: Archivos de log — artefactos de runtime, no fuente. Pueden contener PII.
+*.log
+
+# EN: OS noise.
+# ES: Ruido del SO.
+.DS_Store
+Thumbs.db
+
+# EN: Claude Code workspace files — local AI assistant state, not part of the app.
+# ES: Archivos de espacio de trabajo de Claude Code — estado local del asistente AI, no parte de la app.
+.claude/
