@@ -1,0 +1,57 @@
+# Caddyfile — Micro-Billing-Ledger reverse proxy + TLS
+# ======================================================
+# EN: Caddy automatically obtains and renews a TLS certificate from
+#     Let's Encrypt when CADDY_DOMAIN is set to a real domain and
+#     port 443 is reachable from the internet.
+#
+#     To activate HTTPS in production:
+#       1. Point your domain DNS to this server's IP.
+#       2. Open port 443 on your firewall / security group.
+#       3. Set CADDY_DOMAIN=billing.yourcompany.com in your .env file.
+#       4. Run: docker-compose up -d
+#       Caddy does the rest — no certbot, no cron, no manual renewal.
+#
+# ES: Caddy obtiene y renueva automáticamente un certificado TLS de
+#     Let's Encrypt cuando CADDY_DOMAIN es un dominio real y el
+#     puerto 443 es accesible desde internet.
+#
+#     Para activar HTTPS en producción:
+#       1. Apunta el DNS de tu dominio a la IP de este servidor.
+#       2. Abre el puerto 443 en tu firewall / security group.
+#       3. Configura CADDY_DOMAIN=billing.tuempresa.com en tu .env.
+#       4. Ejecuta: docker-compose up -d
+#       Caddy hace el resto — sin certbot, sin cron, sin renovación manual.
+#
+# LOCAL DEV / DESARROLLO LOCAL:
+#   With CADDY_DOMAIN=localhost (default in .env.example), Caddy uses
+#   a self-signed certificate. Your browser will show a security warning —
+#   this is expected for localhost. For local dev you can also access
+#   the API directly on http://localhost:8000 (billing port is still exposed).
+#
+#   Con CADDY_DOMAIN=localhost (default en .env.example), Caddy usa un
+#   certificado autofirmado. El navegador mostrará una advertencia de seguridad
+#   — es esperado en localhost. Para desarrollo local también puedes acceder
+#   directamente en http://localhost:8000 (el puerto de billing sigue expuesto).
+
+{$CADDY_DOMAIN} {
+    # EN: Forward all traffic to the billing FastAPI container.
+    #     The billing service is NOT exposed to the internet directly —
+    #     all external traffic must pass through Caddy.
+    # ES: Reenvía todo el tráfico al contenedor FastAPI de billing.
+    #     El servicio billing NO está expuesto directamente a internet —
+    #     todo el tráfico externo debe pasar por Caddy.
+    reverse_proxy billing:8000
+
+    # EN: Security headers — applied to every response.
+    # ES: Headers de seguridad — aplicados a cada respuesta.
+    header {
+        # Prevent clickjacking
+        X-Frame-Options DENY
+        # Prevent MIME type sniffing
+        X-Content-Type-Options nosniff
+        # Enable HSTS (tell browsers to always use HTTPS for this domain)
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        # Remove server fingerprint
+        -Server
+    }
+}

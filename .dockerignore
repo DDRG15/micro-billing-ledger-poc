@@ -15,9 +15,12 @@
 
 # EN: Secrets — critical exclusion. .env must NEVER enter a Docker image.
 #     If an image with .env is pushed to a registry, the secret is compromised.
+#     .env.example is also excluded — it contains placeholder values, not needed at runtime.
 # ES: Secretos — exclusión crítica. .env nunca debe entrar a una imagen Docker.
 #     Si una imagen con .env se sube a un registro, el secreto queda comprometido.
+#     .env.example también se excluye — contiene placeholders, no se necesita en runtime.
 .env
+.env.example
 .env.local
 .env.production
 
