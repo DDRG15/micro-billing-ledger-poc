@@ -88,6 +88,17 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          # EN: 256 MB RAM cap — prevents an OOM in the billing container from taking
+          #     down the Docker host. Tune upward if batch ingestion of large payloads
+          #     causes RSS to exceed this limit under production load.
+          # ES: Límite de 256 MB de RAM — previene que un OOM en el contenedor billing
+          #     derribe el host Docker. Ajustar al alza si la ingesta en lote de payloads
+          #     grandes hace que RSS exceda este límite bajo carga de producción.
+          memory: 256M
+          cpus: "0.50"
 
 volumes:
   # EN: Named volume — persists PostgreSQL data between docker-compose down/up cycles.
