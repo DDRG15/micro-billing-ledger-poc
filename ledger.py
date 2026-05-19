@@ -513,6 +513,24 @@ DATABASE_URL: str = os.environ.get(
 #     TODAS las solicitudes entrantes con 400. Establecerlo antes de recibir tráfico real de Stripe.
 STRIPE_WEBHOOK_SECRET: str = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_YOUR_SECRET_HERE")
 
+# EN: Guard against placeholder secret reaching production. The default value
+#     "whsec_YOUR_SECRET_HERE" is not a valid Stripe signing secret. If the env var
+#     was never set, every incoming webhook would pass signature verification because
+#     stripe.Webhook.construct_event() would compare against this literal string —
+#     silently accepting ALL unsigned requests. Fail hard at startup instead.
+# ES: Guardia contra secreto placeholder llegando a producción. El valor por defecto
+#     no es un secreto de firma Stripe válido. Fallar en el inicio en lugar de aceptar
+#     silenciosamente todas las solicitudes sin firma.
+_PLACEHOLDER_SECRET = "whsec_YOUR_SECRET_HERE"
+if STRIPE_WEBHOOK_SECRET == _PLACEHOLDER_SECRET:
+    import warnings
+    warnings.warn(
+        "STRIPE_WEBHOOK_SECRET is the placeholder value. "
+        "Set it to your real Stripe signing secret before receiving live traffic. "
+        "Webhook signature verification will reject all incoming requests until this is set.",
+        stacklevel=1,
+    )
+
 # EN: API key for ops endpoints (/ledger/summary, /dlq/entries).
 #     If empty (env var not set), the check is skipped — dev-mode convenience.
 #     In production: set to a strong random value, e.g., openssl rand -hex 32.

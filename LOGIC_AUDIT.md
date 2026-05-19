@@ -102,11 +102,11 @@ ES: Cada sección de test llama `fresh_conn()` que emite `TRUNCATE TABLE outbox,
 
 | Feature / Característica | Status / Estado |
 |---|---|
-| Stripe webhook signature verification | Code written, commented out — `stripe` SDK not in requirements |
+| Stripe webhook signature verification | **ACTIVE** — `stripe.Webhook.construct_event()` validates HMAC-SHA256 on every request; `stripe==10.12.0` is in `requirements.txt` |
 | Outbox worker (dispatch loop) | Schema exists (dispatched=0/1), worker not implemented |
-| Connection pooling | Single `psycopg2` connection — `ThreadedConnectionPool` is the next step |
-| Prometheus `/metrics` endpoint | Not implemented |
-| Structured JSON logging | Plain text logging only |
+| Connection pooling | **ACTIVE** — `ThreadedConnectionPool(minconn=1, maxconn=20)` at module level |
+| Prometheus `/metrics` endpoint | Not implemented (`prometheus-client` commented out in requirements.txt) |
+| Structured JSON logging | Plain text logging only (`RotatingFileHandler` added in Phase 2) |
 | DLQ retry budget (retry_count, max_retries) | DLQ is append-only — no retry mechanism |
 
 ---
