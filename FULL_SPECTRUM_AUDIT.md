@@ -189,12 +189,13 @@ Reason: Existing codebase, partially remediated from a prior audit.
 
 ~~**The outbox accumulates without bound. There is no worker draining it.**~~ — Fixed in Phase 7.
 
-**New most likely silent failure: `DOWNSTREAM_URL` left empty in production.**
-`worker.py` defaults to log-only mode when `DOWNSTREAM_URL=""`. Events are marked `dispatched=1`
-but never actually forwarded. Revenue data is logged but never reaches the downstream system.
+**New most likely silent failure: `DOWNSTREAM_URL` left empty in production — MITIGATED.**
+`worker.py` now has a fail-fast guard: if `DOWNSTREAM_URL` is empty and `WORKER_LOG_ONLY` is not
+`"true"`, the worker exits at startup with a clear error. Log-only mode requires an explicit opt-in.
+`docker-compose.yml` sets `WORKER_LOG_ONLY=true` with a comment explaining it must be removed in production.
 
 **Monitor:** `SELECT COUNT(*) FROM outbox WHERE dispatched=0`. Alert at > 10,000 rows.
-**Verify:** Set `DOWNSTREAM_URL` to a real endpoint and confirm downstream system receives events.
+**Verify:** Set `DOWNSTREAM_URL` to a real endpoint, remove `WORKER_LOG_ONLY`, and confirm downstream receives events.
 
 ---
 
