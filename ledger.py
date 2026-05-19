@@ -97,6 +97,9 @@ _log = logging.getLogger("ledger")
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # ===========================================================================
 # SECTION 1: ENUMS AND PYDANTIC MODELS (Phase 1 + Phase 2)
@@ -625,7 +628,8 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         cur.execute("""
             CREATE TABLE IF NOT EXISTS outbox (
                 id              BIGSERIAL   PRIMARY KEY,
-                transaction_id  TEXT        NOT NULL,
+                transaction_id  TEXT        NOT NULL
+                                REFERENCES ledger(transaction_id) ON DELETE CASCADE,
                 event_type      TEXT        NOT NULL,
                 payload         TEXT        NOT NULL,
                 dispatched      INTEGER     NOT NULL DEFAULT 0,
@@ -1203,6 +1207,16 @@ def process_stripe_event_batch(
 
 app = FastAPI(title="Micro-Billing-Ledger PoC", version="1.0.0")
 
+# EN: Rate limiter — keyed by client IP. Prevents a single caller from exhausting
+#     the connection pool (maxconn=20) or flooding the DLQ table.
+#     Limits are applied per-route via @limiter.limit() decorator below.
+#     429 Too Many Requests is returned when the limit is exceeded.
+# ES: Limitador de tasa — con clave por IP del cliente. Previene que un único llamador
+#     agote el pool de conexiones o inunde la tabla DLQ.
+_limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = _limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # EN: Ensure all three tables and their indexes exist before the pool opens connections.
 #     The bootstrap connection is closed immediately — it is not reused.
 # ES: Asegurar que las tres tablas y sus índices existen antes de que el pool abra conexiones.
@@ -1224,22 +1238,33 @@ _pool: ThreadedConnectionPool = ThreadedConnectionPool(minconn=1, maxconn=20, ds
 def _require_api_key(x_api_key: str = Header(default="")) -> None:
     """
     EN: FastAPI dependency for ops endpoints. If BILLING_API_KEY is configured in the
-        environment, the X-Api-Key request header must match exactly. If BILLING_API_KEY
-        is empty (not configured), the check is skipped — dev-mode convenience without
-        requiring env setup for every developer.
+        environment (non-empty), the X-Api-Key request header must match exactly.
+        If BILLING_API_KEY is not set at all (empty string from os.environ.get default),
+        the check is skipped — dev-mode convenience without requiring env setup for
+        every developer.
+        IMPORTANT: An operator who sets BILLING_API_KEY="" (explicitly empty) is treated
+        the same as "not configured" — this is intentional dev-mode behaviour. In
+        production, always set BILLING_API_KEY to a non-empty secret value.
         ISO 27001 A.9.4.1: access to sensitive operational data (DLQ, ledger summary)
         must be access-controlled in production.
-    ES: Dependencia FastAPI para endpoints de operaciones. Si BILLING_API_KEY está configurado
-        en el entorno, el header de solicitud X-Api-Key debe coincidir exactamente. Si BILLING_API_KEY
-        está vacío (no configurado), el check se omite — conveniencia en modo dev sin requerir
-        configuración de entorno para cada desarrollador.
-        ISO 27001 A.9.4.1: el acceso a datos operacionales sensibles (DLQ, resumen del libro)
-        debe estar controlado por acceso en producción.
+    ES: Dependencia FastAPI para endpoints de operaciones. Si BILLING_API_KEY está
+        configurado en el entorno (no vacío), el header X-Api-Key debe coincidir exactamente.
+        Un operador que establece BILLING_API_KEY="" se trata como "no configurado" — es
+        comportamiento intencional de modo dev. En producción, siempre establecer
+        BILLING_API_KEY a un valor secreto no vacío.
+        ISO 27001 A.9.4.1: el acceso a datos operacionales sensibles debe estar controlado.
     """
-    if BILLING_API_KEY and x_api_key != BILLING_API_KEY:
+    if not BILLING_API_KEY:
+        return  # EN: dev mode — no key configured, skip check / ES: modo dev — sin clave configurada, omitir check
+    if not x_api_key:
         raise HTTPException(
             status_code=401,
-            detail="Invalid or missing API key / Clave de API inválida o faltante"
+            detail="X-Api-Key header required / Header X-Api-Key requerido"
+        )
+    if x_api_key != BILLING_API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key / Clave de API inválida"
         )
 
 
@@ -1263,6 +1288,7 @@ class StripeWebhookPayload(BaseModel):
 
 
 @app.post("/webhook/stripe", status_code=status.HTTP_200_OK)
+@_limiter.limit("100/minute")
 def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONResponse:
     """
     EN: Receives a Stripe webhook and commits it to the billing ledger.
@@ -1318,7 +1344,8 @@ def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONRespo
 
 
 @app.get("/ledger/summary")
-def ledger_summary(_: None = Depends(_require_api_key)) -> JSONResponse:
+@_limiter.limit("20/minute")
+def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSONResponse:
     """
     EN: Quick sanity-check endpoint. Returns row counts per ledger status, DLQ depth,
         and outbox pending count. Requires X-Api-Key header when BILLING_API_KEY is set.
@@ -1356,7 +1383,8 @@ def ledger_summary(_: None = Depends(_require_api_key)) -> JSONResponse:
 
 
 @app.get("/dlq/entries")
-def dlq_entries(limit: int = 50, _: None = Depends(_require_api_key)) -> JSONResponse:
+@_limiter.limit("20/minute")
+def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_api_key)) -> JSONResponse:
     """
     EN: Inspect DLQ entries over HTTP — newest first. This is the ops endpoint:
         without it, "check the DLQ" means "SSH into the box and run a psql query."

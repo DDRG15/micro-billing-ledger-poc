@@ -55,6 +55,14 @@ stripe==10.12.0
 
 psycopg2-binary==2.9.9  # EN: PostgreSQL sync driver — ACTIVE. Binary package includes libpq; no OS headers needed. / ES: Driver sync PostgreSQL — ACTIVO. El paquete binary incluye libpq; sin headers del SO necesarios.
 
+# EN: slowapi 0.1.9 — rate limiting for FastAPI. Wraps the `limits` library.
+#     Limits: 100 req/min on POST /webhook/stripe, 20 req/min on GET /dlq/entries
+#     and GET /ledger/summary. Prevents connection pool exhaustion and DLQ flooding.
+# ES: slowapi 0.1.9 — limitación de tasa para FastAPI. Envuelve la librería `limits`.
+#     Límites: 100 req/min en POST /webhook/stripe, 20 req/min en GET /dlq/entries
+#     y GET /ledger/summary. Previene agotamiento del pool y flooding del DLQ.
+slowapi==0.1.9
+
 # EN: Uncomment when adding Prometheus /metrics endpoint.
 # ES: Descomentar al agregar el endpoint /metrics de Prometheus.
 # prometheus-client==0.21.0
