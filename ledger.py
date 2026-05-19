@@ -49,6 +49,7 @@ Usage / Uso:
 import argparse       # EN: CLI argument parsing for --silent/--events flags / ES: Parseo de argumentos CLI para las banderas --silent/--events
 import json           # EN: JSON serialization for raw payload archiving / ES: Serialización JSON para archivo del payload crudo
 import logging        # EN: Structured log output to file and stderr / ES: Salida de log estructurado a archivo y stderr
+from logging.handlers import RotatingFileHandler  # EN: Rotating file handler — caps log file size to prevent disk fill / ES: Manejador de archivo rotativo — limita el tamaño del log para prevenir llenado de disco
 import os             # EN: DATABASE_URL, STRIPE_WEBHOOK_SECRET, BILLING_API_KEY env var lookup / ES: Lectura de variables de entorno DATABASE_URL, STRIPE_WEBHOOK_SECRET, BILLING_API_KEY
 import time           # EN: perf_counter for benchmark timing / ES: perf_counter para temporización del benchmark
 import stripe         # EN: Stripe SDK for HMAC-SHA256 webhook signature verification / ES: SDK de Stripe para verificación de firma HMAC-SHA256 de webhook
@@ -62,20 +63,26 @@ from enum import Enum  # EN: Enums for EventType, LedgerStatus, DLQReason — pr
 
 # ---------------------------------------------------------------------------
 # Logging configuration / Configuración de logging
-# EN: Two handlers: StreamHandler (stderr for Docker/systemd) + FileHandler
-#     (billing_ledger.log for manual recovery). Both see ERROR logs for DLQ
-#     write failures, which include the full raw payload for manual replay.
-# ES: Dos manejadores: StreamHandler (stderr para Docker/systemd) + FileHandler
-#     (billing_ledger.log para recuperación manual). Ambos ven logs ERROR para
-#     fallos de escritura en DLQ, que incluyen el payload crudo completo para
-#     reproducción manual.
+# EN: Two handlers: StreamHandler (stderr for Docker/systemd) + RotatingFileHandler
+#     (billing_ledger.log for manual recovery, max 10 MB × 5 files = 50 MB cap).
+#     Both see ERROR logs for DLQ write failures, which include the full raw
+#     payload for manual replay. RotatingFileHandler prevents unbounded disk growth
+#     at high ingestion rates — at 500 TPS with frequent DLQ errors, a plain
+#     FileHandler fills disk in hours.
+# ES: Dos manejadores: StreamHandler (stderr para Docker/systemd) + RotatingFileHandler
+#     (billing_ledger.log para recuperación manual, máx 10 MB × 5 archivos = límite 50 MB).
+#     RotatingFileHandler previene crecimiento ilimitado en disco a altas tasas de ingesta.
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),                          # EN: stderr / ES: stderr
-        logging.FileHandler("billing_ledger.log"),        # EN: persistent log file / ES: archivo de log persistente
+        RotatingFileHandler(
+            "billing_ledger.log",
+            maxBytes=10_485_760,   # EN: 10 MB per file / ES: 10 MB por archivo
+            backupCount=5,          # EN: keep .1 through .5 → 50 MB max / ES: guardar .1 hasta .5 → máx 50 MB
+        ),
     ],
 )
 _log = logging.getLogger("ledger")
@@ -1256,7 +1263,7 @@ class StripeWebhookPayload(BaseModel):
 
 
 @app.post("/webhook/stripe", status_code=status.HTTP_200_OK)
-async def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONResponse:
+def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONResponse:
     """
     EN: Receives a Stripe webhook and commits it to the billing ledger.
         Always returns HTTP 200 for valid JSON — even for duplicates and invalid
@@ -1283,7 +1290,7 @@ async def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSO
     #     Stripe-Signature contra el cuerpo crudo de la solicitud. Cualquier
     #     manipulación del cuerpo o firma incorrecta/ausente lanza SignatureVerificationError → 400.
     #     ISO 27001 A.14.1.2: autenticación en todos los puntos de entrada de ingesta.
-    raw_body   = await request.body()
+    raw_body   = request.body()   # EN: sync call — handler is def, Starlette provides sync .body() / ES: llamada sync — el manejador es def, Starlette provee .body() sync
     sig_header = request.headers.get("stripe-signature", "")
     try:
         stripe.Webhook.construct_event(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
@@ -1315,13 +1322,13 @@ def ledger_summary(_: None = Depends(_require_api_key)) -> JSONResponse:
     """
     EN: Quick sanity-check endpoint. Returns row counts per ledger status, DLQ depth,
         and outbox pending count. Requires X-Api-Key header when BILLING_API_KEY is set.
-        sync def: FastAPI runs this in its thread pool — psycopg2 blocking calls do not
-        block the asyncio event loop.
+        sync def: FastAPI dispatches sync handlers to its thread pool via run_in_threadpool.
+        psycopg2 blocking calls do not block the asyncio event loop.
     ES: Endpoint de verificación rápida de cordura. Retorna conteos de filas por estado
         del libro, profundidad del DLQ y conteo pendiente del outbox. Requiere header
         X-Api-Key cuando BILLING_API_KEY está establecido.
-        sync def: FastAPI ejecuta esto en su thread pool — las llamadas bloqueantes de
-        psycopg2 no bloquean el event loop de asyncio.
+        sync def: FastAPI despacha manejadores síncronos al thread pool vía run_in_threadpool.
+        Las llamadas bloqueantes de psycopg2 no bloquean el event loop de asyncio.
     """
     conn = _pool.getconn()
     try:
@@ -1396,13 +1403,14 @@ def dlq_entries(limit: int = 50, _: None = Depends(_require_api_key)) -> JSONRes
 
 
 @app.get("/health")
-async def health() -> JSONResponse:
+def health() -> JSONResponse:
     """
     EN: Kubernetes/Docker health check endpoint. Returns 200 if the process is alive.
         Does NOT check DB connectivity — a separate readiness probe should do that.
+        sync def: consistent with other route handlers; no I/O performed here.
     ES: Endpoint de health check para Kubernetes/Docker. Retorna 200 si el proceso
         está vivo. NO verifica la conectividad de la DB — una sonda de readiness
-        separada debe hacer eso.
+        separada debe hacer eso. sync def: consistente con otros manejadores.
     """
     return JSONResponse(content={"status": "ok"})
 

@@ -32,9 +32,12 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB:       billing
     ports:
-      # EN: 5432 exposed to localhost so tests can reach it without going through the API container.
-      # ES: 5432 expuesto a localhost para que los tests puedan alcanzarlo sin pasar por el contenedor API.
-      - "5432:5432"
+      # EN: Bound to 127.0.0.1 — only the local machine can connect. Prevents any other host
+      #     on the same LAN from reaching PostgreSQL with the default postgres:postgres credentials.
+      #     Tests connect via localhost:5432 — no change needed in test runner.
+      # ES: Vinculado a 127.0.0.1 — solo la máquina local puede conectarse. Previene que cualquier
+      #     otro host en la misma LAN alcance PostgreSQL con las credenciales postgres:postgres por defecto.
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -74,6 +77,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      # EN: wget is available in Alpine — checks the /health endpoint every 10s.
+      #     start_period=10s gives uvicorn time to import ledger.py and connect the pool.
+      #     Kubernetes readiness probe should use this same endpoint.
+      # ES: wget disponible en Alpine — verifica el endpoint /health cada 10s.
+      #     start_period=10s da tiempo a uvicorn para importar ledger.py y conectar el pool.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   # EN: Named volume — persists PostgreSQL data between docker-compose down/up cycles.
