@@ -43,12 +43,18 @@ pip install -r requirements.txt
 # 3. Run the full test suite — 108 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
-# 4. Start the API
-export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/billing
-export STRIPE_WEBHOOK_SECRET=whsec_YOUR_SECRET_HERE  # replace before receiving live Stripe traffic
+# 4. Configure environment — safe dev defaults work immediately
+cp .env.example .env
+# Edit .env: set STRIPE_WEBHOOK_SECRET to your real Stripe signing secret before live traffic.
+# All other defaults connect correctly to the Docker postgres service.
+
+# 5. Start the full stack (postgres + billing + worker + caddy)
+docker compose up
+
+# — OR — run the API standalone without the full stack
 uvicorn ledger:app --port 8000
 
-# 5. Teardown — stop containers and remove volumes
+# 6. Teardown — stop containers and remove volumes
 docker compose down          # keeps pgdata volume (data survives)
 docker compose down -v       # wipes pgdata volume (full clean slate)
 ```
@@ -87,7 +93,8 @@ curl "http://localhost:8000/dlq/entries?limit=10"
 
 ```mermaid
 flowchart TD
-    S[Stripe Webhook] -->|POST /webhook/stripe| H[FastAPI Handler]
+    S[Stripe Webhook] -->|HTTPS :443| CA[Caddy\nTLS termination + security headers]
+    CA -->|HTTP :8000| H[FastAPI Handler]
     H -->|dict payload| V{5-Layer Pydantic\nValidation Stack}
 
     V -->|ValidationError| DI[DLQ — INVALID\nraw payload preserved]
@@ -102,8 +109,9 @@ flowchart TD
 
     TX -->|COMMIT| C[HTTP 200 to Stripe]
 
-    O -->|Temporal Activity / worker| DS[Downstream System]
-    DS -->|dispatched=1 in same TX| O
+    O -->|worker.py polls every N seconds\nSELECT FOR UPDATE SKIP LOCKED| W[Worker Service\ndispatched=0 → dispatched=1]
+    W -->|HTTP POST if DOWNSTREAM_URL set| DS[Downstream System]
+    W -->|structured log if WORKER_LOG_ONLY| LOG[Log / Audit]
 
     DI --> OPS[Ops — GET /dlq/entries]
     DD --> OPS
@@ -112,6 +120,33 @@ flowchart TD
 ### Why this handles concurrent load correctly
 
 `INSERT INTO ledger ... ON CONFLICT (transaction_id) DO NOTHING` is a **database-level serialization point** — not an application lock, not a SELECT-then-INSERT race. Five threads firing the same `event_id` simultaneously all enter the transaction; PostgreSQL's PRIMARY KEY constraint ensures exactly one INSERT wins; all others produce `rowcount=0` (single-event path) or are absent from the `RETURNING` set (batch path). Zero application-level coordination required.
+
+---
+
+## Outbox Worker
+
+The Transactional Outbox pattern guarantees that a `ledger` row and its corresponding `outbox` row are written atomically. Without a drain loop, that guarantee is half-finished: events are recorded but never delivered downstream.
+
+`worker.py` is a standalone Docker service — not a thread inside the API process. An in-process thread shares the connection pool, dies with the web server, and cannot be restarted independently. A separate service has its own lifecycle, its own connection, and its own failure domain.
+
+**`SELECT FOR UPDATE SKIP LOCKED`** is the concurrency mechanism:
+
+```sql
+SELECT id, transaction_id, event_type, payload
+FROM outbox
+WHERE dispatched = 0
+ORDER BY id
+LIMIT 100
+FOR UPDATE SKIP LOCKED;
+```
+
+`FOR UPDATE` locks the selected rows for the duration of the transaction. `SKIP LOCKED` skips rows already locked by another worker — rather than blocking, it moves on. Two worker replicas running simultaneously process different rows without any coordination. No event is dispatched twice.
+
+The `dispatched=1` update happens in the **same `BEGIN…COMMIT`** as the dispatch confirmation. A crash before `COMMIT` leaves `dispatched=0` — the event is retried on the next poll. Delivery is at-least-once. The ledger's `ON CONFLICT DO NOTHING` makes receipt exactly-once.
+
+**Fail-fast on misconfiguration:** if `DOWNSTREAM_URL` is empty and `WORKER_LOG_ONLY` is not `"true"`, the worker exits at startup with a structured error. The alternative — marking rows `dispatched=1` without forwarding them — is undetectable data loss.
+
+**Resilience:** `psycopg2.OperationalError` triggers exponential backoff (5 → 10 → 20 → 60s cap) and a reconnect loop. `SIGTERM` sets a stop flag; the worker finishes the current batch then exits 0. This is the correct behavior for Docker rolling deploys and Kubernetes graceful termination.
 
 ---
 
@@ -128,6 +163,16 @@ flowchart TD
 **Connection Pooling** — `psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=20)` replaces the single module-level connection. Each request leases a connection via `getconn()` and returns it in a `finally` block via `putconn()`. No connection exhaustion under concurrent load; no leaked connections on exception paths.
 
 **Async/Sync Thread Dispatch** — Database-hitting routes (`/ledger/summary`, `/dlq/entries`) are declared `def`, not `async def`. FastAPI runs synchronous routes in an external thread pool, preventing psycopg2 blocking calls from stalling the asyncio event loop. The webhook handler remains `async def` to support `await request.body()`.
+
+**Rate Limiting** — `slowapi` enforces 100 req/min on `POST /webhook/stripe` and 20 req/min on the read endpoints, keyed by remote IP. A webhook flood without rate limiting exhausts `maxconn=20` and drives `outbox_pending` unbounded. The 429 response instructs Stripe to back off; Stripe's own retry logic handles redelivery.
+
+**Log Rotation** — `RotatingFileHandler(maxBytes=10MB, backupCount=5)` caps log storage at 50 MB. At 500 TPS under DLQ write failures, each logging a full raw payload as JSON, an unbounded log file fills a typical root partition in under an hour. The 5-file backup retains enough history for forensics without infinite growth.
+
+**Resource Limits** — `deploy.resources.limits: memory: 256M, cpus: 0.50` on the billing container. Without a memory ceiling, an OOM in the billing container can terminate the Docker host process. The hard limit ensures OOM kills the container in isolation.
+
+**Secrets Management** — All credentials are read from `.env` via `${VAR}` substitution in `docker-compose.yml`. No credential appears in source code. `.env.example` is the committed template with safe development defaults; `.env` is gitignored. Rotating a secret requires editing one file and restarting the affected service.
+
+**HTTPS / TLS** — Caddy sits in front of FastAPI as a reverse proxy. Set `CADDY_DOMAIN` in `.env` to a real domain; Caddy requests a Let's Encrypt certificate automatically — no `certbot`, no cron renewal job, no manual certificate rotation. Security headers enforced at the proxy: `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Strict-Transport-Security: max-age=31536000`, server fingerprint removed.
 
 ---
 
@@ -219,6 +264,10 @@ CREATE TABLE ledger (
 );
 
 -- Written in the same BEGIN...COMMIT as the ledger row.
+-- transaction_id REFERENCES ledger(transaction_id) ON DELETE CASCADE:
+--   enforces Transactional Outbox invariant at DB level — an outbox row
+--   cannot exist without its corresponding ledger row.
+--   Application logic alone is not sufficient; the FK constraint is the guarantee.
 -- dispatched=0 = pending downstream delivery.
 -- A worker flips to dispatched=1 in the same TX as delivery confirmation.
 CREATE TABLE outbox (
@@ -262,6 +311,8 @@ CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WH
 | `GET` | `/ledger/summary` | Row counts by status, DLQ depth, outbox pending count |
 | `GET` | `/dlq/entries?limit=N` | Inspect DLQ, newest first. Default 50, capped at 1,000. |
 
+**DLQ Operationalization** — `GET /dlq/entries` is the ops interface for triage. Every rejected event lands in the DLQ with its `raw_payload` preserved byte-perfect — never corrected, never truncated. In fintech, a rejected payment event without a recoverable audit trail is a compliance gap, not a logging inconvenience. An operator retrieves entries, inspects the reason code, fixes the upstream issue, and replays the original payload.
+
 ---
 
 ## Test Coverage
@@ -275,6 +326,10 @@ Phase 3  ( 9 tests)   Cross-field    — invoice amount > 0, customer ID format
 Phase 5  (32 tests)   Full stack     — HTTP, concurrent idempotency, outbox dispatch, DLQ queryability
 Phase 7  ( 7 tests)   Security & SRE — HMAC signature rejection, BIGINT overflow, batch duplicate, limit validation
 ```
+
+**Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
+
+**Test isolation:** each section calls `fresh_conn()`, which issues `TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY` — resets data and `BIGSERIAL` sequences. No shared state between sections. Every assertion starts from a known-empty database.
 
 **Concurrent idempotency test:**
 ```python
