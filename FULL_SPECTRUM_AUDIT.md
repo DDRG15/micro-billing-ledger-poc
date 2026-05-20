@@ -16,6 +16,9 @@
 | 2026-05-13 | Phases 1–7 remediation (CRITICAL/HIGH from prior audit) | `03a4226` → `6e36e67` |
 | 2026-05-18 | Full-spectrum re-audit; Phases 1–6 implemented; PRIVATE_README written | `8dfe1cf` → `bb6479c` |
 | 2026-05-19 | Phase 7 — Outbox worker (standalone Docker service); .dockerignore, .gitignore updates | `ae6e9f4` |
+| 2026-05-19 | Worker fail-fast guard; bug fixes B1+B2+B6 (reconnect loop, URLError label, mypy narrowing) | `b342f7a`, `469f667` |
+| 2026-05-19 | Phase 8 — secrets via .env + HTTPS via Caddy; all credentials out of docker-compose | `504ae9a` |
+| 2026-05-19 | Phase 9 — GitHub Actions CI/CD; POC disclaimer + CI badges in README; production gap checklist updated | `ef3e836` |
 
 ---
 
@@ -138,6 +141,28 @@ Reason: Existing codebase, partially remediated from a prior audit.
 - **.gitignore:** Added `.pytest_cache/`, `.mypy_cache/`, `*.egg-info/`, `dist/`, `build/`, `*.whl`.
 - **requirements.txt:** No changes needed — `worker.py` uses only stdlib (`urllib.request`, `signal`, `time`, `logging`) plus `psycopg2` already pinned.
 
+### Phase 7 — Bug fixes (B1, B2, B6)
+- **Commits:** `b342f7a` (fail-fast guard), `469f667` (B1+B2+B6)
+- **B1 — Reconnect loop:** `run_loop()` on `OperationalError` was catching the exception and reusing the broken connection. Fixed with a `while new_conn is None` retry loop that keeps attempting `_connect()` with exponential backoff until a new connection is established.
+- **B2 — URLError label:** `urllib.error.URLError` (DNS / connection refused) was not caught in `_dispatch_row()`. It fell through to the bare `except Exception` block and logged as `unexpected_error`. Fixed by adding an explicit `except urllib.error.URLError` clause that raises `RuntimeError` with a clear `downstream unreachable` message.
+- **B6 — mypy narrowing:** `conn: Optional[psycopg2.connection] = None` before `run_loop(conn)` caused mypy `Argument 1 to "run_loop" has incompatible type "Optional[...]"`. Fixed with `assert conn is not None` to narrow the type.
+- **Fail-fast guard:** Worker refused to start if `DOWNSTREAM_URL` was unset and `WORKER_LOG_ONLY != "true"`. Prevents silent data loss where rows are marked `dispatched=1` without being forwarded anywhere.
+
+### Phase 8 — Secrets management + HTTPS
+- **Commit:** `504ae9a`
+- **Files:** `.env.example` (new), `docker-compose.yml`, `Caddyfile` (new), `.dockerignore`
+- **.env.example:** Bilingual (EN/ES) template with safe dev defaults — `POSTGRES_USER=postgres`, `POSTGRES_PASSWORD=postgres`, `POSTGRES_DB=billing`, `DATABASE_URL`, `STRIPE_WEBHOOK_SECRET`, `BILLING_API_KEY`, `DOWNSTREAM_URL`, `WORKER_LOG_ONLY=true`, `WORKER_BATCH_SIZE=100`, `WORKER_POLL_INTERVAL=5`, `CADDY_DOMAIN=localhost`. `cp .env.example .env && docker-compose up` works immediately for local dev.
+- **docker-compose.yml:** All hardcoded credentials replaced with `${VAR}` substitution. `pg_isready -U ${POSTGRES_USER}` in healthcheck. Billing port changed to `127.0.0.1:8000:8000`.
+- **Caddyfile:** `{$CADDY_DOMAIN}` placeholder — set `CADDY_DOMAIN=billing.yourcompany.com` in `.env` to get automatic Let's Encrypt TLS. Security headers: `X-Frame-Options DENY`, `X-Content-Type-Options nosniff`, `Strict-Transport-Security`, `-Server`.
+- **docker-compose.yml:** `caddy` service added with `caddy_data` and `caddy_config` persistent volumes for certificate storage.
+
+### Phase 9 — GitHub Actions CI/CD
+- **Commit:** `ef3e836`
+- **Files:** `.github/workflows/test.yml` (new), `.github/workflows/lint.yml` (new), `README.md`
+- **test.yml:** Runs on every push and PR to main. PostgreSQL 16-alpine service container with healthcheck. Installs `requirements.txt`, runs `python test_ledger.py` with test secrets injected via env vars. Zero mocks — all 108 tests hit a real PostgreSQL instance.
+- **lint.yml:** `ruff check ledger.py worker.py` + `bandit -r ledger.py worker.py -ll` on every push and PR.
+- **README.md:** Added CI badges, POC disclaimer, updated production gap checklist (outbox worker marked Done, schema migrations gap added explicitly).
+
 ---
 
 ## TOOL RECOMMENDATIONS
@@ -164,7 +189,7 @@ Reason: Existing codebase, partially remediated from a prior audit.
 - [ ] `docker-compose build && docker-compose up` → billing healthcheck goes healthy
 - [ ] Rate limiter confirms 429 on 101st request within a minute from the same IP
 - [ ] `billing_ledger.log` confirmed to rotate (check `.1` file appears after rotation)
-- [ ] Outbox worker implemented OR alert configured for `outbox_pending > 10000`
+- [x] Outbox worker implemented — `worker.py` drains `WHERE dispatched=0` every `WORKER_POLL_INTERVAL` seconds with `SELECT FOR UPDATE SKIP LOCKED`
 - [ ] PII handling policy documented for `ledger.payload` and `dlq.raw_payload`
 - [ ] Run `bandit -r ledger.py` — no HIGH severity findings
 - [ ] Run `mypy ledger.py` — no type errors
@@ -231,4 +256,4 @@ for webhook signature verification only.
 ---
 
 *Diego Alonso Del Río García — posthog-billing-poc — Mayo 2026*
-*Last updated: 2026-05-18 — All 17 findings resolved. Phases 0–6 complete.*
+*Last updated: 2026-05-19 — All 17 findings resolved. Phases 0–9 complete. CI live on GitHub.*

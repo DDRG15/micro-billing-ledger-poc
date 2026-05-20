@@ -894,6 +894,17 @@ ES: - 108/108 tests pasando — 7 nuevas aserciones de seguridad y SRE agregadas
 ## Git Log Summary / Resumen del Log de Git
 
 ```
+ef3e836  feat: Phase 9 — GitHub Actions CI (tests + lint on every push and PR)
+504ae9a  feat: Phase 8 — secrets via .env + HTTPS via Caddy
+469f667  fix: B1+B2+B6 — worker reconnect loop, URLError label, mypy narrowing
+b342f7a  fix: worker fail-fast guard — refuse startup if DOWNSTREAM_URL unset
+ae6e9f4  feat: Phase 7 (outbox) — outbox worker standalone Docker service
+bb6479c  fix: Phase 5 LOW — type annotation fix, dev toolchain (ruff, mypy, bandit)
+49f5bd2  fix: Phase 4 MEDIUM+LOW — test gap coverage, connection leak fix
+346a6bd  fix: Phase 3 HIGH+MEDIUM — rate limiting, resource limits, outbox FK, empty API key guard
+e4703be  fix: Phase 2 HIGH — event loop safety, log rotation, PG port, billing healthcheck
+8dfe1cf  fix: Phase 1 CRITICAL — correct LOGIC_AUDIT.md + startup secret guard
+6e36e67  docs: Update IMPLEMENTATION_REPORT — Phase 7 section
 457ebee  fix: batch duplicate partition (remaining_ids), stripe.error singular module
 48c9779  test: Phase 7 — HMAC rejection, BIGINT, batch dup, Barrier(5), limit validation
 03a4226  feat: Phase 7 — Stripe HMAC, API keys, ThreadedConnectionPool, BIGINT schema
@@ -910,9 +921,6 @@ db5d79f  docs: Add Phase 2 implementation report to README
 d2a0ef7  Phase 2 chunk 2: Expand test coverage for DLQEntry and LedgerEntry models
 d2e2e9a  Phase 2 chunk 1: Add DLQEntry and LedgerEntry Pydantic models
 0dd866c  Phase 1: Pydantic Validation Pipeline - Entry Boundary Guardrails
-619305f  docs: finalized high-integrity README with Amateur Hour sass
-e4724e7  chore: add .gitignore and cleanup local artifacts
-36c5ca0  feat: high-throughput idempotent billing ledger poc
 ```
 
 ---

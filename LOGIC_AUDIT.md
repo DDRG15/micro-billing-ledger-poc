@@ -103,23 +103,37 @@ ES: Cada sección de test llama `fresh_conn()` que emite `TRUNCATE TABLE outbox,
 | Feature / Característica | Status / Estado |
 |---|---|
 | Stripe webhook signature verification | **ACTIVE** — `stripe.Webhook.construct_event()` validates HMAC-SHA256 on every request; `stripe==10.12.0` is in `requirements.txt` |
-| Outbox worker (dispatch loop) | Schema exists (dispatched=0/1), worker not implemented |
+| Outbox worker (dispatch loop) | **ACTIVE** — `worker.py` standalone Docker service; `SELECT FOR UPDATE SKIP LOCKED`; drains every N seconds; SIGTERM-safe; exponential backoff on DB errors (`469f667` bug fixes, `ae6e9f4` Phase 7) |
 | Connection pooling | **ACTIVE** — `ThreadedConnectionPool(minconn=1, maxconn=20)` at module level |
+| Secrets management | **ACTIVE** — all credentials read from `.env` via `${VAR}` substitution in docker-compose; `.env.example` committed as template (`504ae9a`) |
+| HTTPS / TLS | **ACTIVE** — Caddy reverse proxy with automatic Let's Encrypt; security headers (HSTS, X-Frame-Options, X-Content-Type-Options) (`504ae9a`) |
+| CI/CD pipeline | **ACTIVE** — GitHub Actions on every push/PR: 108 tests against real PostgreSQL service container + ruff/bandit lint (`ef3e836`) |
 | Prometheus `/metrics` endpoint | Not implemented (`prometheus-client` commented out in requirements.txt) |
 | Structured JSON logging | Plain text logging only (`RotatingFileHandler` added in Phase 2) |
 | DLQ retry budget (retry_count, max_retries) | DLQ is append-only — no retry mechanism |
+| Schema migrations | `_bootstrap()` runs DDL at startup — safe for PoC, not for production. No Alembic. |
 
 ---
 
 ## Commit History / Historial de Commits
 
 ```
+ef3e836  feat: Phase 9 — GitHub Actions CI (tests + lint on every push and PR)
+504ae9a  feat: Phase 8 — secrets via .env + HTTPS via Caddy
+469f667  fix: B1+B2+B6 — worker reconnect loop, URLError label, mypy narrowing
+b342f7a  fix: worker fail-fast guard — refuse startup if DOWNSTREAM_URL unset
+ae6e9f4  feat: Phase 7 — outbox worker (standalone Docker service, SELECT FOR UPDATE SKIP LOCKED)
+6d7d2f7  docs: Phase 6 — FULL_SPECTRUM_AUDIT.md + PRIVATE_README
+bb6479c  fix: Phase 5 LOW — type annotation fix, dev toolchain (ruff, mypy, bandit)
+49f5bd2  fix: Phase 4 MEDIUM+LOW — test gap coverage, connection leak fix
+346a6bd  fix: Phase 3 HIGH+MEDIUM — rate limiting, resource limits, outbox FK, empty API key guard
+e4703be  fix: Phase 2 HIGH — event loop safety, log rotation, PG port, billing healthcheck
+8dfe1cf  fix: Phase 1 CRITICAL — correct LOGIC_AUDIT.md + startup secret guard
+6e36e67  docs: Update IMPLEMENTATION_REPORT — Phase 7 section
 478bd29  docs: full bilingual rewrite of IMPLEMENTATION_REPORT, remove BLUEPRINT_ANALYSIS
 5e47362  docs: Phase 6 — lead architect documentation pass
 c8f1b30  perf: batch ingestion via execute_values — 26 TPS → 4,992 TPS
 6554181  feat: PostgreSQL migration — rip out SQLite, implement ON CONFLICT idempotency
-0d86845  docs: Add LOGIC_AUDIT.md — honest architectural delta report (SQLite era, now superseded)
-9712cd0  docs: bilingual comments, BLUEPRINT_ANALYSIS.md, README and IMPLEMENTATION_REPORT updates
 ```
 
 ---

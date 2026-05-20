@@ -81,9 +81,10 @@ o si solo parecía estar encendido.
 ## ¿Qué queda pendiente?
 
 Como cualquier negocio, siempre hay cosas en la lista de mejoras:
-- El programa registra los pagos, pero todavía no los **reenvía** a otros sistemas automáticamente
+- ~~El programa registra los pagos, pero todavía no los reenvía a otros sistemas automáticamente~~ — **Implementado (Fase 7):** hay un "mensajero" separado que revisa los pagos registrados y los reenvía automáticamente cada pocos segundos
 - No tiene un tablero con gráficas de cuántos pagos entran por hora
-- Los datos de los clientes se guardan tal cual — en un futuro habría que protegerlos mejor
+- Los datos de los clientes se guardan tal cual — en un futuro habría que protegerlos mejor (LGPD/GDPR)
+- Si un pago llega al "buzón de errores" (DLQ), no hay reintento automático todavía — requiere intervención manual
 
 ---
 
@@ -172,12 +173,15 @@ Se encontraron 17 vulnerabilidades o mejoras pendientes clasificadas así:
 
 | Feature | Estado |
 |---------|--------|
-| Worker del Outbox (reenvío automático) | Pendiente — la cola existe, el worker no |
+| Worker del Outbox (reenvío automático) | **Completado — Fase 7:** `worker.py` servicio Docker independiente, drena la cola cada N segundos |
+| Secrets management (.env) + HTTPS (Caddy) | **Completado — Fase 8:** credenciales fuera del código, HTTPS automático con Let's Encrypt |
+| CI/CD con GitHub Actions | **Completado — Fase 9:** 108 tests + lint en cada push y PR |
 | Endpoint de métricas Prometheus | Pendiente |
 | Logs estructurados en JSON | Pendiente |
-| Mecanismo de reintento para el DLQ | Pendiente |
+| Mecanismo de reintento para el DLQ | Pendiente — sin esto el DLQ es un cementerio, no una cuarentena |
+| Migraciones de schema (Alembic) | Pendiente — `_bootstrap()` hace DDL al arrancar, peligroso en producción |
 
-**El riesgo más alto en producción:** Los eventos se acumulan en el outbox pero nadie los envía a sistemas downstream. Habría que monitorear `SELECT COUNT(*) FROM outbox WHERE dispatched=0`.
+**El riesgo más alto en producción hoy:** Si un evento llega al DLQ (por error de validación o duplicado), no tiene reintento automático. Requiere intervención manual para reproducirlo. Monitorear `SELECT COUNT(*) FROM dlq WHERE received_at > NOW() - INTERVAL '1 hour'`.
 
 ---
 
@@ -444,14 +448,16 @@ bandit==1.7.8    # security lint (OWASP Top 10 patterns)
 
 ## Gaps de producción pendientes
 
-| Gap | Impacto | Esfuerzo |
-|-----|---------|---------|
-| Outbox worker (dispatch loop) | CRÍTICO — revenue no forwarded | Alto |
-| Structured JSON logging | Alto — observabilidad en cloud | Bajo |
-| Prometheus `/metrics` endpoint | Medio | Bajo (ya comentado en requirements.txt) |
-| DLQ retry budget (`retry_count`, `max_retries`) | Medio | Medio |
-| PII redaction en `payload`/`raw_payload` | Legal (LGPD/GDPR) | Alto |
-| Multi-worker Gunicorn config | Perf — scale horizontal | Bajo |
+| Gap | Impacto | Esfuerzo | Estado |
+|-----|---------|---------|--------|
+| Outbox worker (dispatch loop) | CRÍTICO — revenue no forwarded | Alto | **Completado** — `worker.py` Fase 7 |
+| Secrets management + HTTPS | CRÍTICO — credenciales hardcodeadas | Bajo | **Completado** — `.env` + Caddy Fase 8 |
+| CI/CD pipeline | ALTO — sin badge no hay confianza | Bajo | **Completado** — GitHub Actions Fase 9 |
+| Schema migrations (Alembic) | ALTO — `_bootstrap()` destruye datos en prod | Medio | Pendiente |
+| DLQ retry budget (`retry_count`, `max_retries`) | Medio — DLQ es cementerio sin esto | Medio | Pendiente |
+| Structured JSON logging | Alto — observabilidad en cloud | Bajo | Pendiente |
+| Prometheus `/metrics` endpoint | Medio | Bajo (ya comentado en requirements.txt) | Pendiente |
+| PII redaction en `payload`/`raw_payload` | Legal (LGPD/GDPR) | Alto | Pendiente |
 
 ---
 
