@@ -1,6 +1,6 @@
 # Caddyfile — Micro-Billing-Ledger reverse proxy + TLS
 # ======================================================
-# EN: Caddy automatically obtains and renews a TLS certificate from
+# Caddy automatically obtains and renews a TLS certificate from
 #     Let's Encrypt when CADDY_DOMAIN is set to a real domain and
 #     port 443 is reachable from the internet.
 #
@@ -11,9 +11,6 @@
 #       4. Run: docker-compose up -d
 #       Caddy does the rest — no certbot, no cron, no manual renewal.
 #
-# ES: Caddy obtiene y renueva automáticamente un certificado TLS de
-#     Let's Encrypt cuando CADDY_DOMAIN es un dominio real y el
-#     puerto 443 es accesible desde internet.
 #
 #     Para activar HTTPS en producción:
 #       1. Apunta el DNS de tu dominio a la IP de este servidor.
@@ -34,16 +31,12 @@
 #   directamente en http://localhost:8000 (el puerto de billing sigue expuesto).
 
 {$CADDY_DOMAIN} {
-    # EN: Forward all traffic to the billing FastAPI container.
+    # Forward all traffic to the billing FastAPI container.
     #     The billing service is NOT exposed to the internet directly —
     #     all external traffic must pass through Caddy.
-    # ES: Reenvía todo el tráfico al contenedor FastAPI de billing.
-    #     El servicio billing NO está expuesto directamente a internet —
-    #     todo el tráfico externo debe pasar por Caddy.
     reverse_proxy billing:8000
 
-    # EN: Security headers — applied to every response.
-    # ES: Headers de seguridad — aplicados a cada respuesta.
+    # Security headers — applied to every response.
     header {
         # Prevent clickjacking
         X-Frame-Options DENY
