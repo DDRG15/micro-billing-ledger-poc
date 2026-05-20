@@ -1,0 +1,48 @@
+# test.yml — run the full test suite on every push and PR
+# All 108 tests hit a real PostgreSQL 16 container — zero mocks.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: billing
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/billing
+          STRIPE_WEBHOOK_SECRET: whsec_ci_test_secret_not_for_production
+          BILLING_API_KEY: ci_test_api_key_not_for_production
+          WORKER_LOG_ONLY: "true"
+        run: python test_ledger.py

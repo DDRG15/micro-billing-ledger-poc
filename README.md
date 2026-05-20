@@ -1,6 +1,11 @@
 # Micro-Billing-Ledger PoC
 ### Idempotent Stripe Webhook Ingestion — PostgreSQL · Pydantic v2 · FastAPI
 
+[![Tests](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/test.yml/badge.svg)](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/test.yml)
+[![Lint](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/lint.yml/badge.svg)](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/lint.yml)
+
+**Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. Running it in production without addressing the gaps at the bottom of this file will result in unsafe schema migrations, no retry path for dead-lettered events, and blind observability. Each gap lists the exact fix.
+
 **Stack:** Python 3.12 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
 **Tests:** 108 / 108 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** ~5,000 TPS (batch) · 500+ TPS (single-event) · both on Docker-on-Windows localhost
@@ -287,14 +292,15 @@ assert ledger_row_count == 1               # verified by a separate connection
 
 ## Production Gap Checklist
 
-| Gap | Priority | Fix |
-|---|---|---|
-| Outbox worker | **HIGH** | Temporal activity polling `WHERE dispatched=0 ORDER BY id LIMIT 100`, delivering each event, flipping `dispatched=1` in the same TX. |
-| DLQ retry budget | **HIGH** | Add `retry_count`, `next_retry_at`, `max_retries` columns. Without this, DLQ is a graveyard, not a quarantine. |
-| Per-event-type amount extraction | **HIGH** | Unknown amount → DLQ instead of silently recording $0. |
-| Structured JSON logging | **MEDIUM** | JSON logs with `transaction_id`, `outcome`, `duration_ms` per request. |
-| Prometheus `/metrics` | **MEDIUM** | `webhooks_received_total`, `webhooks_posted_total`, `dlq_depth`, `outbox_pending`. |
-| Currency normalization | **LOW** | `.lower()` on ingest. One line. Mixed-case breaks `GROUP BY currency` in finance reports. |
+| Gap | Priority | Status | Fix |
+|---|---|---|---|
+| Outbox worker | **HIGH** | Done | Standalone Docker service — `SELECT FOR UPDATE SKIP LOCKED`, exponential backoff, SIGTERM-safe. |
+| DLQ retry budget | **HIGH** | Open | Add `retry_count`, `next_retry_at`, `max_retries` columns. Without this, DLQ is a graveyard, not a quarantine. |
+| Schema migrations | **HIGH** | Open | `_bootstrap()` runs `CREATE TABLE` on startup. Safe for a POC; destructive in production. Needs Alembic. |
+| Per-event-type amount extraction | **MEDIUM** | Open | Unknown amount → DLQ instead of silently recording $0. |
+| Structured JSON logging | **MEDIUM** | Open | JSON logs with `transaction_id`, `outcome`, `duration_ms` per request. |
+| Prometheus `/metrics` | **MEDIUM** | Open | `webhooks_received_total`, `webhooks_posted_total`, `dlq_depth`, `outbox_pending`. |
+| Currency normalization | **LOW** | Open | `.lower()` on ingest. One line. Mixed-case breaks `GROUP BY currency` in finance reports. |
 
 ---
 
