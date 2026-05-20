@@ -1,32 +1,24 @@
 # requirements-dev.txt — Development toolchain for posthog-billing-poc
 # ======================================================================
-# EN: Install with: pip install -r requirements-dev.txt
+# Install with: pip install -r requirements-dev.txt
 #     These tools are NOT needed to run the app or the test suite.
 #     They are for code quality checks during development.
 #
-# ES: Instalar con: pip install -r requirements-dev.txt
-#     Estas herramientas NO son necesarias para ejecutar la app o los tests.
-#     Son para verificaciones de calidad de código durante el desarrollo.
 #
 # Usage / Uso:
-#   ruff check ledger.py            # EN: lint / ES: lint
-#   ruff format ledger.py           # EN: format / ES: formatear
-#   mypy ledger.py                  # EN: type check / ES: verificar tipos
-#   bandit -r ledger.py             # EN: security scan / ES: escaneo de seguridad
+#   ruff check ledger.py            # lint
+#   ruff format ledger.py           # format
+#   mypy ledger.py                  # type check
+#   bandit -r ledger.py             # security scan
 
-# EN: ruff — extremely fast Python linter and formatter (replaces flake8 + isort + pyupgrade).
+# ruff — extremely fast Python linter and formatter (replaces flake8 + isort + pyupgrade).
 #     Detects unused imports, undefined names, style violations, and many more.
-# ES: ruff — linter y formateador Python extremadamente rápido (reemplaza flake8 + isort + pyupgrade).
 ruff==0.4.4
 
-# EN: mypy — static type checker. Enforces that type annotations (like Optional[int])
+# mypy — static type checker. Enforces that type annotations (like Optional[int])
 #     are actually respected in the code. Catches type mismatches before runtime.
-# ES: mypy — verificador de tipos estático. Aplica que las anotaciones de tipo
-#     sean respetadas en el código. Detecta discrepancias de tipo antes de ejecución.
 mypy==1.10.0
 
-# EN: bandit — security-focused linter. Scans for hardcoded passwords, unsafe calls,
+# bandit — security-focused linter. Scans for hardcoded passwords, unsafe calls,
 #     SQL injection patterns, and other OWASP Top 10 vulnerabilities in Python code.
-# ES: bandit — linter enfocado en seguridad. Escanea contraseñas hardcodeadas,
-#     llamadas inseguras, patrones de inyección SQL y otras vulnerabilidades OWASP Top 10.
 bandit==1.7.8

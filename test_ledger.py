@@ -23,37 +23,29 @@ ES: Tests en 5 fases. Ejecutar con: python test_ledger.py
 # ---------------------------------------------------------------------------
 # Standard library imports / Importaciones de la librería estándar
 # ---------------------------------------------------------------------------
-import io          # EN: Used to wrap stdout for UTF-8 output on Windows / ES: Usado para envolver stdout para salida UTF-8 en Windows
-import json        # EN: Used to verify raw_payload round-trips correctly / ES: Usado para verificar que raw_payload va y vuelve correctamente
-import sys         # EN: stdout override for Windows UTF-8 encoding / ES: Override de stdout para codificación UTF-8 en Windows
-import time        # EN: Used in benchmark timing / ES: Usado en temporización del benchmark
-import threading   # EN: Used for the concurrent idempotency test / ES: Usado para el test de idempotencia concurrente
+import io          # Used to wrap stdout for UTF-8 output on Windows
+import json        # Used to verify raw_payload round-trips correctly
+import sys         # stdout override for Windows UTF-8 encoding
+import time        # Used in benchmark timing
+import threading   # Used for the concurrent idempotency test
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-# EN: Force UTF-8 output on Windows. Without this, Unicode characters in print()
+# Force UTF-8 output on Windows. Without this, Unicode characters in print()
 #     cause UnicodeEncodeError because Windows stdout defaults to CP-1252.
 #     This must happen before any print() call — so it's at the top of the file.
-# ES: Forzar salida UTF-8 en Windows. Sin esto, los caracteres Unicode en print()
-#     causan UnicodeEncodeError porque stdout de Windows tiene CP-1252 por defecto.
-#     Debe ocurrir antes de cualquier llamada print() — por eso está en la parte superior del archivo.
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-# EN: Import the ledger module directly — all tests call its functions and use
+# Import the ledger module directly — all tests call its functions and use
 #     its models. This is the module under test.
-# ES: Importar el módulo ledger directamente — todos los tests llaman a sus funciones
-#     y usan sus modelos. Este es el módulo bajo prueba.
 import ledger as L
 import worker as W  # Phase 7: outbox drain worker
 
 # ---------------------------------------------------------------------------
 # Test infrastructure / Infraestructura de tests
-# EN: Minimal test runner — two globals (ok, fail) and one helper function.
+# Minimal test runner — two globals (ok, fail) and one helper function.
 #     chk() is the assertion function: prints PASS or FAIL with the test name.
 #     No pytest, no unittest — intentional. Any recruiter can read and run this.
-# ES: Runner de tests mínimo — dos globales (ok, fail) y una función auxiliar.
-#     chk() es la función de aserción: imprime PASS o FAIL con el nombre del test.
-#     Sin pytest, sin unittest — intencional. Cualquier reclutador puede leer y ejecutar esto.
 # ---------------------------------------------------------------------------
 ok = fail = 0
 
@@ -153,12 +145,9 @@ def fake_event(
 # PHASE 1: PYDANTIC ENTRY BOUNDARY VALIDATION
 # FASE 1: VALIDACIÓN DE LÍMITE DE ENTRADA PYDANTIC
 #
-# EN: Tests that the Pydantic models (StripeEvent, StripeObject) correctly reject
+# Tests that the Pydantic models (StripeEvent, StripeObject) correctly reject
 #     invalid payloads at the entry boundary. Every invalid payload should route
 #     to DLQ with reason=INVALID, never touch the ledger table.
-# ES: Tests que los modelos Pydantic (StripeEvent, StripeObject) rechazan correctamente
-#     payloads inválidos en el límite de entrada. Cada payload inválido debe enrutarse
-#     al DLQ con reason=INVALID, nunca tocar la tabla del libro.
 # =============================================================================
 
 print("\n── Phase 1: Pydantic Validation (Entry Boundary) ────────────────────────")
@@ -166,18 +155,15 @@ print("\n── Phase 1: Pydantic Validation (Entry Boundary) ──────
 conn = fresh_conn()
 ev   = fake_event()
 
-# EN: Happy path — valid event should be posted to ledger, not DLQ.
-# ES: Camino feliz — el evento válido debe publicarse en el libro, no en el DLQ.
+# Happy path — valid event should be posted to ledger, not DLQ.
 r1 = L.process_stripe_event(conn, ev)
 chk("valid event → POSTED",        r1["outcome"] == "POSTED")
 chk("transaction_id returned",     r1["transaction_id"] == "evt_test_001")
 
 
 print("\n── Phase 1: Currency Validation (Regex Pattern) ────────────────────────")
-# EN: Tests the `pattern=r"^[a-z]{3}$"` constraint on StripeObject.currency.
+# Tests the `pattern=r"^[a-z]{3}$"` constraint on StripeObject.currency.
 #     Only exactly 3 lowercase ASCII letters are accepted. ISO 4217 enforced at entry.
-# ES: Tests la restricción `pattern=r"^[a-z]{3}$"` en StripeObject.currency.
-#     Solo exactamente 3 letras ASCII minúsculas son aceptadas. ISO 4217 aplicado en entrada.
 
 conn = fresh_conn()
 
@@ -362,12 +348,9 @@ for i, (etype, expected_status) in enumerate(expected.items()):
 
 
 print("\n── Headless benchmark ───────────────────────────────────────────────")
-# EN: Throughput measurement — 5,000 unique events, no HTTP overhead.
+# Throughput measurement — 5,000 unique events, no HTTP overhead.
 #     PostgreSQL floor is 500 TPS — conservative for localhost with explicit
 #     per-event transactions (BEGIN + 2 INSERTs + COMMIT per event).
-# ES: Medición de throughput — 5,000 eventos únicos, sin sobrecarga HTTP.
-#     El piso de PostgreSQL es 500 TPS — conservador para localhost con transacciones
-#     explícitas por evento (BEGIN + 2 INSERTs + COMMIT por evento).
 
 N     = 5_000
 conn4 = fresh_conn()
@@ -391,15 +374,13 @@ chk(f"throughput ≥ 500 TPS  (got {tps:,.0f})", tps >= 500)
 print(f"         {N:,} events in {elapsed:.3f}s  →  {tps:,.0f} TPS  "
       f"(batch via execute_values, PostgreSQL localhost)")
 
-# EN: M5 — data integrity: verify actual row count in DB matches batch input size.
+# M5 — data integrity: verify actual row count in DB matches batch input size.
 #     A broken batch function that returns dummy results without touching the DB
 #     would pass the TPS check above but fail this assertion.
-# ES: M5 — integridad de datos: verificar que el conteo de filas en DB coincide
-#     con el tamaño del lote de entrada.
 bench_row_count = _q1(conn4, "SELECT COUNT(*) FROM ledger")
 chk(f"batch data integrity: exactly {N} rows in ledger",
     bench_row_count == N, f"got {bench_row_count}")
-conn4.close()  # EN: L3 — explicit close to avoid leaking connection / ES: L3 — cierre explícito para evitar fuga de conexión
+conn4.close()  # L3 — explicit close to avoid leaking connection
 
 
 # =============================================================================
@@ -423,8 +404,7 @@ db_row = entry.to_db()
 chk("DLQEntry.to_db() is 4-tuple",              len(db_row) == 4)
 chk("to_db() reason is string not enum",        db_row[1] == "DUPLICATE")
 chk("to_db() payload is JSON string",           db_row[2] == '{"id": "evt_test_001"}')
-# EN: received_at is now a timezone-aware datetime (TIMESTAMPTZ), not a float.
-# ES: received_at es ahora un datetime con zona horaria (TIMESTAMPTZ), no un float.
+# received_at is now a timezone-aware datetime (TIMESTAMPTZ), not a float.
 chk("to_db() received_at is datetime",          isinstance(db_row[3], datetime))
 
 try:
@@ -442,10 +422,8 @@ except (PydanticValidationError, ValueError):
 
 print("\n── Phase 2: LedgerEntry model ───────────────────────────────────────────")
 
-# EN: Pydantic v2 coerces float → datetime for datetime fields.
+# Pydantic v2 coerces float → datetime for datetime fields.
 #     1234567890.0 (Unix timestamp) is accepted and stored as a tz-aware datetime.
-# ES: Pydantic v2 coerce float → datetime para campos datetime.
-#     1234567890.0 (Unix timestamp) se acepta y almacena como datetime con zona horaria.
 le = L.LedgerEntry(
     transaction_id="evt_le_001",
     event_type=L.EventType.INVOICE_PAID,
@@ -455,7 +433,7 @@ le = L.LedgerEntry(
     status=L.LedgerStatus.POSTED,
     idempotency_key="idem_evt_le_001",
     payload='{"id": "evt_le_001"}',
-    created_at=1234567890.0,  # EN: coerced to datetime by Pydantic v2 / ES: coercionado a datetime por Pydantic v2
+    created_at=1234567890.0,  # coerced to datetime by Pydantic v2
 )
 chk("LedgerEntry builds with valid data",       le.transaction_id == "evt_le_001")
 chk("LedgerEntry status is LedgerStatus",       le.status == L.LedgerStatus.POSTED)
@@ -465,8 +443,7 @@ chk("LedgerEntry.to_db() is 9-tuple",           len(db_row) == 9)
 chk("to_db() event_type is string not enum",    db_row[1] == "invoice.paid")
 chk("to_db() status is string not enum",        db_row[5] == "POSTED")
 chk("to_db() amount_cents is int",              db_row[3] == 4900)
-# EN: created_at is now a timezone-aware datetime (TIMESTAMPTZ), not a float.
-# ES: created_at es ahora un datetime con zona horaria (TIMESTAMPTZ), no un float.
+# created_at is now a timezone-aware datetime (TIMESTAMPTZ), not a float.
 chk("to_db() created_at is datetime",           isinstance(db_row[8], datetime))
 
 try:
@@ -629,39 +606,30 @@ print("\n── Phase 5: Integration — HTTP layer (TestClient) ─────
 
 from starlette.testclient import TestClient
 
-# EN: _MockPool wraps a single psycopg2 connection to satisfy the _pool.getconn() /
+# _MockPool wraps a single psycopg2 connection to satisfy the _pool.getconn() /
 #     _pool.putconn() interface expected by the FastAPI route handlers. This lets tests
 #     inject a controlled, truncated connection without standing up a real pool.
 #     This does NOT mock the database — every INSERT and SELECT hits real PostgreSQL.
-# ES: _MockPool envuelve una única conexión psycopg2 para satisfacer la interfaz
-#     _pool.getconn() / _pool.putconn() esperada por los manejadores de rutas FastAPI.
-#     Esto permite que los tests inyecten una conexión controlada y truncada sin levantar
-#     un pool real. Esto NO mockea la base de datos — cada INSERT y SELECT golpea PostgreSQL real.
 class _MockPool:
     def __init__(self, conn):
         self._conn = conn
     def getconn(self):
         return self._conn
     def putconn(self, conn):
-        pass  # EN: test connection stays open until the section ends / ES: la conexión de test permanece abierta hasta que la sección termina
+        pass  # test connection stays open until the section ends
 
 http_conn        = fresh_conn()
 original_pool    = L._pool
 L._pool          = _MockPool(http_conn)
 client           = TestClient(L.app)
 
-# EN: Stripe signature verification is patched to a no-op for happy-path tests.
+# Stripe signature verification is patched to a no-op for happy-path tests.
 #     We are testing the application layer (Pydantic validation, idempotency, DLQ routing),
 #     not Stripe's HMAC library. The signature test below verifies the security boundary
 #     separately without patching.
-# ES: La verificación de firma de Stripe se parchea a un no-op para los tests del camino feliz.
-#     Estamos probando la capa de aplicación (validación Pydantic, idempotencia, enrutamiento al DLQ),
-#     no la librería HMAC de Stripe. El test de firma a continuación verifica el límite de seguridad
-#     por separado sin parchear.
 with patch("stripe.Webhook.construct_event"):
 
-    # EN: Health check — verifies the server is responsive.
-    # ES: Health check — verifica que el servidor responde.
+    # Health check — verifies the server is responsive.
     r = client.get("/health")
     chk("GET /health → 200",                        r.status_code == 200)
     chk("health response is ok",                    r.json().get("status") == "ok")
@@ -672,8 +640,7 @@ with patch("stripe.Webhook.construct_event"):
     chk("valid event → POSTED via HTTP",            r.json()["outcome"] == "POSTED",
         f"got {r.json()}")
 
-    # EN: Duplicate via HTTP — must return 200, not 4xx. Stripe needs 200 to stop retrying.
-    # ES: Duplicado vía HTTP — debe retornar 200, no 4xx. Stripe necesita 200 para dejar de reintentar.
+    # Duplicate via HTTP — must return 200, not 4xx. Stripe needs 200 to stop retrying.
     r = client.post("/webhook/stripe", json=ev_http)
     chk("POST duplicate → HTTP 200 (not 4xx)",      r.status_code == 200)
     chk("duplicate → DLQ_DUPLICATE via HTTP",       r.json()["outcome"] == "DLQ_DUPLICATE",
@@ -697,9 +664,8 @@ with patch("stripe.Webhook.construct_event"):
     chk("bad prefix → DLQ_INVALID via HTTP",        r.json()["outcome"] == "DLQ_INVALID",
         f"got {r.json()}")
 
-    # EN: Summary endpoint — verify shape and counts.
+    # Summary endpoint — verify shape and counts.
     #     After the tests above: 1 POSTED, 1 DUPLICATE, 3 INVALID = 4 DLQ entries total.
-    # ES: Endpoint de resumen — verificar forma y conteos.
     r = client.get("/ledger/summary")
     chk("GET /ledger/summary → 200",                r.status_code == 200)
     summary = r.json()
@@ -711,23 +677,18 @@ with patch("stripe.Webhook.construct_event"):
     chk("summary outbox_pending is 1",              summary["outbox_pending"] == 1,
         f"got {summary['outbox_pending']}")
 
-    # EN: limit=-1 must return HTTP 422, not a PostgreSQL error.
-    # ES: limit=-1 debe retornar HTTP 422, no un error de PostgreSQL.
+    # limit=-1 must return HTTP 422, not a PostgreSQL error.
     r = client.get("/dlq/entries?limit=-1")
     chk("GET /dlq/entries?limit=-1 → HTTP 422",     r.status_code == 422)
 
-# EN: Restore the real pool after HTTP tests complete.
-# ES: Restaurar el pool real después de que los tests HTTP terminen.
+# Restore the real pool after HTTP tests complete.
 L._pool = original_pool
 
 
 print("\n── Phase 5: Stripe signature verification ───────────────────────────────")
-# EN: This test verifies the security boundary WITHOUT mocking stripe.Webhook.
+# This test verifies the security boundary WITHOUT mocking stripe.Webhook.
 #     We temporarily set a real-format secret, send a POST with a clearly invalid
 #     signature, and assert the endpoint returns 400.
-# ES: Este test verifica el límite de seguridad SIN mockear stripe.Webhook.
-#     Establecemos temporalmente un secreto con formato real, enviamos un POST
-#     con una firma claramente inválida, y asertamos que el endpoint retorna 400.
 
 sig_client       = TestClient(L.app)
 original_secret  = L.STRIPE_WEBHOOK_SECRET
@@ -752,16 +713,11 @@ finally:
 
 
 print("\n── Phase 5: Concurrent insertion (threading) ────────────────────────────")
-# EN: The most important test in the suite. 5 threads fire the same event simultaneously.
+# The most important test in the suite. 5 threads fire the same event simultaneously.
 #     threading.Barrier(5) ensures all threads have reached _fire() before any INSERT runs —
 #     a mathematically sound race condition test, not a sequential approximation.
 #     ON CONFLICT (transaction_id) DO NOTHING serializes at the DB level:
 #     exactly 1 INSERT wins; the other 4 get rowcount=0 → DLQ_DUPLICATE.
-# ES: El test más importante de la suite. 5 hilos disparan el mismo evento simultáneamente.
-#     threading.Barrier(5) asegura que todos los hilos han llegado a _fire() antes de que
-#     corra cualquier INSERT — un test de condición de carrera matemáticamente sólido,
-#     no una aproximación secuencial. ON CONFLICT (transaction_id) DO NOTHING serializa
-#     a nivel DB: exactamente 1 INSERT gana; los otros 4 obtienen rowcount=0 → DLQ_DUPLICATE.
 
 _setup_conn = fresh_conn()
 _setup_conn.close()
@@ -770,12 +726,12 @@ ev_concurrent      = fake_event(eid="evt_concurrent_001",
                                 customer="cus_concurrent", amount=5000)
 results_concurrent = []
 errors_concurrent  = []
-_barrier           = threading.Barrier(5)  # EN: all 5 threads release simultaneously / ES: los 5 hilos liberan simultáneamente
+_barrier           = threading.Barrier(5)  # all 5 threads release simultaneously
 
 def _fire():
     try:
         conn = L._bootstrap()
-        _barrier.wait()  # EN: block until all 5 threads are ready / ES: bloquear hasta que los 5 hilos estén listos
+        _barrier.wait()  # block until all 5 threads are ready
         r    = L.process_stripe_event(conn, ev_concurrent)
         results_concurrent.append(r["outcome"])
         conn.close()
@@ -806,14 +762,10 @@ chk("ledger has exactly 1 row after 5 concurrent inserts",
 
 
 print("\n── Phase 5: Batch — duplicate transaction_id in same batch ──────────────")
-# EN: Verifies that when the same transaction_id appears twice in a single batch,
+# Verifies that when the same transaction_id appears twice in a single batch,
 #     the RETURNING set correctly partitions them: the first occurrence lands in
 #     the ledger (POSTED), the second is routed to DLQ_DUPLICATE. The ledger
 #     must have exactly 1 row for that transaction_id — BIGINT handles large amounts.
-# ES: Verifica que cuando el mismo transaction_id aparece dos veces en un solo lote,
-#     el conjunto RETURNING los particiona correctamente: la primera ocurrencia aterriza
-#     en el libro (POSTED), la segunda se enruta a DLQ_DUPLICATE. El libro debe tener
-#     exactamente 1 fila para ese transaction_id — BIGINT maneja montos grandes.
 
 batch_conn = fresh_conn()
 dup_ev     = fake_event(eid="evt_batch_dup", customer="cus_batchdup", amount=1000)
@@ -830,13 +782,9 @@ batch_conn.close()
 
 
 print("\n── Phase 5: BIGINT — amount > PostgreSQL INTEGER max ────────────────────")
-# EN: PostgreSQL INTEGER max = 2,147,483,647 (~$21M). This test posts an event with
+# PostgreSQL INTEGER max = 2,147,483,647 (~$21M). This test posts an event with
 #     amount = 2,200,000,000 (~$22M) and asserts POSTED — verifying the BIGINT column
 #     type change is in effect. This would fail with OverflowError if still INTEGER.
-# ES: Máximo de INTEGER en PostgreSQL = 2,147,483,647 (~$21M). Este test publica un
-#     evento con amount = 2,200,000,000 (~$22M) y aserta POSTED — verificando que el
-#     cambio de tipo de columna a BIGINT está en efecto. Fallaría con OverflowError si
-#     todavía fuera INTEGER.
 
 large_conn = fresh_conn()
 ev_large   = fake_event(eid="evt_large_amt", customer="cus_large", amount=2_200_000_000)
@@ -908,11 +856,9 @@ dlq_conn.close()
 # =============================================================================
 
 print("\n── Phase 4: Batch result indexed by input position (M3) ─────────────────")
-# EN: Verifies that results[i] corresponds to events[i] for every position.
+# Verifies that results[i] corresponds to events[i] for every position.
 #     A scrambled-return bug (e.g., results returned in RETURNING order instead of
 #     input order) would pass all previous batch tests but fail these assertions.
-# ES: Verifica que results[i] corresponde a events[i] para cada posición.
-#     Un bug de retorno desordenado pasaría los tests anteriores pero fallaría aquí.
 
 pos_conn = fresh_conn()
 ev_pos_a = fake_event(eid="evt_pos_a", customer="cus_posa", amount=1000)
@@ -930,12 +876,9 @@ pos_conn.close()
 
 
 print("\n── Phase 4: DB failure raises RuntimeError → HTTP 503 (M4) ─────────────")
-# EN: Verifies that when process_stripe_event raises RuntimeError (DB-level failure),
+# Verifies that when process_stripe_event raises RuntimeError (DB-level failure),
 #     the FastAPI handler converts it to HTTP 503. The handler is coded correctly
 #     but was never exercised by any previous test.
-# ES: Verifica que cuando process_stripe_event lanza RuntimeError (fallo a nivel DB),
-#     el manejador FastAPI lo convierte a HTTP 503. El manejador estaba codificado
-#     correctamente pero nunca se ejerció en ningún test anterior.
 
 db_err_conn  = fresh_conn()
 original_pool_3 = L._pool
@@ -955,10 +898,9 @@ finally:
 
 
 print("\n── Phase 4: Empty batch returns empty list (L4) ─────────────────────────")
-# EN: Verifies the early-exit guard: process_stripe_event_batch(conn, []) → [].
+# Verifies the early-exit guard: process_stripe_event_batch(conn, []) → [].
 #     Simple guard but was untested — a regression that removed it would silently
 #     crash on the first None access in the results list.
-# ES: Verifica la guardia de salida temprana: process_stripe_event_batch(conn, []) → [].
 
 empty_conn = fresh_conn()
 empty_result = L.process_stripe_event_batch(empty_conn, [])
@@ -969,10 +911,8 @@ empty_conn.close()
 
 # =============================================================================
 # Phase 7: Outbox worker — drain_batch tests
-# EN: Tests the drain_batch() function from worker.py directly (no HTTP server).
+# Tests the drain_batch() function from worker.py directly (no HTTP server).
 #     Three tests: empty queue, normal dispatch, and idempotency.
-# ES: Tests de la función drain_batch() de worker.py directamente (sin servidor HTTP).
-#     Tres tests: cola vacía, despacho normal, e idempotencia.
 # =============================================================================
 print("\n── Phase 7: drain_batch — empty queue ───────────────────────────────────")
 worker_conn1 = fresh_conn()
@@ -988,8 +928,7 @@ worker_conn1.close()
 
 print("\n── Phase 7: drain_batch — dispatches rows and marks dispatched=1 ────────")
 worker_conn2 = fresh_conn()
-# EN: Manually insert ledger rows first (FK constraint requires them), then outbox rows.
-# ES: Insertar filas de ledger primero (FK lo requiere), luego filas de outbox.
+# Manually insert ledger rows first (FK constraint requires them), then outbox rows.
 with worker_conn2.cursor() as _wc2:
     _wc2.execute("BEGIN")
     for i in range(1, 4):

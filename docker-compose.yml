@@ -1,6 +1,6 @@
 # docker-compose.yml — Micro-Billing-Ledger PoC
 # ===============================================
-# EN: All secrets and configuration are read from the .env file.
+# All secrets and configuration are read from the .env file.
 #     Copy .env.example to .env and fill in your values before running.
 #
 #     For running tests locally, start only the postgres service:
@@ -9,8 +9,6 @@
 #     For the full stack:
 #       docker-compose up
 #
-# ES: Todos los secretos y configuración se leen del archivo .env.
-#     Copia .env.example a .env y llena tus valores antes de ejecutar.
 #
 #     Para ejecutar tests localmente, iniciar solo el servicio postgres:
 #       docker-compose up -d postgres
@@ -30,9 +28,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB:       ${POSTGRES_DB}
     ports:
-      # EN: Bound to 127.0.0.1 — only this machine can connect directly.
+      # Bound to 127.0.0.1 — only this machine can connect directly.
       #     All external DB access must go through the billing/worker services.
-      # ES: Vinculado a 127.0.0.1 — solo esta máquina puede conectarse directamente.
       - "127.0.0.1:5432:5432"
     restart: unless-stopped
     volumes:
@@ -53,14 +50,10 @@ services:
       STRIPE_WEBHOOK_SECRET:   ${STRIPE_WEBHOOK_SECRET}
       BILLING_API_KEY:         ${BILLING_API_KEY}
     ports:
-      # EN: Exposed on localhost only for local development and tests.
+      # Exposed on localhost only for local development and tests.
       #     In production, traffic reaches billing through Caddy (port 443).
       #     To harden production: remove this port mapping so billing is
       #     only reachable internally via the Docker network.
-      # ES: Expuesto solo en localhost para desarrollo local y tests.
-      #     En producción, el tráfico llega a billing a través de Caddy (puerto 443).
-      #     Para endurecer producción: elimina este mapeo para que billing solo
-      #     sea accesible internamente a través de la red Docker.
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
     depends_on:
@@ -97,16 +90,11 @@ services:
 
   # ---------------------------------------------------------------------------
   # caddy — reverse proxy + automatic HTTPS (Phase 8)
-  # EN: Handles TLS termination via Let's Encrypt. Set CADDY_DOMAIN in .env
+  # Handles TLS termination via Let's Encrypt. Set CADDY_DOMAIN in .env
   #     to your real domain and Caddy provisions the certificate automatically.
   #     For local dev with CADDY_DOMAIN=localhost, access via https://localhost
   #     (browser will warn about self-signed cert — expected for localhost).
   #     Or skip Caddy locally and use http://localhost:8000 directly.
-  # ES: Maneja terminación TLS via Let's Encrypt. Configura CADDY_DOMAIN en .env
-  #     con tu dominio real y Caddy provisiona el certificado automáticamente.
-  #     Para dev local con CADDY_DOMAIN=localhost, accede via https://localhost
-  #     (el navegador advertirá del cert autofirmado — esperado en localhost).
-  #     O salta Caddy localmente y usa http://localhost:8000 directamente.
   # ---------------------------------------------------------------------------
   caddy:
     image: caddy:2-alpine
@@ -123,9 +111,7 @@ services:
 
 volumes:
   pgdata:
-  # EN: caddy_data persists TLS certificates — prevents hitting Let's Encrypt
+  # caddy_data persists TLS certificates — prevents hitting Let's Encrypt
   #     rate limits on container restarts.
-  # ES: caddy_data persiste los certificados TLS — evita alcanzar los límites
-  #     de tasa de Let's Encrypt en reinicios del contenedor.
   caddy_data:
   caddy_config:
