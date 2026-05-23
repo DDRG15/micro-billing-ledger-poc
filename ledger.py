@@ -1253,36 +1253,16 @@ _pool: ThreadedConnectionPool = ThreadedConnectionPool(minconn=1, maxconn=20, ds
 
 
 def _require_api_key(x_api_key: str = Header(default="")) -> None:
-    """
-    EN: FastAPI dependency for ops endpoints. If BILLING_API_KEY is configured in the
-        environment (non-empty), the X-Api-Key request header must match exactly.
-        If BILLING_API_KEY is not set at all (empty string from os.environ.get default),
-        the check is skipped — dev-mode convenience without requiring env setup for
-        every developer.
-        IMPORTANT: An operator who sets BILLING_API_KEY="" (explicitly empty) is treated
-        the same as "not configured" — this is intentional dev-mode behaviour. In
-        production, always set BILLING_API_KEY to a non-empty secret value.
-        ISO 27001 A.9.4.1: access to sensitive operational data (DLQ, ledger summary)
-        must be access-controlled in production.
-    ES: Dependencia FastAPI para endpoints de operaciones. Si BILLING_API_KEY está
-        configurado en el entorno (no vacío), el header X-Api-Key debe coincidir exactamente.
-        Un operador que establece BILLING_API_KEY="" se trata como "no configurado" — es
-        comportamiento intencional de modo dev. En producción, siempre establecer
-        BILLING_API_KEY a un valor secreto no vacío.
-        ISO 27001 A.9.4.1: el acceso a datos operacionales sensibles debe estar controlado.
+    """FastAPI dependency for ops endpoints. Enforces X-Api-Key when BILLING_API_KEY is set.
+    If BILLING_API_KEY is empty (default), the check is skipped — dev-mode convenience.
+    ISO 27001 A.9.4.1: access to operational data must be access-controlled in production.
     """
     if not BILLING_API_KEY:
         return  # dev mode — no key configured, skip check
     if not x_api_key:
-        raise HTTPException(
-            status_code=401,
-            detail="X-Api-Key header required / Header X-Api-Key requerido"
-        )
+        raise HTTPException(status_code=401, detail="X-Api-Key header required")
     if x_api_key != BILLING_API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key / Clave de API inválida"
-        )
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 class StripeWebhookPayload(BaseModel):
