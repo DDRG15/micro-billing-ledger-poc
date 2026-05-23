@@ -66,3 +66,9 @@ IMPLEMENTATION_REPORT.md
 LOGIC_AUDIT.md
 PREFLIGHT_AUDIT.md
 TOMORROW.md
+AUDIT_FIXES_LOG.md
+
+# Private AI instruction files — never to GitHub.
+audit_only_prompt.md
+universal_engineering_prompt_v3.md
+voice_tone_guide_v2.pdf

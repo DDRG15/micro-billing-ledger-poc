@@ -1148,6 +1148,51 @@ conn_r.close()
 
 
 # =============================================================================
+# PHASE 11b: HIGH-1 FIX — POST /dlq/{id}/retry resolves on success
+# Verifies that the manual retry endpoint correctly recognises "POSTED" as a
+# success outcome and marks the DLQ entry 'resolved', not 'exhausted'.
+# (The old code checked for "SUCCESS" which process_stripe_event never returns.)
+# =============================================================================
+print("\n── Phase 11b: manual retry endpoint resolves on POSTED (HIGH-1 fix) ────")
+
+manual_conn = fresh_conn()
+original_pool_manual = L._pool
+L._pool = _MockPool(manual_conn)
+manual_client = TestClient(L.app)
+
+valid_manual_payload = {
+    "id": "evt_manual_retry_001",
+    "type": "invoice.paid",
+    "data": {"object": {"customer": "cus_manual001", "amount_paid": 5000, "currency": "usd"}},
+    "request": {"idempotency_key": "idem_manual_001"},
+}
+t_manual = L.DLQEntry(
+    transaction_id="evt_manual_retry_001",
+    reason=L.DLQReason.TRANSIENT,
+    raw_payload=valid_manual_payload,
+)
+L._write_dlq(manual_conn, t_manual)
+
+with manual_conn.cursor() as c:
+    c.execute("SELECT id FROM dlq WHERE transaction_id='evt_manual_retry_001' ORDER BY id DESC LIMIT 1")
+    manual_dlq_id = c.fetchone()[0]
+
+with patch("stripe.Webhook.construct_event"):
+    r = manual_client.post(f"/dlq/{manual_dlq_id}/retry")
+
+chk("POST /dlq/{id}/retry → 200", r.status_code == 200, f"got {r.status_code}: {r.text}")
+chk("manual retry outcome is POSTED", r.json().get("outcome") == "POSTED", f"got {r.json()}")
+
+with manual_conn.cursor() as c:
+    c.execute("SELECT status FROM dlq WHERE id=%s", (manual_dlq_id,))
+    st = c.fetchone()[0]
+chk("manual retry DLQ status is resolved", st == "resolved", f"got {st!r}")
+
+L._pool = original_pool_manual
+manual_conn.close()
+
+
+# =============================================================================
 # FINAL SUMMARY
 # =============================================================================
 print(f"\n{'='*60}")

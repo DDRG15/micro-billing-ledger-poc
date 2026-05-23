@@ -631,6 +631,15 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
             ON outbox(dispatched, id)
             WHERE dispatched = 0
         """)
+        # idx_dlq_retry — covers the WHERE clause in retry_dlq_batch:
+        #     status='pending' AND next_retry_at <= NOW() AND retry_count < max_retries.
+        # Alembic migration 0002 creates this in production; _bootstrap() must mirror it
+        # so CI (which calls _bootstrap() directly, not alembic) gets the same index.
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dlq_retry
+            ON dlq(status, next_retry_at)
+            WHERE status = 'pending'
+        """)
 
     return conn
 
@@ -896,17 +905,27 @@ def retry_dlq_batch(
     On success: status → 'resolved'.
     On failure: retry_count += 1, next_retry_at = NOW() + backoff, and if
                 retry_count >= max_retries: status → 'exhausted'.
+
+    Concurrency: rows are atomically claimed (status='retrying') via UPDATE ... WHERE id IN
+    (SELECT ... FOR UPDATE SKIP LOCKED). Two workers running simultaneously claim disjoint
+    sets — no event is retried twice. The claim transaction commits before process_stripe_event
+    is called because process_stripe_event calls _tx(conn) internally — nested BEGIN on an
+    autocommit connection would error. status='retrying' is the lock substitute.
     """
-    with conn.cursor() as cur:
+    with _tx(conn) as cur:
         cur.execute(
             """
-            SELECT id, transaction_id, raw_payload
-            FROM dlq
-            WHERE status = 'pending'
-              AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-              AND retry_count < max_retries
-            ORDER BY id
-            LIMIT %s
+            UPDATE dlq SET status = 'retrying'
+            WHERE id IN (
+                SELECT id FROM dlq
+                WHERE status = 'pending'
+                  AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                  AND retry_count < max_retries
+                ORDER BY id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id, transaction_id, raw_payload
             """,
             (batch_size,),
         )
@@ -920,7 +939,6 @@ def retry_dlq_batch(
             payload = json.loads(raw_payload_str)
             result = process_stripe_event(conn, payload)
             outcome = result.get("outcome", "")
-            # Both SUCCESS and DLQ_DUPLICATE count as resolved — the event is in the ledger.
             if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
                 with _tx(conn) as cur:
                     cur.execute(
@@ -942,37 +960,50 @@ def _increment_retry(
     dlq_id: int,
     transaction_id: str,
 ) -> None:
-    """Increment retry_count, set next backoff delay, mark exhausted if ceiling reached."""
-    with conn.cursor() as cur:
+    """Atomically increment retry_count and set status/next_retry_at in one UPDATE.
+
+    Single statement eliminates the TOCTOU race: the old SELECT + UPDATE pattern
+    let two concurrent callers both read retry_count=N and both write N+1 instead of N+2.
+    """
+    with _tx(conn) as cur:
         cur.execute(
-            "SELECT retry_count, max_retries FROM dlq WHERE id=%s",
+            """
+            UPDATE dlq
+            SET retry_count   = retry_count + 1,
+                status        = CASE
+                    WHEN retry_count + 1 >= max_retries THEN 'exhausted'
+                    ELSE 'pending'
+                END,
+                next_retry_at = CASE
+                    WHEN retry_count + 1 >= max_retries THEN NULL
+                    ELSE NOW() + (
+                        CASE retry_count
+                            WHEN 0 THEN INTERVAL '300 seconds'
+                            WHEN 1 THEN INTERVAL '900 seconds'
+                            ELSE INTERVAL '3600 seconds'
+                        END
+                    )
+                END
+            WHERE id = %s
+            RETURNING retry_count, max_retries, status
+            """,
             (dlq_id,),
         )
         row = cur.fetchone()
-        if row is None:
-            return
-        retry_count, max_retries = row[0], row[1]
-        new_count = retry_count + 1
-        delay = _RETRY_BACKOFF[min(retry_count, len(_RETRY_BACKOFF) - 1)]
-        if new_count >= max_retries:
-            cur.execute(
-                "UPDATE dlq SET retry_count=%s, status='exhausted', next_retry_at=NULL WHERE id=%s",
-                (new_count, dlq_id),
-            )
-            _log.warning(
-                "dlq_retry exhausted id=%s transaction_id=%s retries=%s/%s",
-                dlq_id, transaction_id, new_count, max_retries,
-            )
-        else:
-            cur.execute(
-                "UPDATE dlq SET retry_count=%s, status='pending',"
-                " next_retry_at=NOW() + interval '%s seconds' WHERE id=%s",
-                (new_count, delay, dlq_id),
-            )
-            _log.info(
-                "dlq_retry scheduled id=%s transaction_id=%s attempt=%s next_in=%ss",
-                dlq_id, transaction_id, new_count, delay,
-            )
+    if row is None:
+        return
+    new_count, max_retries, new_status = row[0], row[1], row[2]
+    if new_status == "exhausted":
+        _log.warning(
+            "dlq_retry exhausted id=%s transaction_id=%s retries=%s/%s",
+            dlq_id, transaction_id, new_count, max_retries,
+        )
+    else:
+        delay = _RETRY_BACKOFF[min(new_count - 1, len(_RETRY_BACKOFF) - 1)]
+        _log.info(
+            "dlq_retry scheduled id=%s transaction_id=%s attempt=%s next_in=%ss",
+            dlq_id, transaction_id, new_count, delay,
+        )
 
 
 def process_stripe_event_batch(
@@ -1297,7 +1328,10 @@ def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONRespo
     #     Stripe-Signature header against the raw request body. Any body tampering
     #     or wrong/missing signature raises SignatureVerificationError → 400.
     #     ISO 27001 A.14.1.2: authentication at all ingestion entry points.
-    raw_body   = request.body()   # sync call — handler is def, Starlette provides sync .body()
+    # Request.body() is async def in Starlette — calling it without await returns a coroutine
+    # object, not bytes. FastAPI already read and cached the body in request._body when it
+    # parsed StripeWebhookPayload above. Access the cached attribute directly.
+    raw_body   = request._body
     sig_header = request.headers.get("stripe-signature", "")
     try:
         stripe.Webhook.construct_event(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
@@ -1433,7 +1467,7 @@ def dlq_retry(request: Request, dlq_id: int, _: None = Depends(_require_api_key)
         result = process_stripe_event(conn, payload)
         outcome = result.get("outcome", "")
 
-        if outcome in ("SUCCESS", "DLQ_DUPLICATE"):
+        if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
             with _tx(conn) as cur:
                 cur.execute(
                     "UPDATE dlq SET status='resolved' WHERE id=%s",

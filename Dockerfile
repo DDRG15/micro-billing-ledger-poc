@@ -46,9 +46,13 @@ WORKDIR /app
 #     This is the multi-stage magic: we get uvloop (C-extension) without the C compiler.
 COPY --from=builder /install /usr/local
 
-# Copy only the application source — not requirements.txt, not .git, not tests.
-#     In production, ledger.py is the only file that needs to be in the container.
-COPY ledger.py .
+# Copy all application source files needed by any service using this image.
+#     billing:  ledger.py (uvicorn ledger:app)
+#     worker:   worker.py (python worker.py)
+#     migrate:  alembic.ini + alembic/ (alembic upgrade head)
+#     All three services build from this single image — every file must be present.
+COPY ledger.py worker.py alembic.ini ./
+COPY alembic/ alembic/
 
 # Grant ownership of /app to the billing user BEFORE switching to it.
 #     WORKDIR /app was created by root, so without this chown the billing user cannot
