@@ -993,7 +993,71 @@ worker_conn3.close()
 
 
 # =============================================================================
-# FINAL SUMMARY / RESUMEN FINAL
+# PHASE 10: ALEMBIC MIGRATION TESTS
+# =============================================================================
+print("\n── Phase 10: Alembic migrations ─────────────────────────────────────────")
+
+import subprocess
+
+conn_mig = fresh_conn()
+
+# Test 1 — alembic upgrade head runs without error and reaches revision 0001.
+result = subprocess.run(
+    ["alembic", "upgrade", "head"],
+    capture_output=True, text=True,
+    env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
+)
+chk("alembic upgrade head exits 0", result.returncode == 0, result.stderr.strip())
+
+result2 = subprocess.run(
+    ["alembic", "current"],
+    capture_output=True, text=True,
+    env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
+)
+chk("alembic current reports 0001 (head)", "0001" in result2.stdout, result2.stdout.strip())
+
+# Test 2 — all three tables exist after migration.
+with conn_mig.cursor() as cur:
+    cur.execute("""
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public'
+        AND table_name IN ('ledger', 'outbox', 'dlq')
+        ORDER BY table_name
+    """)
+    tables = {r[0] for r in cur.fetchall()}
+chk("ledger table exists after migration",  "ledger"  in tables, str(tables))
+chk("outbox table exists after migration",  "outbox"  in tables, str(tables))
+chk("dlq table exists after migration",     "dlq"     in tables, str(tables))
+
+# Test 3 — outbox has dispatched_at column (added in Phase 7, present in migration 0001).
+with conn_mig.cursor() as cur:
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'outbox' AND column_name = 'dispatched_at'
+    """)
+    col = cur.fetchone()
+chk("outbox.dispatched_at column exists", col is not None, "column missing")
+
+# Test 4 — downgrade to base then upgrade back to head (round-trip).
+result_down = subprocess.run(
+    ["alembic", "downgrade", "base"],
+    capture_output=True, text=True,
+    env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
+)
+chk("alembic downgrade base exits 0", result_down.returncode == 0, result_down.stderr.strip())
+
+result_up = subprocess.run(
+    ["alembic", "upgrade", "head"],
+    capture_output=True, text=True,
+    env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
+)
+chk("alembic upgrade head after downgrade exits 0", result_up.returncode == 0, result_up.stderr.strip())
+
+conn_mig.close()
+
+
+# =============================================================================
+# FINAL SUMMARY
 # =============================================================================
 print(f"\n{'='*60}")
 print(f"  {ok} passed | {fail} failed")
