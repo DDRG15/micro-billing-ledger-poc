@@ -49,6 +49,8 @@ import psycopg2
 import psycopg2.extensions
 import psycopg2.extras
 
+import ledger as _ledger  # retry_dlq_batch lives here
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -258,8 +260,9 @@ def run_loop(conn: psycopg2.extensions.connection) -> None:
     while not _stop:
         try:
             count = drain_batch(conn)
+            retried = _ledger.retry_dlq_batch(conn)
             backoff = 5.0  # reset on success
-            if count == 0:
+            if count == 0 and retried == 0:
                 log.debug("queue_empty — sleeping %.0fs", WORKER_POLL_INTERVAL)
                 # Sleep in small increments so SIGTERM is handled quickly.
                 deadline = time.monotonic() + WORKER_POLL_INTERVAL

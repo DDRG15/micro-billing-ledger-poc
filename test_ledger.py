@@ -401,7 +401,7 @@ chk("DLQEntry builds with valid data",          entry.transaction_id == "evt_tes
 chk("DLQEntry reason is enum value",            entry.reason == L.DLQReason.DUPLICATE)
 
 db_row = entry.to_db()
-chk("DLQEntry.to_db() is 4-tuple",              len(db_row) == 4)
+chk("DLQEntry.to_db() is 8-tuple",              len(db_row) == 8)
 chk("to_db() reason is string not enum",        db_row[1] == "DUPLICATE")
 chk("to_db() payload is JSON string",           db_row[2] == '{"id": "evt_test_001"}')
 # received_at is now a timezone-aware datetime (TIMESTAMPTZ), not a float.
@@ -1014,7 +1014,7 @@ result2 = subprocess.run(
     capture_output=True, text=True,
     env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
 )
-chk("alembic current reports 0001 (head)", "0001" in result2.stdout, result2.stdout.strip())
+chk("alembic current reports 0002 (head)", "0002" in result2.stdout, result2.stdout.strip())
 
 # Test 2 — all three tables exist after migration.
 with conn_mig.cursor() as cur:
@@ -1054,6 +1054,97 @@ result_up = subprocess.run(
 chk("alembic upgrade head after downgrade exits 0", result_up.returncode == 0, result_up.stderr.strip())
 
 conn_mig.close()
+
+
+# =============================================================================
+# PHASE 11: DLQ RETRY TESTS
+# =============================================================================
+print("\n── Phase 11: DLQ retry ──────────────────────────────────────────────────")
+
+from worker import drain_batch as _drain_batch
+
+conn_r = fresh_conn()
+
+# Test 1 — TRANSIENT entry gets max_retries=3 and next_retry_at set automatically.
+transient_entry = L.DLQEntry(
+    transaction_id="test_transient_001",
+    reason=L.DLQReason.TRANSIENT,
+    raw_payload={"id": "test_transient_001", "type": "invoice.paid"},
+)
+chk("TRANSIENT DLQEntry gets max_retries=3", transient_entry.max_retries == 3,
+    f"got {transient_entry.max_retries}")
+chk("TRANSIENT DLQEntry next_retry_at starts NULL (retry-immediately semantics)",
+    transient_entry.next_retry_at is None, f"got {transient_entry.next_retry_at}")
+
+# Test 2 — INVALID entry has max_retries=0 (no auto-retry).
+invalid_entry = L.DLQEntry(
+    transaction_id="test_invalid_001",
+    reason=L.DLQReason.INVALID,
+    raw_payload={"bad": "payload"},
+)
+chk("INVALID DLQEntry has max_retries=0", invalid_entry.max_retries == 0,
+    f"got {invalid_entry.max_retries}")
+
+# Test 3 — retry_dlq_batch returns 0 when no retryable entries exist.
+# (fresh_conn already truncated the table — only non-retryable entries would be here)
+count_empty = L.retry_dlq_batch(conn_r)
+chk("retry_dlq_batch returns 0 on empty retryable queue", count_empty == 0,
+    f"got {count_empty}")
+
+# Test 4 — write a TRANSIENT entry, retry_dlq_batch picks it up and resolves it.
+# Use a valid event payload that process_stripe_event will accept.
+valid_payload = {
+    "id": "evt_retry_test_001",
+    "type": "invoice.paid",
+    "data": {"object": {"customer": "cus_retry001", "amount_paid": 5000, "currency": "usd"}},
+    "request": {"idempotency_key": "idem_retry_001"},
+}
+transient_db = L.DLQEntry(
+    transaction_id="evt_retry_test_001",
+    reason=L.DLQReason.TRANSIENT,
+    raw_payload=valid_payload,
+)
+L._write_dlq(conn_r, transient_db)
+
+retried = L.retry_dlq_batch(conn_r)
+chk("retry_dlq_batch attempts 1 TRANSIENT entry", retried == 1, f"got {retried}")
+
+with conn_r.cursor() as cur:
+    cur.execute("SELECT status FROM dlq WHERE transaction_id='evt_retry_test_001'")
+    row = cur.fetchone()
+chk("TRANSIENT entry resolved after successful retry",
+    row is not None and row[0] == "resolved", f"got {row}")
+
+# Test 5 — write a TRANSIENT entry with bad payload and max_retries=1; exhausts after 1 attempt.
+# process_stripe_event also writes an INVALID row for the same transaction_id, so we
+# capture the TRANSIENT entry's id and query by id (not transaction_id) to avoid ambiguity.
+bad_payload = {"id": "evt_exhaust_001", "type": "invoice.paid",
+               "data": {"object": {"customer": "x", "amount_paid": -1, "currency": "usd"}},
+               "request": None}
+exhaust_entry = L.DLQEntry(
+    transaction_id="evt_exhaust_001",
+    reason=L.DLQReason.TRANSIENT,
+    raw_payload=bad_payload,
+    max_retries=1,
+)
+L._write_dlq(conn_r, exhaust_entry)
+
+# Capture the id of the just-written row (largest id in DLQ is the one we just inserted).
+with conn_r.cursor() as cur:
+    cur.execute("SELECT id FROM dlq WHERE transaction_id='evt_exhaust_001' AND reason='TRANSIENT'")
+    exhaust_id = cur.fetchone()[0]
+
+L.retry_dlq_batch(conn_r)
+
+with conn_r.cursor() as cur:
+    cur.execute("SELECT status, retry_count FROM dlq WHERE id=%s", (exhaust_id,))
+    exhaust_row = cur.fetchone()
+chk("exhausted entry has status=exhausted",
+    exhaust_row is not None and exhaust_row[0] == "exhausted", f"got {exhaust_row}")
+chk("exhausted entry retry_count >= max_retries",
+    exhaust_row is not None and exhaust_row[1] >= 1, f"got {exhaust_row}")
+
+conn_r.close()
 
 
 # =============================================================================
