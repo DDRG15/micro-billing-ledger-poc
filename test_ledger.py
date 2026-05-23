@@ -41,6 +41,11 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import ledger as L
 import worker as W  # Phase 7: outbox drain worker
 
+# Integration tests verify application behavior (idempotency, validation, DLQ routing),
+# not authentication. Clear BILLING_API_KEY so _require_api_key skips the check on all
+# protected endpoints — no X-Api-Key header needed in any test call.
+L.BILLING_API_KEY = ""
+
 # ---------------------------------------------------------------------------
 # Test infrastructure / Infraestructura de tests
 # Minimal test runner — two globals (ok, fail) and one helper function.
