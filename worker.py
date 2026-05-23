@@ -150,7 +150,7 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow) -> None:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 — URL is operator-supplied DOWNSTREAM_URL, not user input
                 status = resp.status
         except urllib.error.HTTPError as exc:
             status = exc.code
