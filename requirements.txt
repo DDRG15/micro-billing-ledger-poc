@@ -36,6 +36,11 @@ stripe==10.12.0
 
 psycopg2-binary==2.9.9  # PostgreSQL sync driver — ACTIVE. Binary package includes libpq; no OS headers needed.
 
+# httpx 0.27.2 — required by starlette.testclient (TestClient transport layer).
+#     starlette>=0.21 dropped requests in favour of httpx. Without it, importing
+#     TestClient raises RuntimeError before any test runs.
+httpx==0.27.2
+
 # slowapi 0.1.9 — rate limiting for FastAPI. Wraps the `limits` library.
 #     Limits: 100 req/min on POST /webhook/stripe, 20 req/min on GET /dlq/entries
 #     and GET /ledger/summary. Prevents connection pool exhaustion and DLQ flooding.
