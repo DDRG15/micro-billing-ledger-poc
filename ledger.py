@@ -88,12 +88,12 @@ _log = logging.getLogger("ledger")
 # FastAPI for HTTP routing, Pydantic for validation, starlette for responses.
 #     All pinned in requirements.txt — no surprise version changes.
 # ---------------------------------------------------------------------------
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError, model_validator
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+from pydantic import BaseModel, Field, ValidationError, model_validator  # noqa: E402
+from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: E402
+from slowapi.util import get_remote_address  # noqa: E402
+from slowapi.errors import RateLimitExceeded  # noqa: E402
 
 # ===========================================================================
 # SECTION 1: ENUMS AND PYDANTIC MODELS (Phase 1 + Phase 2)
@@ -1488,7 +1488,8 @@ def _run_headless_benchmark(n: int = 10_000) -> None:
         idempotencia. El TPS de PostgreSQL es menor que SQLite en memoria (~1,000-3,000 vs ~15,000)
         debido a los round-trips de red y WAL fsync del lado del servidor. Ese es el tradeoff correcto.
     """
-    import random, string
+    import random
+    import string
 
     conn = _bootstrap()
 
