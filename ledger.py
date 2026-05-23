@@ -1539,4 +1539,4 @@ if __name__ == "__main__":
         _run_headless_benchmark(args.events)
     else:
         import uvicorn
-        uvicorn.run("ledger:app", host="0.0.0.0", port=8000, reload=False)
+        uvicorn.run("ledger:app", host="0.0.0.0", port=8000, reload=False)  # nosec B104 — intentional: Docker container must bind all interfaces
