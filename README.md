@@ -1,8 +1,8 @@
 # Micro-Billing-Ledger PoC
 ### Idempotent Stripe Webhook Ingestion — PostgreSQL · Pydantic v2 · FastAPI
 
-[![Tests](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/test.yml/badge.svg)](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/test.yml)
-[![Lint](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/lint.yml/badge.svg)](https://github.com/DDRG15/posthog-billing-poc/actions/workflows/lint.yml)
+[![Tests](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml)
+[![Lint](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml)
 
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. Running it in production without addressing the gaps at the bottom of this file will result in unsafe schema migrations, no retry path for dead-lettered events, and blind observability. Each gap lists the exact fix.
 
