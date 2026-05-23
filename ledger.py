@@ -598,15 +598,25 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
 
         # dlq — every rejected event lands here with a structured reason code.
         #     raw_payload is the full original JSON, preserved byte-perfect for replay.
+        #     status/retry columns added in Phase 11 — ADD COLUMN IF NOT EXISTS is
+        #     idempotent for databases that already existed before Phase 11.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS dlq (
                 id              BIGSERIAL   PRIMARY KEY,
                 transaction_id  TEXT        NOT NULL,
                 reason          TEXT        NOT NULL,
                 raw_payload     TEXT        NOT NULL,
-                received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status          TEXT        NOT NULL DEFAULT 'pending',
+                retry_count     INTEGER     NOT NULL DEFAULT 0,
+                max_retries     INTEGER     NOT NULL DEFAULT 0,
+                next_retry_at   TIMESTAMPTZ
             )
         """)
+        cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS status        TEXT    NOT NULL DEFAULT 'pending'")
+        cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS retry_count   INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS max_retries   INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ")
 
         # Indexes for the two production query patterns:
         #     idx_ledger_customer_id — used by revenue-by-customer GROUP BY queries.
