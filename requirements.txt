@@ -41,6 +41,15 @@ psycopg2-binary==2.9.9  # PostgreSQL sync driver — ACTIVE. Binary package incl
 #     and GET /ledger/summary. Prevents connection pool exhaustion and DLQ flooding.
 slowapi==0.1.9
 
+# alembic 1.18.4 — database migration framework (Phase 10).
+#     Replaces _bootstrap() CREATE TABLE IF NOT EXISTS for production schema management.
+#     Migrations live in alembic/versions/. Run: alembic upgrade head
+alembic==1.18.4
+
+# SQLAlchemy 2.0.41 — required by alembic as its engine layer.
+#     Only used for migration execution, not for ORM queries (psycopg2 handles all app queries).
+sqlalchemy==2.0.41
+
 # Uncomment when adding Prometheus /metrics endpoint.
 # prometheus-client==0.21.0
 # ---------------------------------------------------------------------------
