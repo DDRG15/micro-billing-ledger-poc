@@ -369,6 +369,14 @@ class DLQReason(str, Enum):
     DUPLICATE    = "DUPLICATE"     # Stripe retry of already-processed event
     INVALID      = "INVALID"       # Failed Pydantic validation — bad structure or business rule
     UNKNOWN_TYPE = "UNKNOWN_TYPE"  # Reserved — currently caught as INVALID by Pydantic enum
+    TRANSIENT    = "TRANSIENT"     # Transient DB/network error — safe to auto-retry
+
+
+class DLQStatus(str, Enum):
+    PENDING   = "pending"    # Waiting for first or next retry attempt
+    RETRYING  = "retrying"   # Currently being processed by retry worker
+    RESOLVED  = "resolved"   # Successfully reprocessed — ledger row now exists
+    EXHAUSTED = "exhausted"  # retry_count >= max_retries — needs human intervention
 
 
 class DLQEntry(BaseModel):
@@ -385,25 +393,34 @@ class DLQEntry(BaseModel):
         to_db() serializa a una 4-tupla que coincide exactamente con el orden de
         columnas de la tabla dlq.
     """
-    transaction_id: str   = Field(min_length=1)   # Stripe event ID or "unknown" if missing
-    reason:         DLQReason                      # Typed rejection code — not a freeform string
-    raw_payload:    dict                           # The full original webhook payload, untouched
-    received_at:    datetime = Field(default_factory=lambda: datetime.now(timezone.utc))  # Timezone-aware receipt timestamp (TIMESTAMPTZ)
+    transaction_id: str        = Field(min_length=1)
+    reason:         DLQReason
+    raw_payload:    dict
+    received_at:    datetime   = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Retry tracking — DUPLICATE and INVALID default to max_retries=0 (no auto-retry).
+    # TRANSIENT defaults to max_retries=3 (auto-retried by the worker).
+    status:         DLQStatus  = DLQStatus.PENDING
+    retry_count:    int        = 0
+    max_retries:    int        = 0
+    next_retry_at:  Optional[datetime] = None
+
+    def __init__(self, **data: object) -> None:
+        super().__init__(**data)
+        # TRANSIENT errors are auto-retryable — ensure max_retries is set.
+        # next_retry_at stays NULL, which the SELECT treats as "retry immediately".
+        if self.reason == DLQReason.TRANSIENT and self.max_retries == 0:
+            object.__setattr__(self, "max_retries", 3)
 
     def to_db(self) -> tuple:
-        """
-        EN: Serializes the DLQEntry to an ordered 4-tuple for the INSERT statement.
-            .value on the enum converts it to a plain string for the TEXT column.
-            json.dumps on raw_payload preserves the full structure as a JSON string.
-        ES: Serializa el DLQEntry a una 4-tupla ordenada para el INSERT.
-            .value en el enum lo convierte a un string plano para la columna TEXT.
-            json.dumps en raw_payload preserva la estructura completa como string JSON.
-        """
         return (
             self.transaction_id,
-            self.reason.value,              # enum → string
-            json.dumps(self.raw_payload),   # dict → JSON string
+            self.reason.value,
+            json.dumps(self.raw_payload),
             self.received_at,
+            self.status.value,
+            self.retry_count,
+            self.max_retries,
+            self.next_retry_at,
         )
 
 
@@ -831,8 +848,9 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
     try:
         with _tx(conn) as cur:
             cur.execute(
-                "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at)"
-                " VALUES (%s, %s, %s, %s)",
+                "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at,"
+                " status, retry_count, max_retries, next_retry_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                 entry.to_db(),
             )
     except Exception as exc:
@@ -847,6 +865,104 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
             exc,
             json.dumps(entry.raw_payload),
         )
+
+
+# Exponential backoff delays (seconds) for retry attempts 1, 2, 3+
+_RETRY_BACKOFF = [300, 900, 3600]  # 5 min, 15 min, 1 hour
+
+
+def retry_dlq_batch(
+    conn: "psycopg2.extensions.connection",
+    batch_size: int = 50,
+) -> int:
+    """
+    Find DLQ entries eligible for retry, attempt to reprocess each one, and
+    update status accordingly. Returns the number of entries attempted.
+
+    Eligibility: status='pending' AND next_retry_at <= NOW() AND retry_count < max_retries.
+    DUPLICATE and INVALID entries have max_retries=0 so they are never auto-retried.
+    Only TRANSIENT entries (max_retries=3) enter this loop.
+
+    On success: status → 'resolved'.
+    On failure: retry_count += 1, next_retry_at = NOW() + backoff, and if
+                retry_count >= max_retries: status → 'exhausted'.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, transaction_id, raw_payload
+            FROM dlq
+            WHERE status = 'pending'
+              AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+              AND retry_count < max_retries
+            ORDER BY id
+            LIMIT %s
+            """,
+            (batch_size,),
+        )
+        rows = cur.fetchall()
+
+    attempted = 0
+    for row in rows:
+        dlq_id, transaction_id, raw_payload_str = row[0], row[1], row[2]
+        attempted += 1
+        try:
+            payload = json.loads(raw_payload_str)
+            result = process_stripe_event(conn, payload)
+            outcome = result.get("outcome", "")
+            # Both SUCCESS and DLQ_DUPLICATE count as resolved — the event is in the ledger.
+            if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
+                with _tx(conn) as cur:
+                    cur.execute(
+                        "UPDATE dlq SET status='resolved' WHERE id=%s",
+                        (dlq_id,),
+                    )
+                _log.info("dlq_retry resolved id=%s transaction_id=%s", dlq_id, transaction_id)
+            else:
+                _increment_retry(conn, dlq_id, transaction_id)
+        except Exception as exc:
+            _log.error("dlq_retry error id=%s error=%r", dlq_id, exc)
+            _increment_retry(conn, dlq_id, transaction_id)
+
+    return attempted
+
+
+def _increment_retry(
+    conn: "psycopg2.extensions.connection",
+    dlq_id: int,
+    transaction_id: str,
+) -> None:
+    """Increment retry_count, set next backoff delay, mark exhausted if ceiling reached."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT retry_count, max_retries FROM dlq WHERE id=%s",
+            (dlq_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return
+        retry_count, max_retries = row[0], row[1]
+        new_count = retry_count + 1
+        delay = _RETRY_BACKOFF[min(retry_count, len(_RETRY_BACKOFF) - 1)]
+        if new_count >= max_retries:
+            cur.execute(
+                "UPDATE dlq SET retry_count=%s, status='exhausted', next_retry_at=NULL WHERE id=%s",
+                (new_count, dlq_id),
+            )
+            _log.warning(
+                "dlq_retry exhausted id=%s transaction_id=%s retries=%s/%s",
+                dlq_id, transaction_id, new_count, max_retries,
+            )
+        else:
+            cur.execute(
+                "UPDATE dlq SET retry_count=%s, status='pending',"
+                " next_retry_at=NOW() + interval '%s seconds' WHERE id=%s",
+                (new_count, delay, dlq_id),
+            )
+            _log.info(
+                "dlq_retry scheduled id=%s transaction_id=%s attempt=%s next_in=%ss",
+                dlq_id, transaction_id, new_count, delay,
+            )
 
 
 def process_stripe_event_batch(
@@ -1052,7 +1168,8 @@ def process_stripe_event_batch(
                 execute_values(
                     cur,
                     "INSERT INTO dlq"
-                    " (transaction_id, reason, raw_payload, received_at) VALUES %s",
+                    " (transaction_id, reason, raw_payload, received_at,"
+                    "  status, retry_count, max_retries, next_retry_at) VALUES %s",
                     all_dlq,
                     page_size=page_size,
                 )
@@ -1278,6 +1395,52 @@ def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_ap
         ],
         "count": len(rows),
     })
+
+
+@app.post("/dlq/{dlq_id}/retry")
+@_limiter.limit("20/minute")
+def dlq_retry(request: Request, dlq_id: int, _: None = Depends(_require_api_key)) -> JSONResponse:
+    """
+    Manual retry endpoint for a single DLQ entry. Reprocesses the raw_payload
+    immediately regardless of status or retry_count. Useful for ops: fix the
+    upstream issue (e.g. bad validator config), then replay specific entries.
+    Returns the outcome of the reprocessing attempt.
+    Requires X-Api-Key header when BILLING_API_KEY is set.
+    """
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT transaction_id, raw_payload, status FROM dlq WHERE id=%s",
+                (dlq_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"DLQ entry {dlq_id} not found")
+
+        transaction_id, raw_payload_str, current_status = row
+        payload = json.loads(raw_payload_str)
+        result = process_stripe_event(conn, payload)
+        outcome = result.get("outcome", "")
+
+        if outcome in ("SUCCESS", "DLQ_DUPLICATE"):
+            with _tx(conn) as cur:
+                cur.execute(
+                    "UPDATE dlq SET status='resolved' WHERE id=%s",
+                    (dlq_id,),
+                )
+            _log.info("dlq manual retry resolved id=%s transaction_id=%s", dlq_id, transaction_id)
+        else:
+            _increment_retry(conn, dlq_id, transaction_id)
+
+        return JSONResponse(content={
+            "dlq_id":         dlq_id,
+            "transaction_id": transaction_id,
+            "outcome":        outcome,
+            "previous_status": current_status,
+        })
+    finally:
+        _pool.putconn(conn)
 
 
 @app.get("/health")
