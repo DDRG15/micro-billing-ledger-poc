@@ -11,24 +11,11 @@
 #       4. Run: docker-compose up -d
 #       Caddy does the rest — no certbot, no cron, no manual renewal.
 #
-#
-#     Para activar HTTPS en producción:
-#       1. Apunta el DNS de tu dominio a la IP de este servidor.
-#       2. Abre el puerto 443 en tu firewall / security group.
-#       3. Configura CADDY_DOMAIN=billing.tuempresa.com en tu .env.
-#       4. Ejecuta: docker-compose up -d
-#       Caddy hace el resto — sin certbot, sin cron, sin renovación manual.
-#
-# LOCAL DEV / DESARROLLO LOCAL:
+# LOCAL DEV:
 #   With CADDY_DOMAIN=localhost (default in .env.example), Caddy uses
 #   a self-signed certificate. Your browser will show a security warning —
 #   this is expected for localhost. For local dev you can also access
 #   the API directly on http://localhost:8000 (billing port is still exposed).
-#
-#   Con CADDY_DOMAIN=localhost (default en .env.example), Caddy usa un
-#   certificado autofirmado. El navegador mostrará una advertencia de seguridad
-#   — es esperado en localhost. Para desarrollo local también puedes acceder
-#   directamente en http://localhost:8000 (el puerto de billing sigue expuesto).
 
 {$CADDY_DOMAIN} {
     # Forward all traffic to the billing FastAPI container.

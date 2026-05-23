@@ -7,7 +7,7 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. Running it in production without addressing the gaps at the bottom of this file will result in unsafe schema migrations, no retry path for dead-lettered events, and blind observability. Each gap lists the exact fix.
 
 **Stack:** Python 3.12 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 108 / 108 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 141 / 141 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** ~5,000 TPS (batch) · 500+ TPS (single-event) · both on Docker-on-Windows localhost
 
 ---
@@ -40,7 +40,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 3. Run the full test suite — 108 tests, live PostgreSQL, no mocks
+# 3. Run the full test suite — 141 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 4. Configure environment — safe dev defaults work immediately
@@ -318,7 +318,7 @@ CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WH
 ## Test Coverage
 
 ```
-108 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+141 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1  (34 tests)   Entry boundary — Pydantic type + Field + enum validation
 Phase 2  (26 tests)   Output models  — DLQEntry, LedgerEntry, to_db() serialization
