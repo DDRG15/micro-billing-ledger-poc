@@ -92,6 +92,9 @@ def _qall(conn, sql: str, params: tuple = ()) -> list:
         return cur.fetchall()
 
 
+_open_conns: list = []  # M7: every fresh_conn() is tracked here and closed at end of run
+
+
 def fresh_conn():
     """
     EN: Returns a PostgreSQL connection with all tables truncated.
@@ -108,6 +111,7 @@ def fresh_conn():
     conn = L._bootstrap()
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+    _open_conns.append(conn)  # M7: tracked for guaranteed close at end of run
     return conn
 
 
@@ -1195,6 +1199,83 @@ chk("manual retry DLQ status is resolved", st == "resolved", f"got {st!r}")
 
 L._pool = original_pool_manual
 manual_conn.close()
+
+
+# =============================================================================
+# M1: API KEY AUTH BOUNDARY
+# Verifies _require_api_key actually enforces the key. The rest of the suite runs
+#     with BILLING_API_KEY="" (auth disabled); this section sets a key and asserts
+#     401 on missing/wrong and 200 on correct, then restores the empty key.
+# =============================================================================
+print("\n── M1: API key auth boundary ────────────────────────────────────────────")
+
+auth_conn          = fresh_conn()
+original_pool_auth = L._pool
+original_key_auth  = L.BILLING_API_KEY
+L._pool            = _MockPool(auth_conn)
+L.BILLING_API_KEY  = "test_secret_key"
+auth_client        = TestClient(L.app)
+try:
+    r = auth_client.get("/ledger/summary")
+    chk("ops endpoint without X-Api-Key → 401", r.status_code == 401, f"got {r.status_code}")
+
+    r = auth_client.get("/ledger/summary", headers={"X-Api-Key": "wrong_key"})
+    chk("ops endpoint with wrong key → 401", r.status_code == 401, f"got {r.status_code}")
+
+    r = auth_client.get("/ledger/summary", headers={"X-Api-Key": "test_secret_key"})
+    chk("ops endpoint with correct key → 200", r.status_code == 200, f"got {r.status_code}")
+finally:
+    L.BILLING_API_KEY = original_key_auth
+    L._pool           = original_pool_auth
+    auth_conn.close()
+
+
+# =============================================================================
+# M5: DLQ RETENTION (prune_dlq)
+# Verifies prune_dlq deletes old DUPLICATE rows only — recent DUPLICATE rows and
+#     INVALID rows of any age are kept (they need human review).
+# =============================================================================
+print("\n── M5: prune_dlq retention ──────────────────────────────────────────────")
+
+prune_conn = fresh_conn()
+with prune_conn.cursor() as cur:
+    cur.execute("BEGIN")
+    cur.execute(
+        "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at) "
+        "VALUES (%s, %s, %s, NOW() - INTERVAL '100 days')",
+        ("evt_old_dup", "DUPLICATE", "{}"),
+    )
+    cur.execute(
+        "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at) "
+        "VALUES (%s, %s, %s, NOW() - INTERVAL '10 days')",
+        ("evt_new_dup", "DUPLICATE", "{}"),
+    )
+    cur.execute(
+        "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at) "
+        "VALUES (%s, %s, %s, NOW() - INTERVAL '100 days')",
+        ("evt_old_invalid", "INVALID", "{}"),
+    )
+    cur.execute("COMMIT")
+
+deleted = L.prune_dlq(prune_conn, retention_days=90)
+chk("prune_dlq deletes exactly 1 old DUPLICATE row", deleted == 1, f"got {deleted}")
+
+remaining_ids = [r[0] for r in _qall(prune_conn, "SELECT transaction_id FROM dlq ORDER BY transaction_id")]
+chk("old DUPLICATE (>90d) removed",        "evt_old_dup" not in remaining_ids, str(remaining_ids))
+chk("recent DUPLICATE (10d) kept",         "evt_new_dup" in remaining_ids, str(remaining_ids))
+chk("old INVALID kept (only DUPLICATE pruned)", "evt_old_invalid" in remaining_ids, str(remaining_ids))
+prune_conn.close()
+
+
+# =============================================================================
+# M7: close every connection opened via fresh_conn(). Closing an already-closed
+#     connection is a no-op, so sections that closed their own connection are fine.
+# =============================================================================
+for _c in _open_conns:
+    try:
+        _c.close()
+    except Exception:
+        pass
 
 
 # =============================================================================

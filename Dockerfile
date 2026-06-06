@@ -79,6 +79,12 @@ EXPOSE 8000
 #       For higher concurrency, switch to Gunicorn + uvicorn workers — each worker
 #       gets its own pool, so connections = workers × maxconn.
 #     --no-access-log: reduces log noise; structured application logs handle observability.
+#     --proxy-headers --forwarded-allow-ips=*: billing is only reachable through Caddy,
+#       so request.client.host is Caddy's container IP. Without these, slowapi's
+#       get_remote_address keys every client to that one IP and the per-IP rate limit
+#       becomes a single global bucket. Honoring X-Forwarded-For (set by Caddy) restores
+#       real per-client limiting. "*" is safe here: the only ingress is the trusted proxy.
 CMD ["python", "-m", "uvicorn", "ledger:app", \
      "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "1", "--no-access-log"]
+     "--workers", "1", "--no-access-log", \
+     "--proxy-headers", "--forwarded-allow-ips", "*"]

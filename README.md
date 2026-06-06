@@ -4,10 +4,10 @@
 [![Tests](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml)
 [![Lint](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml)
 
-**Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. Running it in production without addressing the gaps at the bottom of this file will result in unsafe schema migrations, no retry path for dead-lettered events, and blind observability. Each gap lists the exact fix.
+**Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The open gaps are listed at the bottom of this file — chiefly blind observability (no structured JSON logging or Prometheus metrics), per-event-type amount extraction, and currency normalization. Each gap lists the exact fix.
 
 **Stack:** Python 3.12 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 141 / 141 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 148 / 148 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** ~5,000 TPS (batch) · 500+ TPS (single-event) · both on Docker-on-Windows localhost
 
 ---
@@ -40,7 +40,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 3. Run the full test suite — 141 tests, live PostgreSQL, no mocks
+# 3. Run the full test suite — 148 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 4. Configure environment — safe dev defaults work immediately
@@ -162,9 +162,9 @@ The `dispatched=1` update happens in the **same `BEGIN…COMMIT`** as the dispat
 
 **Connection Pooling** — `psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=20)` replaces the single module-level connection. Each request leases a connection via `getconn()` and returns it in a `finally` block via `putconn()`. No connection exhaustion under concurrent load; no leaked connections on exception paths.
 
-**Async/Sync Thread Dispatch** — Database-hitting routes (`/ledger/summary`, `/dlq/entries`) are declared `def`, not `async def`. FastAPI runs synchronous routes in an external thread pool, preventing psycopg2 blocking calls from stalling the asyncio event loop. The webhook handler remains `async def` to support `await request.body()`.
+**Async/Sync Thread Dispatch** — All database-hitting routes — `POST /webhook/stripe`, `/ledger/summary`, `/dlq/entries` — are declared `def`, not `async def`. FastAPI runs synchronous routes in an external thread pool, so psycopg2's blocking calls never stall the asyncio event loop. The webhook handler reads the raw body from `request._body` (cached by Starlette when it parses the request) for HMAC verification — no `await` needed.
 
-**Rate Limiting** — `slowapi` enforces 100 req/min on `POST /webhook/stripe` and 20 req/min on the read endpoints, keyed by remote IP. A webhook flood without rate limiting exhausts `maxconn=20` and drives `outbox_pending` unbounded. The 429 response instructs Stripe to back off; Stripe's own retry logic handles redelivery.
+**Rate Limiting** — `slowapi` enforces 100 req/min on `POST /webhook/stripe` and 20 req/min on the read endpoints, keyed by client IP. Behind the Caddy proxy the app runs with `--proxy-headers --forwarded-allow-ips=*`, so the limiter keys on the real client IP from `X-Forwarded-For` rather than the proxy address — without that, every request shares one bucket. A webhook flood without rate limiting exhausts `maxconn=20` and drives `outbox_pending` unbounded. The 429 response instructs Stripe to back off; Stripe's own retry logic handles redelivery.
 
 **Log Rotation** — `RotatingFileHandler(maxBytes=10MB, backupCount=5)` caps log storage at 50 MB. At 500 TPS under DLQ write failures, each logging a full raw payload as JSON, an unbounded log file fills a typical root partition in under an hour. The 5-file backup retains enough history for forensics without infinite growth.
 
@@ -318,13 +318,17 @@ CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WH
 ## Test Coverage
 
 ```
-141 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+148 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
-Phase 1  (34 tests)   Entry boundary — Pydantic type + Field + enum validation
-Phase 2  (26 tests)   Output models  — DLQEntry, LedgerEntry, to_db() serialization
-Phase 3  ( 9 tests)   Cross-field    — invoice amount > 0, customer ID format
-Phase 5  (32 tests)   Full stack     — HTTP, concurrent idempotency, outbox dispatch, DLQ queryability
-Phase 7  ( 7 tests)   Security & SRE — HMAC signature rejection, BIGINT overflow, batch duplicate, limit validation
+Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
+Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
+Phase 3    Cross-field    — invoice amount > 0, customer ID 'cus_' format
+Phase 5    Full stack     — HTTP 200/400/422/503, HMAC signature, 5-thread concurrent
+                            idempotency, batch duplicate partition, BIGINT, outbox, DLQ
+Phase 7    Outbox worker  — drain_batch dispatch + dispatched_at, SKIP LOCKED, idempotent re-drain
+Phase 10   Migrations     — alembic upgrade/downgrade round-trip, schema parity with _bootstrap()
+Phase 11   DLQ retry      — TRANSIENT backoff, exhaustion, manual POST /dlq/{id}/retry
+M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), prune_dlq retention
 ```
 
 **Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
@@ -350,8 +354,9 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Gap | Priority | Status | Fix |
 |---|---|---|---|
 | Outbox worker | **HIGH** | Done | Standalone Docker service — `SELECT FOR UPDATE SKIP LOCKED`, exponential backoff, SIGTERM-safe. |
-| DLQ retry budget | **HIGH** | Open | Add `retry_count`, `next_retry_at`, `max_retries` columns. Without this, DLQ is a graveyard, not a quarantine. |
-| Schema migrations | **HIGH** | Open | `_bootstrap()` runs `CREATE TABLE` on startup. Safe for a POC; destructive in production. Needs Alembic. |
+| DLQ retry budget | **HIGH** | Done | `retry_count`/`max_retries`/`next_retry_at` columns, exponential backoff, `POST /dlq/{id}/retry`, and a worker retry loop are implemented. Only `TRANSIENT` entries auto-retry; nothing in the live ingest path classifies an event as `TRANSIENT` yet (single-event DB failures return 503 so Stripe retries). The mechanism is provisioned for a future non-Stripe / async source with no upstream retrier. |
+| DLQ retention | **MEDIUM** | Done | `prune_dlq()` deletes `DUPLICATE` rows older than 90 days; the worker runs it at most once per hour. Without retention, Stripe's at-least-once redelivery grows the `dlq` table without bound. |
+| Schema migrations | **HIGH** | Done | Alembic migrations in `alembic/versions/` manage the production schema; the `migrate` service runs `alembic upgrade head` before the API starts. `_bootstrap()` mirrors the DDL with `IF NOT EXISTS` guards so CI runs against the same schema. |
 | Per-event-type amount extraction | **MEDIUM** | Open | Unknown amount → DLQ instead of silently recording $0. |
 | Structured JSON logging | **MEDIUM** | Open | JSON logs with `transaction_id`, `outcome`, `duration_ms` per request. |
 | Prometheus `/metrics` | **MEDIUM** | Open | `webhooks_received_total`, `webhooks_posted_total`, `dlq_depth`, `outbox_pending`. |

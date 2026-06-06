@@ -369,7 +369,12 @@ class DLQReason(str, Enum):
     DUPLICATE    = "DUPLICATE"     # Stripe retry of already-processed event
     INVALID      = "INVALID"       # Failed Pydantic validation — bad structure or business rule
     UNKNOWN_TYPE = "UNKNOWN_TYPE"  # Reserved — currently caught as INVALID by Pydantic enum
-    TRANSIENT    = "TRANSIENT"     # Transient DB/network error — safe to auto-retry
+    # TRANSIENT is the only reason the retry worker auto-processes. It is wired and tested
+    #     but has no production trigger today: single-event DB failures return HTTP 503 so
+    #     Stripe itself retries, and batch failures roll back atomically. It is provisioned
+    #     for a future non-Stripe / internal-async source — one with no upstream retrier —
+    #     where a network timeout or an upstream 503 must be re-attempted by us, not Stripe.
+    TRANSIENT    = "TRANSIENT"     # Transient DB/network error — auto-retryable (see note above)
 
 
 class DLQStatus(str, Enum):
@@ -518,6 +523,17 @@ if STRIPE_WEBHOOK_SECRET == _PLACEHOLDER_SECRET:
 #     ISO 27001 A.9.4.1: access to operational data must be access-controlled.
 BILLING_API_KEY: str = os.environ.get("BILLING_API_KEY", "")
 
+# Fail-open on an empty key is a deliberate dev convenience — but a silent one is a
+#     liability. If a production deploy forgets BILLING_API_KEY, /dlq/entries would
+#     serve raw Stripe payloads (customer IDs, amounts) to anyone, with no signal.
+#     Make that misconfiguration loud at startup instead of silent at runtime.
+if not BILLING_API_KEY:
+    _log.warning(
+        "BILLING_API_KEY is empty — /ledger/summary, /dlq/entries and /dlq/{id}/retry "
+        "are UNAUTHENTICATED. Dev mode only. Set a strong key (openssl rand -hex 32) "
+        "before any network-reachable deployment."
+    )
+
 
 # ===========================================================================
 # SECTION 3: DATABASE BOOTSTRAP
@@ -609,13 +625,16 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
                 received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 status          TEXT        NOT NULL DEFAULT 'pending',
                 retry_count     INTEGER     NOT NULL DEFAULT 0,
-                max_retries     INTEGER     NOT NULL DEFAULT 0,
+                max_retries     INTEGER     NOT NULL DEFAULT 3,
                 next_retry_at   TIMESTAMPTZ
             )
         """)
+        # max_retries DEFAULT 3 mirrors Alembic migration 0002 exactly. _bootstrap()
+        # exists to give CI the same schema Alembic produces in prod; a mismatched
+        # default (was 0 here) means "green in CI" would not guarantee "correct in prod".
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS status        TEXT    NOT NULL DEFAULT 'pending'")
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS retry_count   INTEGER NOT NULL DEFAULT 0")
-        cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS max_retries   INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS max_retries   INTEGER NOT NULL DEFAULT 3")
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ")
 
         # Indexes for the two production query patterns:
@@ -902,6 +921,11 @@ def retry_dlq_batch(
     DUPLICATE and INVALID entries have max_retries=0 so they are never auto-retried.
     Only TRANSIENT entries (max_retries=3) enter this loop.
 
+    NOTE — no production trigger today: nothing in the live ingest path writes a TRANSIENT
+    entry (single-event DB failures return 503 so Stripe retries; batch failures roll back
+    atomically). This loop is wired and tested, provisioned for a future non-Stripe / async
+    source with no upstream retrier. Until then it is intentionally inert in production.
+
     On success: status → 'resolved'.
     On failure: retry_count += 1, next_retry_at = NOW() + backoff, and if
                 retry_count >= max_retries: status → 'exhausted'.
@@ -1004,6 +1028,31 @@ def _increment_retry(
             "dlq_retry scheduled id=%s transaction_id=%s attempt=%s next_in=%ss",
             dlq_id, transaction_id, new_count, delay,
         )
+
+
+def prune_dlq(
+    conn: "psycopg2.extensions.connection",
+    retention_days: int = 90,
+) -> int:
+    """Delete DUPLICATE DLQ rows older than retention_days. Returns rows deleted.
+
+    Without retention the dlq table grows without bound: Stripe's at-least-once
+    redelivery writes a DUPLICATE row per replayed event, and at 500 TPS even a small
+    duplicate rate is millions of audit-only rows per day. Those rows are safe to age out.
+    INVALID and exhausted entries are NEVER pruned — they need human review and stay until
+    an operator resolves them.
+
+    The worker calls this at most once per hour (see worker.run_loop). It is a single
+    idempotent DELETE and can also be run standalone or from cron / pg_cron.
+    """
+    with _tx(conn) as cur:
+        cur.execute(
+            "DELETE FROM dlq "
+            "WHERE reason = %s "
+            "  AND received_at < NOW() - make_interval(days => %s)",
+            (DLQReason.DUPLICATE.value, retention_days),
+        )
+        return cur.rowcount
 
 
 def process_stripe_event_batch(

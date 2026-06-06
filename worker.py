@@ -250,17 +250,25 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
 
 def run_loop(conn: psycopg2.extensions.connection) -> None:
     """
-    EN: Infinite polling loop. Drains outbox until empty, then sleeps.
-        Reconnects with exponential backoff on DB errors.
-    ES: Bucle de sondeo infinito. Vacía el outbox hasta que esté vacío, luego duerme.
-        Reconecta con backoff exponencial en errores de DB.
+    EN: Infinite polling loop. Drains outbox until empty, then sleeps. Prunes old
+        DUPLICATE DLQ rows at most once per hour. Reconnects with exponential backoff on DB errors.
+    ES: Bucle de sondeo infinito. Vacía el outbox hasta que esté vacío, luego duerme. Poda filas
+        DUPLICATE viejas del DLQ como máximo una vez por hora. Reconecta con backoff exponencial.
     """
     backoff: float = 5.0
+    last_prune: float = 0.0          # monotonic ts of last DLQ prune (0 → prune on first cycle)
+    prune_interval: float = 3600.0   # prune DUPLICATE DLQ rows at most once per hour
 
     while not _stop:
         try:
             count = drain_batch(conn)
             retried = _ledger.retry_dlq_batch(conn)
+            now = time.monotonic()
+            if now - last_prune >= prune_interval:
+                deleted = _ledger.prune_dlq(conn)
+                last_prune = now
+                if deleted:
+                    log.info("dlq_pruned deleted=%d reason=DUPLICATE older_than_days=90", deleted)
             backoff = 5.0  # reset on success
             if count == 0 and retried == 0:
                 log.debug("queue_empty — sleeping %.0fs", WORKER_POLL_INTERVAL)
