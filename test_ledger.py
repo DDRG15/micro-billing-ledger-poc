@@ -1,27 +1,18 @@
 """
-test_ledger.py — Full Integration Test Suite / Suite Completa de Tests de Integración
+test_ledger.py — Full Integration Test Suite
 ======================================================================================
-EN: Tests across 5 phases. Run with: python test_ledger.py
-    Requires: PostgreSQL running and DATABASE_URL set (see docker-compose.yml).
-    Covers: entry validation, output models, cross-field rules, HTTP layer,
-    concurrent insertion, outbox dispatch simulation, DLQ queryability.
-    No mocks for the database. No stubs for the ON CONFLICT logic.
-    Every assertion hits a real PostgreSQL database.
-    The test runner is deliberately simple — no pytest dependency — so anyone
-    can run it with a plain Python install.
-
-ES: Tests en 5 fases. Ejecutar con: python test_ledger.py
-    Requiere: PostgreSQL en ejecución y DATABASE_URL establecido (ver docker-compose.yml).
-    Cubre: validación de entrada, modelos de salida, reglas de campos cruzados,
-    capa HTTP, inserción concurrente, simulación de despacho del outbox, consultabilidad del DLQ.
-    Sin mocks para la base de datos. Sin stubs para la lógica ON CONFLICT.
-    Cada aserción golpea una base de datos PostgreSQL real.
-    El runner de tests es deliberadamente simple — sin dependencia de pytest — para que
-    cualquiera pueda ejecutarlo con una instalación Python plana.
+Tests across multiple phases. Run with: python test_ledger.py
+Requires: PostgreSQL running and DATABASE_URL set (see docker-compose.yml).
+Covers: entry validation, output models, cross-field rules, HTTP layer,
+concurrent insertion, outbox dispatch simulation, DLQ queryability.
+No mocks for the database. No stubs for the ON CONFLICT logic.
+Every assertion hits a real PostgreSQL database.
+The test runner is deliberately simple — no pytest dependency — so anyone
+can run it with a plain Python install.
 """
 
 # ---------------------------------------------------------------------------
-# Standard library imports / Importaciones de la librería estándar
+# Standard library imports
 # ---------------------------------------------------------------------------
 import io          # Used to wrap stdout for UTF-8 output on Windows
 import json        # Used to verify raw_payload round-trips correctly
@@ -56,10 +47,8 @@ ok = fail = 0
 
 def chk(name: str, cond: bool, detail: str = "") -> None:
     """
-    EN: Assertion helper. Increments ok or fail and prints result.
-        detail is shown only on failure — useful for showing actual vs expected values.
-    ES: Auxiliar de aserción. Incrementa ok o fail e imprime el resultado.
-        detail se muestra solo en fallo — útil para mostrar valores actuales vs esperados.
+    Assertion helper. Increments ok or fail and prints result.
+    detail is shown only on failure — useful for showing actual vs expected values.
     """
     global ok, fail
     if cond:
@@ -72,10 +61,8 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
 
 def _q1(conn, sql: str, params: tuple = ()) -> object:
     """
-    EN: Execute a query and return the first column of the first row.
-        Used for COUNT(*) and similar single-value reads.
-    ES: Ejecutar una consulta y retornar la primera columna de la primera fila.
-        Usado para COUNT(*) y lecturas similares de valor único.
+    Execute a query and return the first column of the first row.
+    Used for COUNT(*) and similar single-value reads.
     """
     with conn.cursor() as cur:
         cur.execute(sql, params)
@@ -84,8 +71,7 @@ def _q1(conn, sql: str, params: tuple = ()) -> object:
 
 def _qall(conn, sql: str, params: tuple = ()) -> list:
     """
-    EN: Execute a query and return all rows as a list of tuples.
-    ES: Ejecutar una consulta y retornar todas las filas como lista de tuplas.
+    Execute a query and return all rows as a list of tuples.
     """
     with conn.cursor() as cur:
         cur.execute(sql, params)
@@ -97,16 +83,11 @@ _open_conns: list = []  # M7: every fresh_conn() is tracked here and closed at e
 
 def fresh_conn():
     """
-    EN: Returns a PostgreSQL connection with all tables truncated.
-        Each test section that needs isolation calls fresh_conn() to start clean.
-        TRUNCATE ... RESTART IDENTITY resets all table data and BIGSERIAL sequences.
-        No mocking — this hits the real PostgreSQL database defined by DATABASE_URL.
-        Requires: docker-compose up -d postgres (or a running PostgreSQL instance).
-    ES: Retorna una conexión PostgreSQL con todas las tablas truncadas.
-        Cada sección de test que necesita aislamiento llama fresh_conn() para empezar limpio.
-        TRUNCATE ... RESTART IDENTITY resetea todos los datos de tablas y secuencias BIGSERIAL.
-        Sin mocking — esto golpea la base de datos PostgreSQL real definida por DATABASE_URL.
-        Requiere: docker-compose up -d postgres (o una instancia PostgreSQL en ejecución).
+    Returns a PostgreSQL connection with all tables truncated.
+    Each test section that needs isolation calls fresh_conn() to start clean.
+    TRUNCATE ... RESTART IDENTITY resets all table data and BIGSERIAL sequences.
+    No mocking — this hits the real PostgreSQL database defined by DATABASE_URL.
+    Requires: docker-compose up -d postgres (or a running PostgreSQL instance).
     """
     conn = L._bootstrap()
     with conn.cursor() as cur:
@@ -124,17 +105,11 @@ def fake_event(
     include_request: bool = True,
 ) -> dict:
     """
-    EN: Factory function for fake Stripe events. Produces structurally valid payloads
-        that pass all Pydantic validators by default. Override individual fields to
-        test specific failure modes (e.g., currency="USD" to test uppercase rejection).
-        customer default "cus_123" passes min_length=4 AND the cus_ prefix check.
-        amount default 4900 passes ge=0 AND the nonzero invoice check.
-    ES: Función fábrica para eventos Stripe falsos. Produce payloads estructuralmente
-        válidos que pasan todos los validadores Pydantic por defecto. Sobreescribir
-        campos individuales para probar modos de fallo específicos (ej., currency="USD"
-        para probar el rechazo de mayúsculas). El cliente por defecto "cus_123" pasa
-        min_length=4 Y el check del prefijo cus_. El monto por defecto 4900 pasa
-        ge=0 Y el check de factura no cero.
+    Factory function for fake Stripe events. Produces structurally valid payloads
+    that pass all Pydantic validators by default. Override individual fields to
+    test specific failure modes (e.g., currency="USD" to test uppercase rejection).
+    customer default "cus_123" passes min_length=4 AND the cus_ prefix check.
+    amount default 4900 passes ge=0 AND the nonzero invoice check.
     """
     event = {
         "id": eid,

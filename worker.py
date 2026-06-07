@@ -1,25 +1,15 @@
 """
 worker.py — Transactional Outbox drain worker
 ==============================================
-EN: Standalone process that polls the outbox table for undispatched rows,
-    forwards each event to a downstream system (or logs it when no
-    DOWNSTREAM_URL is configured), then marks the rows dispatched=1.
+Standalone process that polls the outbox table for undispatched rows,
+forwards each event to a downstream system (or logs it when no
+DOWNSTREAM_URL is configured), then marks the rows dispatched=1.
 
-    Run alongside the billing API:
-        python worker.py
+Run alongside the billing API:
+    python worker.py
 
-    The worker is also wired as a Docker service in docker-compose.yml so
-    it starts automatically next to the billing container.
-
-ES: Proceso independiente que sondea la tabla outbox por filas no despachadas,
-    reenvía cada evento a un sistema downstream (o lo registra si no hay
-    DOWNSTREAM_URL configurado), luego marca las filas como dispatched=1.
-
-    Ejecutar junto a la API de facturación:
-        python worker.py
-
-    El worker también está configurado como servicio Docker en docker-compose.yml
-    para que se inicie automáticamente junto al contenedor billing.
+The worker is also wired as a Docker service in docker-compose.yml so
+it starts automatically next to the billing container.
 
 ENV VARS
 --------
@@ -125,14 +115,10 @@ def _tx(
 
 def _dispatch_row(row: psycopg2.extras.RealDictRow) -> None:
     """
-    EN: Forward a single outbox row to the downstream system.
-        If DOWNSTREAM_URL is set: HTTP POST the payload JSON.
-        If not set:               structured log line (POC mode).
-        Raises on failure so the caller skips the UPDATE (row retried next poll).
-    ES: Reenvía una fila del outbox al sistema downstream.
-        Si DOWNSTREAM_URL está configurado: HTTP POST del payload JSON.
-        Si no:                              línea de log estructurado (modo POC).
-        Lanza excepción en fallo para que la llamadora omita el UPDATE (reintento).
+    Forward a single outbox row to the downstream system.
+    If DOWNSTREAM_URL is set: HTTP POST the payload JSON.
+    If not set:               structured log line (POC mode).
+    Raises on failure so the caller skips the UPDATE (row retried next poll).
     """
     if DOWNSTREAM_URL:
         import urllib.request
@@ -179,14 +165,10 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow) -> None:
 
 def drain_batch(conn: psycopg2.extensions.connection) -> int:
     """
-    EN: Read up to WORKER_BATCH_SIZE undispatched rows, dispatch each one,
-        then mark them dispatched=1 in the same transaction.
-        Returns the number of rows successfully dispatched.
-        Returns 0 when the queue is empty.
-    ES: Lee hasta WORKER_BATCH_SIZE filas no despachadas, despacha cada una,
-        luego las marca como dispatched=1 en la misma transacción.
-        Retorna el número de filas despachadas exitosamente.
-        Retorna 0 cuando la cola está vacía.
+    Read up to WORKER_BATCH_SIZE undispatched rows, dispatch each one,
+    then mark them dispatched=1 in the same transaction.
+    Returns the number of rows successfully dispatched.
+    Returns 0 when the queue is empty.
     """
     with _tx(conn) as cur:
         cur.execute(
@@ -250,10 +232,8 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
 
 def run_loop(conn: psycopg2.extensions.connection) -> None:
     """
-    EN: Infinite polling loop. Drains outbox until empty, then sleeps. Prunes old
-        DUPLICATE DLQ rows at most once per hour. Reconnects with exponential backoff on DB errors.
-    ES: Bucle de sondeo infinito. Vacía el outbox hasta que esté vacío, luego duerme. Poda filas
-        DUPLICATE viejas del DLQ como máximo una vez por hora. Reconecta con backoff exponencial.
+    Infinite polling loop. Drains outbox until empty, then sleeps. Prunes old
+    DUPLICATE DLQ rows at most once per hour. Reconnects with exponential backoff on DB errors.
     """
     backoff: float = 5.0
     last_prune: float = 0.0          # monotonic ts of last DLQ prune (0 → prune on first cycle)

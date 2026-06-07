@@ -4,8 +4,7 @@
 #     These tools are NOT needed to run the app or the test suite.
 #     They are for code quality checks during development.
 #
-#
-# Usage / Uso:
+# Usage:
 #   ruff check ledger.py            # lint
 #   ruff format ledger.py           # format
 #   mypy ledger.py                  # type check

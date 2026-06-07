@@ -8,13 +8,6 @@
 #       python test_ledger.py
 #     For the full stack:
 #       docker-compose up
-#
-#
-#     Para ejecutar tests localmente, iniciar solo el servicio postgres:
-#       docker-compose up -d postgres
-#       python test_ledger.py
-#     Para el stack completo:
-#       docker-compose up
 
 services:
 
