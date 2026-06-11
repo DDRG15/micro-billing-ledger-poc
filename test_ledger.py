@@ -19,7 +19,7 @@ import json        # Used to verify raw_payload round-trips correctly
 import sys         # stdout override for Windows UTF-8 encoding
 import time        # Used in benchmark timing
 import threading   # Used for the concurrent idempotency test
-from datetime import datetime, timezone
+from datetime import datetime
 from unittest.mock import patch
 
 # Force UTF-8 output on Windows. Without this, Unicode characters in print()
@@ -38,7 +38,7 @@ import worker as W  # Phase 7: outbox drain worker
 L.BILLING_API_KEY = ""
 
 # ---------------------------------------------------------------------------
-# Test infrastructure / Infraestructura de tests
+# Test infrastructure
 # Minimal test runner — two globals (ok, fail) and one helper function.
 #     chk() is the assertion function: prints PASS or FAIL with the test name.
 #     No pytest, no unittest — intentional. Any recruiter can read and run this.
@@ -127,7 +127,6 @@ def fake_event(
 
 # =============================================================================
 # PHASE 1: PYDANTIC ENTRY BOUNDARY VALIDATION
-# FASE 1: VALIDACIÓN DE LÍMITE DE ENTRADA PYDANTIC
 #
 # Tests that the Pydantic models (StripeEvent, StripeObject) correctly reject
 #     invalid payloads at the entry boundary. Every invalid payload should route
@@ -339,7 +338,8 @@ print("\n── Headless benchmark ───────────────
 N     = 5_000
 conn4 = fresh_conn()
 
-import random, string
+import random
+import string
 
 def _fake(i):
     return fake_event(
@@ -369,7 +369,6 @@ conn4.close()  # L3 — explicit close to avoid leaking connection
 
 # =============================================================================
 # PHASE 2: OUTPUT MODEL VALIDATION (DLQEntry + LedgerEntry)
-# FASE 2: VALIDACIÓN DE MODELOS DE SALIDA (DLQEntry + LedgerEntry)
 # =============================================================================
 
 print("\n── Phase 2: DLQEntry model ──────────────────────────────────────────────")
@@ -502,7 +501,6 @@ chk("subscription.updated → PENDING",
 
 # =============================================================================
 # PHASE 3: CROSS-FIELD VALIDATORS
-# FASE 3: VALIDADORES DE CAMPOS CRUZADOS
 # (Placed before Phase 5 so unit-level cross-field failures are verified
 #  before the full HTTP integration stack is exercised.)
 # =============================================================================
@@ -583,7 +581,6 @@ chk("reason mentions validation failures",
 
 # =============================================================================
 # PHASE 5: INTEGRATION TESTS — FULL STACK
-# FASE 5: TESTS DE INTEGRACIÓN — STACK COMPLETO
 # =============================================================================
 
 print("\n── Phase 5: Integration — HTTP layer (TestClient) ──────────────────────")
@@ -836,7 +833,6 @@ dlq_conn.close()
 
 # =============================================================================
 # PHASE 4 NEW TESTS: M3, M4, L4
-# FASE 4 NUEVOS TESTS: M3, M4, L4
 # =============================================================================
 
 print("\n── Phase 4: Batch result indexed by input position (M3) ─────────────────")
@@ -874,8 +870,11 @@ try:
         r = db_err_client.post("/webhook/stripe", json=fake_event(eid="evt_db_err"))
         chk("DB RuntimeError → HTTP 503",
             r.status_code == 503, f"got {r.status_code}: {r.text}")
+        # The previous assertion already pins status_code == 503; this one must verify
+        # the BODY independently. (An earlier version had "or r.status_code == 503"
+        # appended — a tautology that could never fail once the status check passed.)
         chk("503 body contains error detail",
-            "DB write failed" in r.text or r.status_code == 503)
+            "DB write failed" in r.text, f"got body: {r.text}")
 finally:
     L._pool = original_pool_3
     db_err_conn.close()
@@ -1045,7 +1044,6 @@ conn_mig.close()
 # =============================================================================
 print("\n── Phase 11: DLQ retry ──────────────────────────────────────────────────")
 
-from worker import drain_batch as _drain_batch
 
 conn_r = fresh_conn()
 

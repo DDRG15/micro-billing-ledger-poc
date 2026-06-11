@@ -35,6 +35,10 @@ LOGIC_AUDIT.md
 IMPLEMENTATION_REPORT.md
 README.md
 *.md
+# Archived private docs folder — *.md above only matches the root, so the folder
+# needs its own rule or its contents enter the build context (not the image — the
+# Dockerfile COPYs specific files — but private docs do not belong in the context).
+documentos/
 
 # Development toolchain config and cache.
 .pytest_cache/
