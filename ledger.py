@@ -531,7 +531,8 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
                 status          TEXT        NOT NULL DEFAULT 'pending',
                 retry_count     INTEGER     NOT NULL DEFAULT 0,
                 max_retries     INTEGER     NOT NULL DEFAULT 3,
-                next_retry_at   TIMESTAMPTZ
+                next_retry_at   TIMESTAMPTZ,
+                claimed_at      TIMESTAMPTZ
             )
         """)
         # max_retries DEFAULT 3 mirrors Alembic migration 0002 exactly. _bootstrap()
@@ -541,6 +542,9 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS retry_count   INTEGER NOT NULL DEFAULT 0")
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS max_retries   INTEGER NOT NULL DEFAULT 3")
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ")
+        # claimed_at mirrors Alembic migration 0003 — when the row was claimed for
+        #     retry. Lets retry_dlq_batch reclaim a claim that was never released.
+        cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS claimed_at    TIMESTAMPTZ")
 
         # Indexes for the two production query patterns:
         #     idx_ledger_customer_id — used by revenue-by-customer GROUP BY queries.
@@ -563,6 +567,13 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
             CREATE INDEX IF NOT EXISTS idx_dlq_retry
             ON dlq(status, next_retry_at)
             WHERE status = 'pending'
+        """)
+        # idx_dlq_stale_claim — covers the reclaim half of the retry_dlq_batch WHERE
+        # clause: status='retrying' AND claim older than the timeout. Mirrors 0003.
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_dlq_stale_claim
+            ON dlq(status, claimed_at)
+            WHERE status = 'retrying'
         """)
 
     return conn
@@ -612,7 +623,11 @@ _STATUS_MAP: dict[EventType, LedgerStatus] = {
 }
 
 
-def process_stripe_event(conn: "psycopg2.extensions.connection", event: dict) -> dict:
+def process_stripe_event(
+    conn: "psycopg2.extensions.connection",
+    event: dict,
+    from_retry: bool = False,
+) -> dict:
     """
     Idempotently inserts a Stripe event into the ledger and outbox.
 
@@ -621,6 +636,17 @@ def process_stripe_event(conn: "psycopg2.extensions.connection", event: dict) ->
     Layer 2 — Business logic: atomic dual-write (ledger + outbox) in one transaction
     Layer 3 — DLQ routing: invalid or duplicate events are logged, never silently dropped
 
+    from_retry marks a replay of a payload already held in the DLQ (manual retry endpoint
+    or retry_dlq_batch). A retry never creates DLQ rows: the entry being replayed IS the
+    DLQ record for that payload, and its status / retry_count / next_retry_at columns carry
+    the outcome of each attempt. Appending another row per attempt is what made the queue
+    amplify itself — one retry of an entry whose event had already reached the ledger left
+    behind one more pending row than it consumed, and each of those was itself retry-eligible.
+    That inflated the dlq_depth operators read to judge whether ingestion is healthy, making
+    retry activity indistinguishable from real upstream failures. The rule holds for both
+    outcomes a replay can produce, DUPLICATE and INVALID; the caller records the attempt
+    against the existing row instead.
+
     Returns a result dict with keys: outcome, transaction_id, reason.
     Possible outcomes:
       POSTED     — new event, payment confirmed, written to ledger
@@ -628,6 +654,7 @@ def process_stripe_event(conn: "psycopg2.extensions.connection", event: dict) ->
       PENDING    — new event, subscription updated (awaiting resolution)
       DLQ_INVALID    — Pydantic validation failed; event in DLQ
       DLQ_DUPLICATE  — already processed; idempotency guard fired; event in DLQ
+    Neither outcome writes a new DLQ row when from_retry is True.
     """
     now = datetime.now(timezone.utc)
 
@@ -642,12 +669,21 @@ def process_stripe_event(conn: "psycopg2.extensions.connection", event: dict) ->
         transaction_id = event.get("id") or "unknown"
         # "unknown" fallback only if the event has no id at all.
         #     DLQEntry.min_length=1 would reject "" so we use "unknown" as the floor.
-        dlq_entry = DLQEntry(
-            transaction_id=transaction_id,
-            reason=DLQReason.INVALID,
-            raw_payload=event,
-        )
-        _write_dlq(conn, dlq_entry)
+        if not from_retry:
+            dlq_entry = DLQEntry(
+                transaction_id=transaction_id,
+                reason=DLQReason.INVALID,
+                raw_payload=event,
+            )
+            _write_dlq(conn, dlq_entry)
+        else:
+            # A replay that still fails validation is worth surfacing, but as a log
+            #     line rather than another row: the entry being retried already holds
+            #     this payload, and _increment_retry drives it to 'exhausted'.
+            _log.warning(
+                "dlq_retry payload still invalid transaction_id=%s errors=%s",
+                transaction_id, e.error_count(),
+            )
         return {
             "outcome":        "DLQ_INVALID",
             "transaction_id": transaction_id,
@@ -727,12 +763,15 @@ def process_stripe_event(conn: "psycopg2.extensions.connection", event: dict) ->
     #     Write to DLQ with reason DUPLICATE for audit visibility.
     #     The duplicate event is NOT an error — it's Stripe doing its job (at-least-once delivery).
     if inserted == 0:
-        dlq_entry = DLQEntry(
-            transaction_id=transaction_id,
-            reason=DLQReason.DUPLICATE,
-            raw_payload=event,
-        )
-        _write_dlq(conn, dlq_entry)
+        # On a replay the DUPLICATE row already exists — it is the entry being retried.
+        #     Writing another would grow the queue by one row per retry, forever.
+        if not from_retry:
+            dlq_entry = DLQEntry(
+                transaction_id=transaction_id,
+                reason=DLQReason.DUPLICATE,
+                raw_payload=event,
+            )
+            _write_dlq(conn, dlq_entry)
         return {
             "outcome":        "DLQ_DUPLICATE",
             "transaction_id": transaction_id,
@@ -781,10 +820,19 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
 # Exponential backoff delays (seconds) for retry attempts 1, 2, 3+
 _RETRY_BACKOFF = [300, 900, 3600]  # 5 min, 15 min, 1 hour
 
+# How long a retry claim (status='retrying') stays valid before another batch may
+#     reclaim it. The claim is committed before the work runs, so a crash between the
+#     two would otherwise strand the row forever — retry_dlq_batch only ever looked at
+#     status='pending'. 15 minutes is comfortably above the worst-case time to process
+#     one batch; reclaiming a row that is still in flight costs duplicated effort, never
+#     duplicated money, because the ledger primary key still rejects the second insert.
+_CLAIM_TIMEOUT_SECONDS = 900
+
 
 def retry_dlq_batch(
     conn: "psycopg2.extensions.connection",
     batch_size: int = 50,
+    claim_timeout_seconds: int = _CLAIM_TIMEOUT_SECONDS,
 ) -> int:
     """
     Find DLQ entries eligible for retry, attempt to reprocess each one, and
@@ -803,28 +851,47 @@ def retry_dlq_batch(
     On failure: retry_count += 1, next_retry_at = NOW() + backoff, and if
                 retry_count >= max_retries: status → 'exhausted'.
 
-    Concurrency: rows are atomically claimed (status='retrying') via UPDATE ... WHERE id IN
-    (SELECT ... FOR UPDATE SKIP LOCKED). Two workers running simultaneously claim disjoint
-    sets — no event is retried twice. The claim transaction commits before process_stripe_event
-    is called because process_stripe_event calls _tx(conn) internally — nested BEGIN on an
-    autocommit connection would error. status='retrying' is the lock substitute.
+    Concurrency: rows are atomically claimed (status='retrying', claimed_at=NOW()) via
+    UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED). Two workers running
+    simultaneously claim disjoint sets — no event is retried twice. The claim transaction
+    commits before process_stripe_event is called because process_stripe_event calls
+    _tx(conn) internally — nested BEGIN on an autocommit connection would error.
+    status='retrying' is the lock substitute.
+
+    Stale-claim recovery: because the claim commits before the work happens, a crash (or a
+    failure inside the recovery UPDATE itself) leaves rows in 'retrying' that no later batch
+    would ever select — invisible, counted as neither pending nor resolved nor exhausted.
+    The claim query therefore also reclaims 'retrying' rows whose claimed_at is older than
+    claim_timeout_seconds. A NULL claimed_at counts as infinitely stale, which recovers rows
+    stranded before migration 0003 added the column.
+
+    Set claim_timeout_seconds above the worst-case processing time for one batch. Too low and
+    a second worker reclaims a row that is still being worked on; the ledger PK still prevents
+    double-counting, so the cost is duplicated effort, not duplicated money.
     """
     with _tx(conn) as cur:
         cur.execute(
             """
-            UPDATE dlq SET status = 'retrying'
+            UPDATE dlq SET status = 'retrying', claimed_at = NOW()
             WHERE id IN (
                 SELECT id FROM dlq
-                WHERE status = 'pending'
-                  AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-                  AND retry_count < max_retries
+                WHERE (
+                        status = 'pending'
+                        AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                        AND retry_count < max_retries
+                      )
+                   OR (
+                        status = 'retrying'
+                        AND (claimed_at IS NULL
+                             OR claimed_at < NOW() - make_interval(secs => %s))
+                      )
                 ORDER BY id
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING id, transaction_id, raw_payload
             """,
-            (batch_size,),
+            (claim_timeout_seconds, batch_size),
         )
         rows = cur.fetchall()
 
@@ -834,12 +901,16 @@ def retry_dlq_batch(
         attempted += 1
         try:
             payload = json.loads(raw_payload_str)
-            result = process_stripe_event(conn, payload)
+            # from_retry=True: this payload is being replayed, so a DLQ_DUPLICATE outcome
+            #     must not append another DLQ row. Without it every retry of an entry whose
+            #     event already reached the ledger left one more pending row behind than it
+            #     consumed, and each of those was itself retry-eligible.
+            result = process_stripe_event(conn, payload, from_retry=True)
             outcome = result.get("outcome", "")
             if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
                 with _tx(conn) as cur:
                     cur.execute(
-                        "UPDATE dlq SET status='resolved' WHERE id=%s",
+                        "UPDATE dlq SET status='resolved', claimed_at=NULL WHERE id=%s",
                         (dlq_id,),
                     )
                 _log.info("dlq_retry resolved id=%s transaction_id=%s", dlq_id, transaction_id)
@@ -847,7 +918,19 @@ def retry_dlq_batch(
                 _increment_retry(conn, dlq_id, transaction_id)
         except Exception as exc:
             _log.error("dlq_retry error id=%s error=%r", dlq_id, exc)
-            _increment_retry(conn, dlq_id, transaction_id)
+            # The recovery UPDATE can fail for the same reason the retry did — the database
+            #     is still unreachable. Unguarded, that exception escaped this loop and left
+            #     every remaining claimed row of the batch stuck in 'retrying'. Contain it
+            #     per row so one bad row cannot abort the rest of the batch.
+            try:
+                _increment_retry(conn, dlq_id, transaction_id)
+            except Exception as inner_exc:
+                _log.critical(
+                    "dlq_retry recovery failed id=%s transaction_id=%s error=%r — "
+                    "entry left in status='retrying'; it will be reclaimed automatically "
+                    "after claim_timeout_seconds=%s",
+                    dlq_id, transaction_id, inner_exc, claim_timeout_seconds,
+                )
 
     return attempted
 
@@ -867,6 +950,10 @@ def _increment_retry(
             """
             UPDATE dlq
             SET retry_count   = retry_count + 1,
+                -- Release the claim in the same statement that decides the next state.
+                -- A row leaving 'retrying' must never keep a claim timestamp, or the
+                -- reclaim query would treat a healthy pending row as a stale claim.
+                claimed_at    = NULL,
                 status        = CASE
                     WHEN retry_count + 1 >= max_retries THEN 'exhausted'
                     ELSE 'pending'
@@ -1304,10 +1391,18 @@ def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_ap
 def dlq_retry(request: Request, dlq_id: int, _: None = Depends(_require_api_key)) -> JSONResponse:
     """
     Manual retry endpoint for a single DLQ entry. Reprocesses the raw_payload
-    immediately regardless of status or retry_count. Useful for ops: fix the
+    immediately, ignoring retry_count and backoff. Useful for ops: fix the
     upstream issue (e.g. bad validator config), then replay specific entries.
     Returns the outcome of the reprocessing attempt.
     Requires X-Api-Key header when BILLING_API_KEY is set.
+
+    'resolved' is terminal and returns 409. A resolved entry means the ledger already
+    holds its event, so replaying it can only ever produce DLQ_DUPLICATE — no work, but
+    it used to mark the row resolved a second time and append a fresh pending DLQ row,
+    which made the queue self-amplifying and let one id be reopened without limit.
+    Every other status ('pending', 'retrying', 'exhausted') stays replayable — that is
+    the point of the endpoint, and it is also the manual escape hatch for an entry whose
+    automatic retries are spent.
     """
     conn = _pool.getconn()
     try:
@@ -1321,14 +1416,20 @@ def dlq_retry(request: Request, dlq_id: int, _: None = Depends(_require_api_key)
             raise HTTPException(status_code=404, detail=f"DLQ entry {dlq_id} not found")
 
         transaction_id, raw_payload_str, current_status = row
+        if current_status == "resolved":
+            raise HTTPException(
+                status_code=409,
+                detail=f"DLQ entry {dlq_id} is already resolved — nothing to replay",
+            )
+
         payload = json.loads(raw_payload_str)
-        result = process_stripe_event(conn, payload)
+        result = process_stripe_event(conn, payload, from_retry=True)
         outcome = result.get("outcome", "")
 
         if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
             with _tx(conn) as cur:
                 cur.execute(
-                    "UPDATE dlq SET status='resolved' WHERE id=%s",
+                    "UPDATE dlq SET status='resolved', claimed_at=NULL WHERE id=%s",
                     (dlq_id,),
                 )
             _log.info("dlq manual retry resolved id=%s transaction_id=%s", dlq_id, transaction_id)
@@ -1419,4 +1520,10 @@ if __name__ == "__main__":
         _run_headless_benchmark(args.events)
     else:
         import uvicorn
-        uvicorn.run("ledger:app", host="0.0.0.0", port=8000, reload=False)  # nosec B104 — intentional: Docker container must bind all interfaces
+        # Binds all interfaces because inside the container nothing else can reach the
+        #     port: compose publishes it on 127.0.0.1:8000 and external traffic arrives
+        #     through Caddy. The nosec is live, not vestigial — bandit emits
+        #     "nosec encountered (B104), but no failed test on line N", which reads like
+        #     a dead suppression, but deleting it makes B104 fire immediately. Verified
+        #     both ways on 2026-08-09; leave it in place.
+        uvicorn.run("ledger:app", host="0.0.0.0", port=8000, reload=False)  # nosec B104

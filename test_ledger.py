@@ -997,7 +997,28 @@ result2 = subprocess.run(
     capture_output=True, text=True,
     env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
 )
-chk("alembic current reports 0002 (head)", "0002" in result2.stdout, result2.stdout.strip())
+# Compare against whatever alembic itself calls head rather than a literal revision.
+#     Hardcoding "0002" made this test fail on the next migration for no real reason,
+#     which trains people to edit the assertion instead of reading it. What actually
+#     matters is that `upgrade head` landed on the latest revision, not its number.
+result_heads = subprocess.run(
+    ["alembic", "heads"],
+    capture_output=True, text=True,
+    env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
+)
+_head_rev = result_heads.stdout.split()[0] if result_heads.stdout.split() else ""
+chk("alembic current is at head",
+    bool(_head_rev) and _head_rev in result2.stdout,
+    f"head={_head_rev!r} current={result2.stdout.strip()!r}")
+
+# dlq.claimed_at arrives in migration 0003 — assert it through the Alembic path too,
+#     not only through _bootstrap(), since production schema comes from Alembic.
+with conn_mig.cursor() as cur:
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'dlq' AND column_name = 'claimed_at'
+    """)
+    chk("dlq.claimed_at exists after alembic upgrade head", cur.fetchone() is not None)
 
 # Test 2 — all three tables exist after migration.
 with conn_mig.cursor() as cur:
@@ -1238,6 +1259,173 @@ chk("old DUPLICATE (>90d) removed",        "evt_old_dup" not in remaining_ids, s
 chk("recent DUPLICATE (10d) kept",         "evt_new_dup" in remaining_ids, str(remaining_ids))
 chk("old INVALID kept (only DUPLICATE pruned)", "evt_old_invalid" in remaining_ids, str(remaining_ids))
 prune_conn.close()
+
+
+# =============================================================================
+# A1: DLQ SELF-AMPLIFICATION (audit 2026-08-09)
+# A retry must never create DLQ rows. The entry being replayed IS the DLQ record
+#     for that payload; its status/retry_count columns carry each attempt's result.
+#     Before the fix, retrying an entry whose event had already reached the ledger
+#     appended a fresh DUPLICATE row and marked the original resolved — one more
+#     pending row than it consumed, each itself retry-eligible. The queue amplified
+#     itself and inflated the dlq_depth operators read to judge ingestion health.
+# =============================================================================
+print("\n── A1: retry does not amplify the DLQ (audit 2026-08-09) ───────────────")
+
+amp_conn = fresh_conn()
+ev_amp = fake_event(eid="evt_amp_001")
+
+chk("1st delivery → POSTED",
+    L.process_stripe_event(amp_conn, ev_amp)["outcome"] == "POSTED")
+chk("Stripe redelivery → DLQ_DUPLICATE",
+    L.process_stripe_event(amp_conn, ev_amp)["outcome"] == "DLQ_DUPLICATE")
+
+_amp_count = lambda: _q1(amp_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_amp_001'")
+chk("redelivery leaves exactly 1 DLQ row", _amp_count() == 1, f"got {_amp_count()}")
+
+r_amp = L.process_stripe_event(amp_conn, ev_amp, from_retry=True)
+chk("retry still reports DLQ_DUPLICATE", r_amp["outcome"] == "DLQ_DUPLICATE", f"got {r_amp}")
+chk("retry appends no DLQ row (was 2 before fix)", _amp_count() == 1, f"got {_amp_count()}")
+
+for _ in range(3):
+    L.process_stripe_event(amp_conn, ev_amp, from_retry=True)
+chk("4 retries still leave 1 DLQ row (was 5 before fix)", _amp_count() == 1, f"got {_amp_count()}")
+chk("money still counted exactly once",
+    _q1(amp_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_amp_001'") == 1)
+
+# The same rule covers INVALID: replaying a malformed payload must not append rows either.
+ev_amp_bad = fake_event(eid="evt_amp_bad", currency="WRONG")
+L.process_stripe_event(amp_conn, ev_amp_bad)
+_bad_count = lambda: _q1(amp_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_amp_bad'")
+chk("invalid payload writes 1 DLQ row on ingest", _bad_count() == 1, f"got {_bad_count()}")
+L.process_stripe_event(amp_conn, ev_amp_bad, from_retry=True)
+L.process_stripe_event(amp_conn, ev_amp_bad, from_retry=True)
+chk("invalid payload retries append no rows", _bad_count() == 1, f"got {_bad_count()}")
+amp_conn.close()
+
+
+# =============================================================================
+# A2: 'resolved' IS TERMINAL (audit 2026-08-09)
+# A resolved entry means the ledger already holds its event, so replaying it can
+#     only produce DLQ_DUPLICATE. The endpoint used to accept it anyway, re-resolve
+#     the row and append another DLQ row, letting one id be reopened without limit.
+# =============================================================================
+print("\n── A2: POST /dlq/{id}/retry rejects a resolved entry ───────────────────")
+
+term_conn = fresh_conn()
+original_pool_term = L._pool
+L._pool = _MockPool(term_conn)
+term_client = TestClient(L.app)
+
+ev_term = fake_event(eid="evt_term_001")
+L.process_stripe_event(term_conn, ev_term)
+L.process_stripe_event(term_conn, ev_term)
+term_dlq_id = _q1(term_conn, "SELECT id FROM dlq WHERE transaction_id='evt_term_001' ORDER BY id LIMIT 1")
+
+r_t1 = term_client.post(f"/dlq/{term_dlq_id}/retry")
+chk("1st manual retry → 200", r_t1.status_code == 200, f"got {r_t1.status_code}: {r_t1.text}")
+chk("entry marked resolved",
+    _q1(term_conn, "SELECT status FROM dlq WHERE id=%s", (term_dlq_id,)) == "resolved")
+
+_term_count = lambda: _q1(term_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_term_001'")
+chk("manual retry appends no DLQ row", _term_count() == 1, f"got {_term_count()}")
+
+r_t2 = term_client.post(f"/dlq/{term_dlq_id}/retry")
+chk("2nd manual retry on resolved → 409 (was 200)", r_t2.status_code == 409, f"got {r_t2.status_code}")
+chk("409 body names the entry", str(term_dlq_id) in r_t2.text, f"got {r_t2.text}")
+chk("rejected retry appends no DLQ row (was 3)", _term_count() == 1, f"got {_term_count()}")
+
+# 'exhausted' must stay replayable — it is the operator's escape hatch.
+L._write_dlq(term_conn, L.DLQEntry(transaction_id="evt_term_exh",
+                                   reason=L.DLQReason.TRANSIENT,
+                                   raw_payload=fake_event(eid="evt_term_exh")))
+exh_id = _q1(term_conn, "SELECT id FROM dlq WHERE transaction_id='evt_term_exh' ORDER BY id DESC LIMIT 1")
+with term_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("UPDATE dlq SET status='exhausted' WHERE id=%s", (exh_id,))
+    c.execute("COMMIT")
+chk("exhausted entry is still replayable (not 409)",
+    term_client.post(f"/dlq/{exh_id}/retry").status_code == 200)
+
+L._pool = original_pool_term
+term_conn.close()
+
+
+# =============================================================================
+# A3: STALE RETRY CLAIMS ARE RECLAIMED (audit 2026-08-09)
+# retry_dlq_batch commits the claim (status='retrying') before doing the work, so a
+#     crash — or a failure inside the recovery UPDATE, likely because the outage that
+#     caused the retry is still going — left rows claimed forever. The claim query only
+#     selected status='pending', so nothing ever looked at them again: not pending, not
+#     resolved, not exhausted, and invisible to the operator's own retry mechanism.
+# =============================================================================
+print("\n── A3: stranded 'retrying' rows recover automatically ──────────────────")
+
+claim_conn = fresh_conn()
+chk("dlq.claimed_at exists (migration 0003 / _bootstrap parity)",
+    _q1(claim_conn,
+        "SELECT COUNT(*) FROM information_schema.columns "
+        "WHERE table_name='dlq' AND column_name='claimed_at'") == 1)
+
+with claim_conn.cursor() as c:
+    c.execute("BEGIN")
+    for i in range(3):
+        c.execute(
+            "INSERT INTO dlq (transaction_id, reason, raw_payload, status, retry_count, max_retries) "
+            "VALUES (%s, %s, %s, 'pending', 0, 3)",
+            (f"evt_claim_{i}", "TRANSIENT", json.dumps({"id": f"evt_claim_{i}", "type": "bogus.type"})),
+        )
+    c.execute("COMMIT")
+
+# Row 1's recovery fails on BOTH the normal call and the guarded retry inside the
+#     except handler — the realistic case, and the only one that actually strands a
+#     row. A single-failure stub recovers on the second call and would make the
+#     reclaim assertions below pass without ever testing them.
+_real_increment = L._increment_retry
+_STRANDED = "evt_claim_1"
+
+def _flaky_increment(c, dlq_id_, txid):
+    if txid == _STRANDED:
+        raise RuntimeError("simulated connection drop mid-recovery")
+    return _real_increment(c, dlq_id_, txid)
+
+L._increment_retry = _flaky_increment
+try:
+    attempted = L.retry_dlq_batch(claim_conn)
+    batch_raised = None
+except Exception as _exc:            # noqa: BLE001
+    attempted, batch_raised = -1, _exc
+finally:
+    L._increment_retry = _real_increment
+
+chk("batch does not propagate a recovery failure", batch_raised is None, f"raised {batch_raised!r}")
+chk("batch attempts all 3 rows despite one failing", attempted == 3, f"got {attempted}")
+
+stranded = [r[0] for r in _qall(claim_conn,
+            "SELECT transaction_id FROM dlq WHERE status='retrying' ORDER BY id")]
+chk("exactly the doubly-failed row is left claimed", stranded == [_STRANDED], f"got {stranded}")
+chk("other rows still processed — one bad row does not abort the batch",
+    _q1(claim_conn, "SELECT COUNT(*) FROM dlq WHERE status='pending' AND retry_count=1") == 2)
+
+chk("a live claim is not stolen inside its timeout",
+    L.retry_dlq_batch(claim_conn, claim_timeout_seconds=900) == 0)
+
+chk("stale claim is reclaimed (was invisible forever)",
+    L.retry_dlq_batch(claim_conn, claim_timeout_seconds=0) == 1)
+chk("reclaimed row reaches a terminal state",
+    _q1(claim_conn, "SELECT status FROM dlq WHERE transaction_id=%s", (_STRANDED,))
+    in ("pending", "exhausted"))
+chk("no row outside 'retrying' keeps a claim timestamp",
+    _q1(claim_conn, "SELECT COUNT(*) FROM dlq WHERE status <> 'retrying' AND claimed_at IS NOT NULL") == 0)
+
+# A row stranded before migration 0003 has claimed_at NULL — treat it as infinitely stale.
+with claim_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("UPDATE dlq SET status='retrying', claimed_at=NULL WHERE transaction_id=%s", (_STRANDED,))
+    c.execute("COMMIT")
+chk("pre-migration claim (claimed_at NULL) is reclaimed",
+    L.retry_dlq_batch(claim_conn, claim_timeout_seconds=900) == 1)
+claim_conn.close()
 
 
 # =============================================================================
