@@ -6,10 +6,20 @@
 #     Install with: pip install -r requirements.txt
 #
 
-# FastAPI 0.115.0 — HTTP framework for the webhook endpoint and summary/DLQ routes.
+# FastAPI 0.115.14 — HTTP framework for the webhook endpoint and summary/DLQ routes.
 #     Chosen over Flask because it ships async support, automatic OpenAPI docs, and
-#     Pydantic v2 integration out of the box. 0.115.0 is stable and tested.
-fastapi==0.115.0
+#     Pydantic v2 integration out of the box.
+#
+#     Was 0.115.0, which pins starlette<0.39.0. Starlette below 0.40.0 carries
+#     GHSA-f96h-pmfr-66vw (CVE-2024-47874): unbounded multipart form parsing, a
+#     denial of service. This project exposes no multipart endpoint, so real
+#     exposure was low — but the vulnerable version sat in the dependency tree and
+#     any scanner would flag it. Dependabot did not, because starlette is not in
+#     this manifest; it arrives through FastAPI's pin range, which is exactly how a
+#     transitive advisory goes unnoticed.
+#     0.115.14 requires starlette>=0.40.0 and is the last patch of the same minor
+#     line, so the upgrade carries no API change. Verified: 213/213.
+fastapi==0.115.14
 
 # uvicorn[standard] 0.30.6 — ASGI server that runs the FastAPI app.
 #     [standard] includes uvloop (faster event loop, C extension) and httptools

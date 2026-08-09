@@ -54,7 +54,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    restart: "no"
+    # on-failure, not "no". `docker compose up` honours the service_healthy condition
+    #     above, but `docker compose restart` does NOT — it bounces containers without
+    #     re-evaluating depends_on, so this service came back while postgres was still
+    #     restarting and died on "connection to server at postgres ... refused".
+    #     Nothing was lost (the schema was already at head and the API stayed healthy),
+    #     but it left a red Exited (1) next to four healthy services, which reads as a
+    #     broken deploy to anyone who runs restart and looks at `docker compose ps`.
+    #     Three attempts covers the seconds postgres needs; a genuinely bad migration
+    #     still fails and still stops, because alembic is deterministic — retrying it
+    #     cannot turn a broken migration into a working one.
+    restart: on-failure:3
 
   # ---------------------------------------------------------------------------
   # billing — the FastAPI application
