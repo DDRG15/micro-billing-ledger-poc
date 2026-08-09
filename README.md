@@ -3,11 +3,12 @@
 
 [![Tests](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml)
 [![Lint](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml)
+[![Stack](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/stack.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/stack.yml)
 
-**Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The open gaps are listed at the bottom of this file — chiefly blind observability (no structured JSON logging or Prometheus metrics), per-event-type amount extraction, and currency normalization. Each gap lists the exact fix.
+**Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 148 / 148 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 213 / 213 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** ~5,000 TPS (batch) · 500+ TPS (single-event) · both on Docker-on-Windows localhost
 
 ---
@@ -40,7 +41,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 3. Run the full test suite — 148 tests, live PostgreSQL, no mocks
+# 3. Run the full test suite — 213 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 4. Configure environment — safe dev defaults work immediately
@@ -164,7 +165,15 @@ The `dispatched=1` update happens in the **same `BEGIN…COMMIT`** as the dispat
 
 **Async/Sync Thread Dispatch** — All database-hitting routes — `POST /webhook/stripe`, `/ledger/summary`, `/dlq/entries` — are declared `def`, not `async def`. FastAPI runs synchronous routes in an external thread pool, so psycopg2's blocking calls never stall the asyncio event loop. The webhook handler reads the raw body from `request._body` (cached by Starlette when it parses the request) for HMAC verification — no `await` needed.
 
-**Rate Limiting** — `slowapi` enforces 100 req/min on `POST /webhook/stripe` and 20 req/min on the read endpoints, keyed by client IP. Behind the Caddy proxy the app runs with `--proxy-headers --forwarded-allow-ips=*`, so the limiter keys on the real client IP from `X-Forwarded-For` rather than the proxy address — without that, every request shares one bucket. A webhook flood without rate limiting exhausts `maxconn=20` and drives `outbox_pending` unbounded. The 429 response instructs Stripe to back off; Stripe's own retry logic handles redelivery.
+**Rate Limiting** — `slowapi` enforces 100 req/min on `POST /webhook/stripe` and 20 req/min on the read endpoints, keyed by client IP. A webhook flood without rate limiting exhausts `maxconn=20` and drives `outbox_pending` unbounded. The 429 response instructs Stripe to back off; Stripe's own retry logic handles redelivery.
+
+Behind Caddy the app runs with `--proxy-headers` and trusts `X-Forwarded-For` **only from Caddy's address**, set via `FORWARDED_ALLOW_IPS` and pinned to a static container IP. The limiter therefore keys on the real client rather than the proxy, without letting the client choose its own key.
+
+The obvious shortcut here is wrong and worth stating plainly. `--forwarded-allow-ips=*` sets `always_trust=True` in uvicorn's `ProxyHeadersMiddleware`, which returns `x_forwarded_for_hosts[0]` — the leftmost, entirely caller-supplied entry. Any client can then rotate the header to mint a fresh bucket every 100 requests, or forge a specific customer's IP to poison theirs. Pinning to Caddy's address makes uvicorn walk the header from the right and stop at the first untrusted hop, which is the real client, because Caddy appends rather than overwrites.
+
+One version-specific trap: uvicorn 0.30.6 compares this value as an **exact string**, not a CIDR range. `172.28.0.0/16` matches nothing, silently disabling `X-Forwarded-For` and collapsing the limiter into a single global bucket — the failure looks like a fix. Hence a literal address plus a fixed `ipv4_address` in `docker-compose.yml`.
+
+Verified end to end, not just traced: two containers with distinct addresses hit Caddy, one exhausted its bucket to 429 keyed on its own IP while the other still passed, and a forged header from an untrusted peer no longer reset the limit. `.github/workflows/stack.yml` asserts the bypass stays closed.
 
 **Log Rotation** — `RotatingFileHandler(maxBytes=10MB, backupCount=5)` caps log storage at 50 MB. At 500 TPS under DLQ write failures, each logging a full raw payload as JSON, an unbounded log file fills a typical root partition in under an hour. The 5-file backup retains enough history for forensics without infinite growth.
 
@@ -284,14 +293,26 @@ CREATE TABLE outbox (
 CREATE TABLE dlq (
     id             BIGSERIAL   PRIMARY KEY,
     transaction_id TEXT        NOT NULL,
-    reason         TEXT        NOT NULL,   -- DUPLICATE | INVALID
+    reason         TEXT        NOT NULL,   -- DUPLICATE | INVALID | TRANSIENT | UNKNOWN_TYPE
     raw_payload    TEXT        NOT NULL,
-    received_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    received_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Retry budget (migration 0002)
+    status         TEXT        NOT NULL DEFAULT 'pending',  -- pending | retrying | resolved | exhausted
+    retry_count    INTEGER     NOT NULL DEFAULT 0,
+    max_retries    INTEGER     NOT NULL DEFAULT 3,
+    next_retry_at  TIMESTAMPTZ,
+    -- Claim timestamp (migration 0003). retry_dlq_batch commits its claim before
+    -- doing the work, so without this a crash mid-batch left rows in 'retrying'
+    -- that no later batch would ever select again. NULL counts as infinitely
+    -- stale, which recovers rows stranded before this column existed.
+    claimed_at     TIMESTAMPTZ
 );
 
 -- Indexes for hot query paths
 CREATE INDEX IF NOT EXISTS idx_ledger_customer_id ON ledger(customer_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WHERE dispatched=0;
+CREATE INDEX IF NOT EXISTS idx_dlq_retry ON dlq(status, next_retry_at) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS idx_dlq_stale_claim ON dlq(status, claimed_at) WHERE status='retrying';
 ```
 
 | Status | Event types | Meaning |
@@ -310,6 +331,37 @@ CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WH
 | `GET` | `/health` | Liveness check |
 | `GET` | `/ledger/summary` | Row counts by status, DLQ depth, outbox pending count |
 | `GET` | `/dlq/entries?limit=N` | Inspect DLQ, newest first. Default 50, capped at 1,000. |
+| `POST` | `/dlq/{id}/retry` | Replay one entry. `409` if already `resolved` — the ledger holds it, so there is nothing to replay. `exhausted` stays replayable. |
+| `GET` | `/metrics` | Prometheus exposition. Requires `X-Api-Key`. |
+
+---
+
+## Observability
+
+**Structured logs.** `LOG_FORMAT=json` (the default in containers) emits one JSON object per line. Anything passed through `extra={...}` becomes a top-level field, so `transaction_id`, `outcome`, `duration_ms`, `path` and `status` are queryable directly:
+
+```json
+{"ts":"2026-08-09T18:07:47+00:00","level":"INFO","logger":"ledger","message":"request POST /webhook/stripe -> 200",
+ "event":"http_request","method":"POST","path":"/webhook/stripe","status":200,"duration_ms":12.6,"client_ip":"203.0.113.9"}
+```
+
+Plain text is unparseable at the moment you most need it: *"which `transaction_id` failed, how often, and how slow was it"* becomes a regex against a human sentence, and that regex breaks the next time someone rewords a log line. Consumers here read keys, not prose. Records are always one line — log shippers split on newlines, so a multi-line record arrives as several unparseable fragments — and tracebacks are folded into a single string field for the same reason. `worker.py` reuses the same formatter: two services logging the same event in two shapes cannot be correlated on `transaction_id`, which is exactly the field you want when tracing an event from ingest through to dispatch.
+
+**Metrics.** `GET /metrics` exposes `webhook_events_total{outcome}`, `http_requests_total{method,path,status}`, `http_request_duration_seconds{method,path}`, plus `dlq_depth` and `outbox_pending`.
+
+Labels use the route **template** (`/dlq/{dlq_id}/retry`), never the resolved path. Labelling by resolved path gives every id its own time series — the standard way to take down a Prometheus server with your own instrumentation.
+
+The two queue gauges are read from the database on each scrape rather than tracked in memory. The worker drains the outbox and prunes the DLQ from a different process, so an in-memory count would diverge from the tables it claims to describe, and a queue depth that is confidently wrong is worse than no queue depth at all.
+
+`/metrics` requires `X-Api-Key` because it publishes the same operational figures as `/ledger/summary`; locking one door and leaving the other open is not a boundary. Scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: billing
+    authorization: {type: X-Api-Key, credentials_file: /etc/prom/billing.key}
+```
+
+---
 
 **DLQ Operationalization** — `GET /dlq/entries` is the ops interface for triage. Every rejected event lands in the DLQ with its `raw_payload` preserved byte-perfect — never corrected, never truncated. In fintech, a rejected payment event without a recoverable audit trail is a compliance gap, not a logging inconvenience. An operator retrieves entries, inspects the reason code, fixes the upstream issue, and replays the original payload.
 
@@ -318,7 +370,7 @@ CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WH
 ## Test Coverage
 
 ```
-148 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+213 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -328,8 +380,16 @@ Phase 5    Full stack     — HTTP 200/400/422/503, HMAC signature, 5-thread con
 Phase 7    Outbox worker  — drain_batch dispatch + dispatched_at, SKIP LOCKED, idempotent re-drain
 Phase 10   Migrations     — alembic upgrade/downgrade round-trip, schema parity with _bootstrap()
 Phase 11   DLQ retry      — TRANSIENT backoff, exhaustion, manual POST /dlq/{id}/retry
+Phase 12   Observability  — JSON formatter (field promotion, one line, traceback folding,
+                            unserializable degradation), /metrics shape, outcome labels,
+                            route-template cardinality, gauge-vs-table agreement, auth
+A0         Amount extract — per-event-type field priority; unknown amount → DLQ, never $0
+A1 / A2    DLQ integrity  — retry appends no rows; 'resolved' terminal (409); 'exhausted' replayable
+A3         Claim recovery — stale claim reclaimed, live claim not stolen, batch not aborted
 M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), prune_dlq retention
 ```
+
+**Mutation-verified.** A passing suite proves nothing until you watch it fail. Nine deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch.
 
 **Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
 
@@ -353,14 +413,24 @@ assert ledger_row_count == 1               # verified by a separate connection
 
 | Gap | Priority | Status | Fix |
 |---|---|---|---|
+| Runtime ingress (Caddy) | **CRITICAL** | Done | `CADDY_DOMAIN` never reached the Caddy container, so `{$CADDY_DOMAIN}` expanded to nothing, the site block degenerated into a global options block, and Caddy crash-looped on every `up` — HTTPS ingress had never worked. Fixed, plus an admin-API healthcheck so nothing gates on a container that silently never started. |
+| `X-Forwarded-For` trust | **HIGH** | Done | Was `--forwarded-allow-ips "*"`, letting any caller pick its own rate-limit bucket. Now pinned to Caddy's static address. See *Rate Limiting* above. |
+| Container healthcheck | **HIGH** | Done | Probed bare `localhost`, which musl resolves to `::1` while uvicorn binds IPv4 only — a healthy service reported `unhealthy` on every start. Now probes `127.0.0.1`. |
+| DLQ self-amplification | **HIGH** | Done | Retrying an entry whose event already reached the ledger appended a *new* DLQ row while resolving the old one, so the queue grew by one row per retry and `dlq_depth` became inflatable by retry activity. A replay now never creates DLQ rows, and `resolved` is terminal (409). |
+| Stranded retry claims | **HIGH** | Done | `retry_dlq_batch` commits its claim before doing the work; a failure in the recovery path left rows in `retrying` that the claim query never selected again. Migration 0003 adds `claimed_at`; stale claims are reclaimed automatically. |
 | Outbox worker | **HIGH** | Done | Standalone Docker service — `SELECT FOR UPDATE SKIP LOCKED`, exponential backoff, SIGTERM-safe. |
 | DLQ retry budget | **HIGH** | Done | `retry_count`/`max_retries`/`next_retry_at` columns, exponential backoff, `POST /dlq/{id}/retry`, and a worker retry loop are implemented. Only `TRANSIENT` entries auto-retry; nothing in the live ingest path classifies an event as `TRANSIENT` yet (single-event DB failures return 503 so Stripe retries). The mechanism is provisioned for a future non-Stripe / async source with no upstream retrier. |
 | DLQ retention | **MEDIUM** | Done | `prune_dlq()` deletes `DUPLICATE` rows older than 90 days; the worker runs it at most once per hour. Without retention, Stripe's at-least-once redelivery grows the `dlq` table without bound. |
 | Schema migrations | **HIGH** | Done | Alembic migrations in `alembic/versions/` manage the production schema; the `migrate` service runs `alembic upgrade head` before the API starts. `_bootstrap()` mirrors the DDL with `IF NOT EXISTS` guards so CI runs against the same schema. |
-| Per-event-type amount extraction | **MEDIUM** | Open | Unknown amount → DLQ instead of silently recording $0. |
-| Structured JSON logging | **MEDIUM** | Open | JSON logs with `transaction_id`, `outcome`, `duration_ms` per request. |
-| Prometheus `/metrics` | **MEDIUM** | Open | `webhooks_received_total`, `webhooks_posted_total`, `dlq_depth`, `outbox_pending`. |
-| Currency normalization | **LOW** | Open | `.lower()` on ingest. One line. Mixed-case breaks `GROUP BY currency` in finance reports. |
+| Per-event-type amount extraction | **MEDIUM** | Done | A failed invoice carries `amount_paid=0` with the real figure in `amount_due`, so reading `amount_paid` for every type dead-lettered every `invoice.payment_failed` — the events dunning runs on. `_AMOUNT_FIELDS_BY_TYPE` now maps each type to its field priority. An event with no amount field at all still routes to the DLQ: an unknown amount recorded as $0 reconciles cleanly and is therefore invisible. |
+| Structured JSON logging | **MEDIUM** | Done | `LOG_FORMAT=json` emits one JSON object per line; `transaction_id`, `outcome`, `duration_ms`, `path` and `status` are top-level fields. API and worker share the formatter so an event can be correlated from ingest to dispatch. |
+| Prometheus `/metrics` | **MEDIUM** | Done | `webhook_events_total{outcome}`, `http_requests_total`, `http_request_duration_seconds`, `dlq_depth`, `outbox_pending`. Key-protected, labelled by route template. |
+| Currency normalization | **LOW** | Done | Lowercased at the entry boundary by a `mode="before"` validator, so `USD` is accepted and stored as `usd` rather than dead-lettered. `LedgerEntry` still rejects un-normalized input as a second layer. |
+| Dependency pins | **MEDIUM** | Done | `psycopg2-binary==2.9.9` had no cp313 wheel, so the documented "Python 3.12+" prerequisite could not be followed. Bumped to 2.9.12; supported range stated explicitly. |
+| CI blind spot | **HIGH** | Done | No workflow built the image or started compose, which is why the three runtime findings above survived four audit cycles with green badges. `stack.yml` now builds, boots, and attacks the stack. |
+| Multi-tenancy | — | Not attempted | Needs a tenant column on every table, a migration that backfills existing rows, and a tenant-scoped auth model. A half-built version is worse than none: cross-tenant reads would look like ordinary queries. |
+| GDPR / LGPD erasure | — | Not attempted | Conflicts directly with the append-only ledger this system is built around. Resolving that needs a documented retention and pseudonymization policy first, not code. |
+| PgBouncer + Kubernetes | — | Not attempted | Deployment topology, not application behavior. The `--workers 1` / `maxconn=20` note above is the prerequisite to settle first. |
 
 ---
 
@@ -372,4 +442,4 @@ In billing, a single race condition is a financial discrepancy. This system trea
 
 ---
 
-*Diego Alonso Del Río García — June 11, 2026*
+*Diego Alonso Del Río García — August 9, 2026*
