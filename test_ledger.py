@@ -1551,17 +1551,22 @@ _rec.outcome = "POSTED"
 _rec.duration_ms = 12.5
 _parsed = json.loads(_json_fmt.format(_rec))
 
+# .get() throughout: a missing key must report FAIL, not raise a KeyError that
+#     aborts every remaining section of the suite.
 chk("log line is valid JSON",                    isinstance(_parsed, dict))
 chk("message is interpolated, not a format string",
-    _parsed["message"] == "webhook processed POSTED", f"got {_parsed['message']!r}")
-chk("level is present",                          _parsed["level"] == "INFO")
-chk("logger name is present",                    _parsed["logger"] == "ledger")
+    _parsed.get("message") == "webhook processed POSTED", f"got {_parsed.get('message')!r}")
+chk("level is present",                          _parsed.get("level") == "INFO")
+chk("logger name is present",                    _parsed.get("logger") == "ledger")
 chk("timestamp is ISO-8601 with timezone",
-    "T" in _parsed["ts"] and ("+" in _parsed["ts"] or _parsed["ts"].endswith("Z")),
-    f"got {_parsed['ts']!r}")
-chk("extra= transaction_id promoted to top level", _parsed["transaction_id"] == "evt_json_001")
-chk("extra= outcome promoted to top level",        _parsed["outcome"] == "POSTED")
-chk("extra= duration_ms promoted to top level",    _parsed["duration_ms"] == 12.5)
+    "T" in _parsed.get("ts", "") and ("+" in _parsed.get("ts", "") or _parsed.get("ts", "").endswith("Z")),
+    f"got {_parsed.get('ts')!r}")
+chk("extra= transaction_id promoted to top level",
+    _parsed.get("transaction_id") == "evt_json_001", f"got {_parsed.get('transaction_id')!r}")
+chk("extra= outcome promoted to top level",
+    _parsed.get("outcome") == "POSTED", f"got {_parsed.get('outcome')!r}")
+chk("extra= duration_ms promoted to top level",
+    _parsed.get("duration_ms") == 12.5, f"got {_parsed.get('duration_ms')!r}")
 
 # One record must never span multiple lines: shippers split on newlines, so a
 #     multi-line record arrives as several unparseable fragments.
@@ -1593,7 +1598,7 @@ _rec_odd = logging.LogRecord(
 )
 _rec_odd.when = datetime(2026, 8, 9, 12, 0, 0)
 chk("non-serializable extra degrades to string instead of raising",
-    "2026-08-09" in json.loads(_json_fmt.format(_rec_odd))["when"])
+    "2026-08-09" in str(json.loads(_json_fmt.format(_rec_odd)).get("when", "")))
 
 
 # =============================================================================
