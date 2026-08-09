@@ -1,0 +1,114 @@
+# stack.yml — build and run the real docker-compose stack, then attack it.
+#
+# Why this workflow exists: test.yml runs the suite against a bare PostgreSQL
+#     service container and lint.yml runs static analysis. Neither builds the
+#     image or starts compose, so an entire class of defect was invisible to CI —
+#     a deploy could go green while the actual ingress path was dead. Three
+#     findings from the 2026-08-09 audit lived in exactly that blind spot:
+#
+#       - Caddy crash-looped on every `up` (CADDY_DOMAIN never reached the
+#         container), so HTTPS ingress had never once worked.
+#       - The billing healthcheck probed bare "localhost", resolved ::1 under
+#         musl, and reported unhealthy forever against a working app.
+#       - uvicorn ran with --forwarded-allow-ips "*", letting any caller forge
+#         X-Forwarded-For and pick its own rate-limit bucket.
+#
+#     Each assertion below fails if its fix is reverted. This is the regression
+#     net for the runtime topology, not for application logic.
+
+name: Stack
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  stack:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env from example
+        run: cp .env.example .env
+
+      - name: Build and start the full stack
+        run: docker compose up -d --build
+
+      - name: Wait for services to report healthy
+        run: |
+          for i in $(seq 1 30); do
+            unhealthy=$(docker compose ps --format '{{.Service}} {{.Status}}' \
+              | grep -E 'billing|caddy|postgres' \
+              | grep -vc 'healthy' || true)
+            if [ "$unhealthy" -eq 0 ]; then
+              echo "all services healthy after ${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "services did not converge to healthy:"
+          docker compose ps
+          docker compose logs --tail 50
+          exit 1
+
+      # --- Regression: Caddy must actually start (2026-08-09 CRITICAL) --------
+      - name: Caddy is healthy, not crash-looping
+        run: |
+          status=$(docker compose ps --format '{{.Service}} {{.Status}}' | grep '^caddy')
+          echo "caddy: $status"
+          echo "$status" | grep -q 'healthy' \
+            || { echo "FAIL: caddy is not healthy"; docker compose logs caddy; exit 1; }
+          echo "$status" | grep -qi 'restarting' \
+            && { echo "FAIL: caddy is crash-looping"; docker compose logs caddy; exit 1; }
+          exit 0
+
+      # --- Regression: billing healthcheck must not be a false negative ------
+      - name: Billing container reports healthy
+        run: |
+          status=$(docker compose ps --format '{{.Service}} {{.Status}}' | grep '^billing')
+          echo "billing: $status"
+          echo "$status" | grep -q 'healthy' \
+            || { echo "FAIL: billing healthcheck is failing"; docker compose logs billing; exit 1; }
+
+      # --- Regression: HTTPS ingress through Caddy must serve traffic --------
+      - name: Health endpoint answers through the Caddy HTTPS ingress
+        run: |
+          code=$(curl -sk -o /dev/null -w '%{http_code}' https://localhost/health)
+          echo "https://localhost/health -> $code"
+          [ "$code" = "200" ] || { echo "FAIL: ingress not serving"; docker compose logs caddy; exit 1; }
+
+      - name: Security headers are applied at the proxy
+        run: |
+          hdrs=$(curl -skI https://localhost/health)
+          echo "$hdrs"
+          echo "$hdrs" | grep -qi 'X-Frame-Options: DENY'          || { echo "FAIL: X-Frame-Options"; exit 1; }
+          echo "$hdrs" | grep -qi 'X-Content-Type-Options: nosniff' || { echo "FAIL: X-Content-Type-Options"; exit 1; }
+          echo "$hdrs" | grep -qi 'Strict-Transport-Security'       || { echo "FAIL: HSTS"; exit 1; }
+
+      # --- Regression: forged X-Forwarded-For must not reset the limiter -----
+      - name: Rate limiter cannot be bypassed by rotating X-Forwarded-For
+        run: |
+          post() {
+            curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/webhook/stripe \
+              -H "X-Forwarded-For: $1" -H 'Content-Type: application/json' \
+              -H 'Stripe-Signature: t=1,v1=bad' -d '{"id":"evt_ci_spoof","type":"invoice.paid"}'
+          }
+          for i in $(seq 1 101); do last=$(post 203.0.113.9); done
+          echo "after 101 requests with forged XFF 203.0.113.9 -> $last"
+          [ "$last" = "429" ] || { echo "FAIL: limiter never engaged (got $last)"; exit 1; }
+
+          rotated=$(post 203.0.113.200)
+          echo "rotated forged XFF 203.0.113.200 -> $rotated"
+          [ "$rotated" = "429" ] \
+            || { echo "FAIL: forged X-Forwarded-For bypassed the rate limiter (got $rotated)"; exit 1; }
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v --remove-orphans

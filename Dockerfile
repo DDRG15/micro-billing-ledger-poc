@@ -79,12 +79,22 @@ EXPOSE 8000
 #       For higher concurrency, switch to Gunicorn + uvicorn workers — each worker
 #       gets its own pool, so connections = workers × maxconn.
 #     --no-access-log: reduces log noise; structured application logs handle observability.
-#     --proxy-headers --forwarded-allow-ips=*: billing is only reachable through Caddy,
-#       so request.client.host is Caddy's container IP. Without these, slowapi's
-#       get_remote_address keys every client to that one IP and the per-IP rate limit
-#       becomes a single global bucket. Honoring X-Forwarded-For (set by Caddy) restores
-#       real per-client limiting. "*" is safe here: the only ingress is the trusted proxy.
+#     --proxy-headers: honor X-Forwarded-For so slowapi's get_remote_address keys the
+#       rate limiter on the real client instead of the proxy's container IP.
+#
+#     Which peers are trusted to set that header is deliberately NOT baked into the
+#     image — it is deployment topology, not build configuration. uvicorn reads the
+#     FORWARDED_ALLOW_IPS environment variable when the flag is absent and defaults to
+#     127.0.0.1 (config.py: os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1")).
+#     docker-compose.yml pins it to Caddy's static address.
+#
+#     This previously passed --forwarded-allow-ips "*". That set always_trust=True in
+#     uvicorn's ProxyHeadersMiddleware, which returns x_forwarded_for_hosts[0] — the
+#     leftmost, entirely caller-supplied entry — so any client could pick its own
+#     rate-limit bucket by rotating the header, and could also forge a victim's IP to
+#     poison their bucket. The "only ingress is the trusted proxy" assumption behind it
+#     was false: docker-compose also publishes this service on 127.0.0.1:8000.
 CMD ["python", "-m", "uvicorn", "ledger:app", \
      "--host", "0.0.0.0", "--port", "8000", \
      "--workers", "1", "--no-access-log", \
-     "--proxy-headers", "--forwarded-allow-ips", "*"]
+     "--proxy-headers"]

@@ -16,6 +16,7 @@ services:
   # ---------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
+    networks: [billing_net]
     environment:
       POSTGRES_USER:     ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -38,6 +39,7 @@ services:
   # ---------------------------------------------------------------------------
   migrate:
     build: .
+    networks: [billing_net]
     command: alembic upgrade head
     environment:
       DATABASE_URL: ${DATABASE_URL}
@@ -51,10 +53,22 @@ services:
   # ---------------------------------------------------------------------------
   billing:
     build: .
+    networks: [billing_net]
     environment:
       DATABASE_URL:            ${DATABASE_URL}
       STRIPE_WEBHOOK_SECRET:   ${STRIPE_WEBHOOK_SECRET}
       BILLING_API_KEY:         ${BILLING_API_KEY}
+      # Which peer addresses may set X-Forwarded-For. uvicorn reads this env var
+      #     when --forwarded-allow-ips is absent from the command line.
+      #     Pinned to Caddy's static address (see the caddy service below) — NOT "*".
+      #     With "*", uvicorn's ProxyHeadersMiddleware sets always_trust=True and
+      #     returns x_forwarded_for_hosts[0], the leftmost and fully caller-supplied
+      #     entry, so any client could forge its own rate-limit bucket key.
+      #     WARNING: uvicorn 0.30.6 matches this value as an exact string, not a CIDR
+      #     (proxy_headers.py builds a set() and tests `host in trusted_hosts`).
+      #     A subnet like 172.28.0.0/16 here would match nothing and silently
+      #     disable X-Forwarded-For entirely. Use a literal address.
+      FORWARDED_ALLOW_IPS:     ${FORWARDED_ALLOW_IPS:-172.28.0.10}
     ports:
       # Exposed on localhost only for local development and tests.
       #     In production, traffic reaches billing through Caddy (port 443).
@@ -68,7 +82,12 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      # 127.0.0.1, never bare "localhost". In the Alpine/musl runtime image
+      #     localhost resolves to both ::1 and 127.0.0.1, musl returns ::1 first,
+      #     and uvicorn binds IPv4 only (--host 0.0.0.0) — so a "localhost" probe
+      #     gets Connection refused and the container reports unhealthy forever
+      #     while the app is fine. Same rule applies to any k8s liveness probe.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -84,6 +103,7 @@ services:
   # ---------------------------------------------------------------------------
   worker:
     build: .
+    networks: [billing_net]
     command: python worker.py
     environment:
       DATABASE_URL:        ${DATABASE_URL}
@@ -106,6 +126,20 @@ services:
   # ---------------------------------------------------------------------------
   caddy:
     image: caddy:2-alpine
+    networks:
+      billing_net:
+        # Static address so the billing service can pin FORWARDED_ALLOW_IPS to a
+        #     literal peer address. Without a fixed IP, Docker assigns Caddy a new
+        #     address on every recreate and the pin breaks silently.
+        ipv4_address: 172.28.0.10
+    environment:
+      # Caddy resolves {$CADDY_DOMAIN} in the Caddyfile from its OWN process
+      #     environment. docker-compose's ${...} substitution applies to this YAML
+      #     file, not inside the container, so without this line the placeholder
+      #     expands to nothing: the site block degenerates into a global options
+      #     block and Caddy aborts with "unrecognized global option: reverse_proxy".
+      #     restart: unless-stopped then crash-loops it forever.
+      CADDY_DOMAIN: ${CADDY_DOMAIN}
     ports:
       - "80:80"
       - "443:443"
@@ -116,6 +150,28 @@ services:
     depends_on:
       - billing
     restart: unless-stopped
+    healthcheck:
+      # Caddy's admin API answers only once the config parsed and the server started.
+      #     Nothing previously gated on Caddy coming up, which is how the crash-loop
+      #     above survived undetected: `docker compose up` exits 0 either way.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+# ---------------------------------------------------------------------------
+# Explicit user-defined network with a fixed subnet.
+# Required so caddy can hold a static address (see FORWARDED_ALLOW_IPS on the
+#     billing service). Declaring any network here replaces the implicit default,
+#     so every service must join it explicitly or lose DNS name resolution.
+# ---------------------------------------------------------------------------
+networks:
+  billing_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
 
 volumes:
   pgdata:
