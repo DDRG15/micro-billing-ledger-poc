@@ -9,7 +9,7 @@
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
 **Tests:** 213 / 213 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
-**Throughput:** ~5,000 TPS (batch) · 500+ TPS (single-event) · both on Docker-on-Windows localhost
+**Throughput:** ~5,000 TPS batch ingest (`execute_values`) · 26 TPS per-event, the cost of 4 synchronous round trips per event · measured on Docker-on-Windows localhost, see Performance Benchmarks
 
 ---
 
