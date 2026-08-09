@@ -154,10 +154,25 @@ ev_valid = fake_event(currency="usd")
 r = L.process_stripe_event(conn, ev_valid)
 chk("currency 'usd' → POSTED",                  r["outcome"] == "POSTED")
 
-ev_uppercase = fake_event(eid="evt_invalid_curr_1", currency="USD")
+# Uppercase is normalized, not rejected. ISO 4217 codes are case-insensitive and
+#     upstream systems disagree about case; storing both "USD" and "usd" would split
+#     every GROUP BY currency in a finance report into two rows that look like two
+#     currencies. What matters is that only one spelling ever reaches the database.
+ev_uppercase = fake_event(eid="evt_upper_curr_1", currency="USD")
 r = L.process_stripe_event(conn, ev_uppercase)
-chk("currency 'USD' (uppercase) → DLQ_INVALID",
-    r["outcome"] == "DLQ_INVALID", f"got {r['outcome']}")
+chk("currency 'USD' (uppercase) → POSTED, normalized",
+    r["outcome"] == "POSTED", f"got {r['outcome']}")
+chk("uppercase currency stored lowercase",
+    _q1(conn, "SELECT currency FROM ledger WHERE transaction_id='evt_upper_curr_1'") == "usd",
+    str(_q1(conn, "SELECT currency FROM ledger WHERE transaction_id='evt_upper_curr_1'")))
+
+ev_mixed = fake_event(eid="evt_upper_curr_2", currency="eUr")
+L.process_stripe_event(conn, ev_mixed)
+chk("mixed-case currency stored lowercase",
+    _q1(conn, "SELECT currency FROM ledger WHERE transaction_id='evt_upper_curr_2'") == "eur")
+
+chk("GROUP BY currency does not split on case",
+    _q1(conn, "SELECT COUNT(DISTINCT currency) FROM ledger WHERE currency IN ('usd','USD')") == 1)
 
 ev_short = fake_event(eid="evt_invalid_curr_2", currency="us")
 r = L.process_stripe_event(conn, ev_short)
@@ -627,10 +642,18 @@ with patch("stripe.Webhook.construct_event"):
     chk("duplicate → DLQ_DUPLICATE via HTTP",       r.json()["outcome"] == "DLQ_DUPLICATE",
         f"got {r.json()}")
 
-    ev_bad_curr = fake_event(eid="evt_http_bad_curr", currency="USD")
-    r = client.post("/webhook/stripe", json=ev_bad_curr)
+    ev_up_curr = fake_event(eid="evt_http_up_curr", currency="USD")
+    r = client.post("/webhook/stripe", json=ev_up_curr)
     chk("POST uppercase currency → HTTP 200",       r.status_code == 200)
-    chk("uppercase currency → DLQ_INVALID via HTTP", r.json()["outcome"] == "DLQ_INVALID",
+    chk("uppercase currency normalized, not rejected", r.json()["outcome"] == "POSTED",
+        f"got {r.json()}")
+
+    # A currency that is not simply the wrong case is still rejected — normalization
+    #     lowercases, it does not repair. "us" has no lowercase spelling that is valid.
+    ev_bad_curr = fake_event(eid="evt_http_bad_curr", currency="us")
+    r = client.post("/webhook/stripe", json=ev_bad_curr)
+    chk("POST malformed currency → HTTP 200",       r.status_code == 200)
+    chk("malformed currency → DLQ_INVALID via HTTP", r.json()["outcome"] == "DLQ_INVALID",
         f"got {r.json()}")
 
     ev_zero = fake_event(eid="evt_http_zero", amount=0)
@@ -646,7 +669,9 @@ with patch("stripe.Webhook.construct_event"):
         f"got {r.json()}")
 
     # Summary endpoint — verify shape and counts.
-    #     After the tests above: 1 POSTED, 1 DUPLICATE, 3 INVALID = 4 DLQ entries total.
+    #     Posted above: evt_http_001 and evt_http_up_curr (uppercase currency is
+    #     normalized and accepted, so it posts) = 2 ledger rows, 2 outbox rows.
+    #     DLQ: 1 DUPLICATE + 3 INVALID (malformed currency, $0 invoice, bad prefix) = 4.
     r = client.get("/ledger/summary")
     chk("GET /ledger/summary → 200",                r.status_code == 200)
     summary = r.json()
@@ -655,7 +680,7 @@ with patch("stripe.Webhook.construct_event"):
     chk("summary has 'outbox_pending' key",         "outbox_pending" in summary)
     chk("summary dlq_depth is 4",                   summary["dlq_depth"] == 4,
         f"got {summary['dlq_depth']}")
-    chk("summary outbox_pending is 1",              summary["outbox_pending"] == 1,
+    chk("summary outbox_pending is 2",              summary["outbox_pending"] == 2,
         f"got {summary['outbox_pending']}")
 
     # limit=-1 must return HTTP 422, not a PostgreSQL error.
@@ -1267,6 +1292,75 @@ chk("old DUPLICATE (>90d) removed",        "evt_old_dup" not in remaining_ids, s
 chk("recent DUPLICATE (10d) kept",         "evt_new_dup" in remaining_ids, str(remaining_ids))
 chk("old INVALID kept (only DUPLICATE pruned)", "evt_old_invalid" in remaining_ids, str(remaining_ids))
 prune_conn.close()
+
+
+# =============================================================================
+# A0: PER-EVENT-TYPE AMOUNT EXTRACTION
+# Stripe does not put the billable figure in one field for every event type. A
+#     failed invoice reports amount_paid=0 and the real figure in amount_due, so
+#     reading amount_paid for everything made every invoice.payment_failed look like
+#     a $0 invoice — rejected by check_invoice_amount_nonzero and dead-lettered.
+#     Dunning depends on exactly those events.
+# =============================================================================
+print("\n── A0: amount is read from the field each event type populates ─────────")
+
+amt_conn = fresh_conn()
+
+ev_failed_due = {
+    "id": "evt_amt_failed",
+    "type": "invoice.payment_failed",
+    "data": {"object": {"customer": "cus_amt01", "amount_paid": 0,
+                        "amount_due": 7500, "currency": "usd"}},
+}
+r_amt = L.process_stripe_event(amt_conn, ev_failed_due)
+chk("failed invoice with amount_due is accepted (was DLQ_INVALID)",
+    r_amt["outcome"] == "VOID", f"got {r_amt}")
+chk("failed invoice recorded at amount_due, not amount_paid=0",
+    _q1(amt_conn, "SELECT amount_cents FROM ledger WHERE transaction_id='evt_amt_failed'") == 7500,
+    str(_q1(amt_conn, "SELECT amount_cents FROM ledger WHERE transaction_id='evt_amt_failed'")))
+
+# A paid invoice still prefers amount_paid — that is what was actually collected.
+ev_paid_both = {
+    "id": "evt_amt_paid",
+    "type": "invoice.paid",
+    "data": {"object": {"customer": "cus_amt02", "amount_paid": 3000,
+                        "amount_due": 9999, "currency": "usd"}},
+}
+L.process_stripe_event(amt_conn, ev_paid_both)
+chk("paid invoice recorded at amount_paid, not amount_due",
+    _q1(amt_conn, "SELECT amount_cents FROM ledger WHERE transaction_id='evt_amt_paid'") == 3000)
+
+# A genuinely unknown amount must dead-letter, never post as $0. Recording an
+#     unknown amount as zero reconciles cleanly and is therefore invisible.
+ev_no_amount = {
+    "id": "evt_amt_none",
+    "type": "invoice.paid",
+    "data": {"object": {"customer": "cus_amt03", "currency": "usd"}},
+}
+chk("event with no amount field at all → DLQ_INVALID, never $0",
+    L.process_stripe_event(amt_conn, ev_no_amount)["outcome"] == "DLQ_INVALID")
+chk("no phantom $0 row was written",
+    _q1(amt_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_amt_none'") == 0)
+
+# Still zero after resolution → still a data-quality failure for invoice types.
+ev_zero_due = {
+    "id": "evt_amt_zero",
+    "type": "invoice.payment_failed",
+    "data": {"object": {"customer": "cus_amt04", "amount_paid": 0,
+                        "amount_due": 0, "currency": "usd"}},
+}
+chk("failed invoice with amount_due=0 → DLQ_INVALID",
+    L.process_stripe_event(amt_conn, ev_zero_due)["outcome"] == "DLQ_INVALID")
+
+# Subscription lifecycle events carry no money and may legitimately be zero.
+ev_sub_life = {
+    "id": "evt_amt_sub",
+    "type": "customer.subscription.updated",
+    "data": {"object": {"customer": "cus_amt05", "amount": 0, "currency": "usd"}},
+}
+chk("subscription lifecycle event with amount=0 still accepted",
+    L.process_stripe_event(amt_conn, ev_sub_life)["outcome"] == "PENDING")
+amt_conn.close()
 
 
 # =============================================================================

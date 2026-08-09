@@ -76,7 +76,7 @@ _log = logging.getLogger("ledger")
 # ---------------------------------------------------------------------------
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
-from pydantic import BaseModel, Field, ValidationError, model_validator  # noqa: E402
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator  # noqa: E402
 from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: E402
 from slowapi.util import get_remote_address  # noqa: E402
 from slowapi.errors import RateLimitExceeded  # noqa: E402
@@ -107,6 +107,25 @@ class EventType(str, Enum):
     SUB_UPDATED    = "customer.subscription.updated"   # Subscription plan changed
 
 
+# Which field carries the billable figure, per event type, most specific first.
+#     Stripe does not use one field for every event: a paid invoice reports
+#     amount_paid, a failed one reports amount_paid=0 with the real figure in
+#     amount_due, and subscription lifecycle events often carry neither.
+#     Reading amount_paid for every type made each invoice.payment_failed look
+#     like a $0 invoice, so check_invoice_amount_nonzero rejected it and a real
+#     failed payment — the kind of event dunning depends on — landed in the DLQ.
+#     An event type whose fields are all absent still routes to the DLQ, which is
+#     the intended outcome: an unknown amount must never be recorded as $0.
+_AMOUNT_FIELDS_BY_TYPE: dict = {
+    EventType.INVOICE_PAID:   ("amount_paid", "amount", "amount_due"),
+    EventType.INVOICE_FAILED: ("amount_due", "amount_paid", "amount"),
+    EventType.SUB_CREATED:    ("amount", "amount_paid", "amount_due"),
+    EventType.SUB_DELETED:    ("amount", "amount_paid", "amount_due"),
+    EventType.SUB_UPDATED:    ("amount", "amount_paid", "amount_due"),
+}
+_AMOUNT_FIELDS_DEFAULT = ("amount_paid", "amount", "amount_due")
+
+
 class StripeObject(BaseModel):
     """
     Represents the `data.object` payload inside a Stripe webhook. Contains the
@@ -129,22 +148,49 @@ class StripeObject(BaseModel):
         description="Amount paid in cents, non-negative"
     )
 
+    # What an invoice was billed for, as opposed to what was collected. A failed
+    #     payment carries amount_paid=0 and the real figure here, so reading only
+    #     amount_paid made every invoice.payment_failed event look like a $0 invoice
+    #     and get rejected by check_invoice_amount_nonzero. See _AMOUNT_FIELDS_BY_TYPE.
+    amount_due: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Amount owed in cents — the figure on a failed or open invoice"
+    )
+
     # Fallback amount field — Stripe uses different field names depending on
-    #     the event type. The model_validator below picks the right one.
+    #     the event type. _AMOUNT_FIELDS_BY_TYPE picks the right one.
     amount: Optional[int] = Field(
         default=None,
         ge=0,
-        description="Amount in cents (fallback to amount_paid)"
+        description="Amount in cents (generic fallback)"
     )
 
-    # ISO 4217 currency code. Regex enforces exactly 3 lowercase letters.
-    #     "USD" (uppercase) fails — currency normalization (.lower() on ingest) is a
-    #     known gap listed in the Production Gap Checklist in the README.
+    # ISO 4217 currency code. Regex enforces exactly 3 lowercase letters; the
+    #     validator below normalizes case before the pattern runs, so "USD" is
+    #     accepted and stored as "usd" rather than rejected as malformed.
     currency: str = Field(
         default="usd",
         pattern=r"^[a-z]{3}$",
         description="ISO 4217 currency code, lowercase 3 chars"
     )
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def normalize_currency(cls, v: object) -> object:
+        """
+        Lowercase the currency before the pattern constraint sees it.
+
+        ISO 4217 codes are case-insensitive and upstream systems disagree about
+        which case to send. Storing both "USD" and "usd" splits every
+        GROUP BY currency in a finance report into two rows that look like two
+        currencies, and the split is silent — the totals still add up per row, so
+        nothing looks broken until someone reconciles against the bank.
+        Normalizing at the entry boundary means the database only ever holds one
+        spelling, and mode="before" is what lets the pattern validate the
+        normalized value instead of the raw one.
+        """
+        return v.lower() if isinstance(v, str) else v
 
     @model_validator(mode='after')
     def check_amount_present(self):
@@ -156,23 +202,32 @@ class StripeObject(BaseModel):
         Invoice events with amount=0 are caught by check_invoice_amount_nonzero
         in StripeEvent — a different layer for a different rule.
         """
-        actual_amount = self.amount_paid if self.amount_paid is not None else self.amount
-        if actual_amount is None:
-            # Both fields are None — no amount at all. This is a data quality failure.
+        if self.amount_paid is None and self.amount is None and self.amount_due is None:
+            # No amount field at all. This is a data quality failure.
             raise ValueError(
-                "Either amount_paid or amount must be provided and non-null"
+                "One of amount_paid, amount_due or amount must be provided and non-null"
             )
         return self
 
-    def get_amount(self) -> Optional[int]:
+    def get_amount(self, field_priority: tuple = ("amount_paid", "amount", "amount_due")) -> Optional[int]:
         """
-        Returns the effective billing amount in cents. Prefers amount_paid
-        (Stripe invoice events) over amount (fallback). Returns None only if
-        both fields are None — check_amount_present prevents this when the
-        model is constructed via StripeEvent, but direct StripeObject()
+        Returns the effective billing amount in cents, reading the candidate fields
+        in the given order and taking the first that is present.
+
+        The default order preserves the original behaviour for callers that have no
+        event type to hand. Callers that do have one should go through
+        StripeEvent.get_billing_amount(), which selects the order that matches how
+        Stripe populates that particular event.
+
+        Returns None only if every candidate is None — check_amount_present prevents
+        that when the model is constructed via StripeEvent, but direct StripeObject()
         construction bypasses that validator, so Optional[int] is the honest type.
         """
-        return self.amount_paid if self.amount_paid is not None else self.amount
+        for name in field_priority:
+            value = getattr(self, name, None)
+            if value is not None:
+                return value
+        return None
 
 
 class StripeEventData(BaseModel):
@@ -254,7 +309,7 @@ class StripeEvent(BaseModel):
         """
         invoice_types = {EventType.INVOICE_PAID, EventType.INVOICE_FAILED}
         if self.type in invoice_types:
-            amount = self.data.object.get_amount()
+            amount = self.get_billing_amount()
             if amount == 0:
                 raise ValueError(
                     f"{self.type.value} must have amount > 0 "
@@ -277,6 +332,21 @@ class StripeEvent(BaseModel):
                 f"got '{self.data.object.customer}'"
             )
         return self
+
+    def get_billing_amount(self) -> Optional[int]:
+        """
+        The billable amount in cents, read from whichever field this event type
+        actually populates (see _AMOUNT_FIELDS_BY_TYPE).
+
+        Returns None when the event carries no amount field at all. Callers must
+        route that to the DLQ rather than defaulting it: a missing amount is an
+        unknown amount, and recording an unknown amount as $0 turns a data-quality
+        problem into a silent revenue loss that reconciles cleanly and is therefore
+        invisible. check_amount_present already rejects that case at validation time,
+        so this returning None means someone built the model directly.
+        """
+        priority = _AMOUNT_FIELDS_BY_TYPE.get(self.type, _AMOUNT_FIELDS_DEFAULT)
+        return self.data.object.get_amount(priority)
 
 
 class LedgerStatus(str, Enum):
@@ -703,9 +773,11 @@ def process_stripe_event(
     #     layer — LedgerEntry's own Field constraints run on the extracted values.
     #     In practice these always pass (Pydantic already validated upstream),
     #     but the model acts as a schema contract for the INSERT statement.
-    amount_cents  = data_object.get_amount()
+    # get_billing_amount() reads the field this event type actually populates,
+    #     so a failed invoice is recorded at its amount_due, not at amount_paid=0.
+    amount_cents  = validated_event.get_billing_amount()
     customer_id   = data_object.customer
-    currency      = data_object.currency
+    currency      = data_object.currency     # already lowercased at the entry boundary
     ledger_status = _STATUS_MAP[event_type]   # type-safe — KeyError impossible here
     payload_json  = json.dumps(event)
 
@@ -1094,7 +1166,7 @@ def process_stripe_event_batch(
             transaction_id=validated.id,
             event_type=validated.type,
             customer_id=data_obj.customer,
-            amount_cents=data_obj.get_amount(),
+            amount_cents=validated.get_billing_amount(),  # per-event-type field, see above
             currency=data_obj.currency,
             status=_STATUS_MAP[validated.type],
             idempotency_key=validated.idempotency_key,
