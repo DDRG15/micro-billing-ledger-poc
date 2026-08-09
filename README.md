@@ -33,21 +33,22 @@ Two concurrent retries pass the `exists()` check before either commits. The resu
 **Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) · Python 3.12 or 3.13
 
 ```bash
-# 1. Start PostgreSQL
+# 1. Configure environment — the dev defaults work as-is
+cp .env.example .env
+# Every compose variable also has a built-in dev default, so the stack still
+# starts without this file. Copy it anyway: it is where you change the values
+# marked *** CHANGE *** before anything is reachable from a network.
+
+# 2. Start PostgreSQL
 docker compose up -d postgres
 
-# 2. Install Python dependencies
+# 3. Install Python dependencies
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 3. Run the full test suite — 213 tests, live PostgreSQL, no mocks
+# 4. Run the full test suite — 213 tests, live PostgreSQL, no mocks
 python test_ledger.py
-
-# 4. Configure environment — safe dev defaults work immediately
-cp .env.example .env
-# Edit .env: set STRIPE_WEBHOOK_SECRET to your real Stripe signing secret before live traffic.
-# All other defaults connect correctly to the Docker postgres service.
 
 # 5. Start the full stack (postgres + billing + worker + caddy)
 docker compose up

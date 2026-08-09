@@ -1,13 +1,21 @@
 # docker-compose.yml — Micro-Billing-Ledger PoC
 # ===============================================
-# All secrets and configuration are read from the .env file.
-#     Copy .env.example to .env and fill in your values before running.
+# Configuration comes from .env, but every variable below carries a working dev
+#     default, so the stack starts on a fresh clone with no .env at all.
+#     That is deliberate: without defaults, a missing .env made POSTGRES_PASSWORD
+#     empty and postgres refused to initialize ("Database is uninitialized and
+#     superuser password is not specified"), so `docker compose up -d postgres`
+#     crash-looped on the very first command a new reader runs. A demo that fails
+#     on step one teaches nothing about what it was built to show.
+#
+#     The defaults are dev-only. Copy .env.example to .env and change every value
+#     marked *** CHANGE *** before this is reachable from a network.
 #
 #     For running tests locally, start only the postgres service:
-#       docker-compose up -d postgres
+#       docker compose up -d postgres
 #       python test_ledger.py
 #     For the full stack:
-#       docker-compose up
+#       docker compose up
 
 services:
 
@@ -18,9 +26,9 @@ services:
     image: postgres:16-alpine
     networks: [billing_net]
     environment:
-      POSTGRES_USER:     ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      POSTGRES_DB:       "${POSTGRES_DB:-billing}"
     ports:
       # Bound to 127.0.0.1 — only this machine can connect directly.
       #     All external DB access must go through the billing/worker services.
@@ -29,7 +37,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -42,7 +50,7 @@ services:
     networks: [billing_net]
     command: alembic upgrade head
     environment:
-      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_URL: "${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/billing}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,9 +63,9 @@ services:
     build: .
     networks: [billing_net]
     environment:
-      DATABASE_URL:            ${DATABASE_URL}
-      STRIPE_WEBHOOK_SECRET:   ${STRIPE_WEBHOOK_SECRET}
-      BILLING_API_KEY:         ${BILLING_API_KEY}
+      DATABASE_URL:            "${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/billing}"
+      STRIPE_WEBHOOK_SECRET:   "${STRIPE_WEBHOOK_SECRET:-whsec_YOUR_SECRET_HERE}"
+      BILLING_API_KEY:         "${BILLING_API_KEY:-dev_key_change_in_production}"
       # Which peer addresses may set X-Forwarded-For. uvicorn reads this env var
       #     when --forwarded-allow-ips is absent from the command line.
       #     Pinned to Caddy's static address (see the caddy service below) — NOT "*".
@@ -109,11 +117,11 @@ services:
     networks: [billing_net]
     command: python worker.py
     environment:
-      DATABASE_URL:        ${DATABASE_URL}
-      DOWNSTREAM_URL:      ${DOWNSTREAM_URL}
-      WORKER_LOG_ONLY:     ${WORKER_LOG_ONLY}
-      WORKER_BATCH_SIZE:   ${WORKER_BATCH_SIZE}
-      WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL}
+      DATABASE_URL:        "${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/billing}"
+      DOWNSTREAM_URL:      "${DOWNSTREAM_URL:-}"
+      WORKER_LOG_ONLY:     "${WORKER_LOG_ONLY:-true}"
+      WORKER_BATCH_SIZE:   "${WORKER_BATCH_SIZE:-100}"
+      WORKER_POLL_INTERVAL: "${WORKER_POLL_INTERVAL:-5}"
       # Same format as the billing service — correlating an event from ingest to
       #     dispatch needs both sides emitting the same shape on transaction_id.
       LOG_FORMAT:          ${LOG_FORMAT:-json}
@@ -145,7 +153,7 @@ services:
       #     expands to nothing: the site block degenerates into a global options
       #     block and Caddy aborts with "unrecognized global option: reverse_proxy".
       #     restart: unless-stopped then crash-loops it forever.
-      CADDY_DOMAIN: ${CADDY_DOMAIN}
+      CADDY_DOMAIN: "${CADDY_DOMAIN:-localhost}"
     ports:
       - "80:80"
       - "443:443"
