@@ -1709,9 +1709,16 @@ chk("duplicate outcome counted separately",
     'webhook_events_total{outcome="DLQ_DUPLICATE"}' in _body, "DLQ_DUPLICATE label missing")
 
 # Gauges are read from the DB at scrape time, so they must match what the tables say.
-_dlq_now = _q1(metrics_conn, "SELECT COUNT(*) FROM dlq")
-chk("dlq_depth gauge matches the table at scrape time",
+#     Compare against the ACTIONABLE count, not COUNT(*). The two coincide here because
+#     nothing in this section is resolved yet, and an assertion that passes only by that
+#     coincidence stops testing anything the moment a resolved row appears.
+_dlq_now = _q1(metrics_conn,
+               "SELECT COUNT(*) FROM dlq WHERE status IN ('pending','retrying','exhausted')")
+_dlq_all = _q1(metrics_conn, "SELECT COUNT(*) FROM dlq")
+chk("dlq_depth gauge matches the backlog at scrape time",
     f"dlq_depth {float(_dlq_now)}" in _body, f"expected {_dlq_now}")
+chk("dlq_total gauge matches every row at scrape time",
+    f"dlq_total {float(_dlq_all)}" in _body, f"expected {_dlq_all}")
 
 # Route templates, never resolved paths: labelling by resolved path gives every
 #     dlq_id its own time series and turns instrumentation into a cardinality bomb.

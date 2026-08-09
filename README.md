@@ -8,7 +8,7 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 213 / 213 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 221 / 221 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** ~5,000 TPS batch ingest (`execute_values`) · 26 TPS per-event, the cost of 4 synchronous round trips per event · measured on Docker-on-Windows localhost, see Performance Benchmarks
 
 ---
@@ -47,7 +47,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. Run the full test suite — 213 tests, live PostgreSQL, no mocks
+# 4. Run the full test suite — 221 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 5. Start the full stack (postgres + billing + worker + caddy)
@@ -399,7 +399,7 @@ scrape_configs:
 ## Test Coverage
 
 ```
-213 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+221 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -412,13 +412,15 @@ Phase 11   DLQ retry      — TRANSIENT backoff, exhaustion, manual POST /dlq/{i
 Phase 12   Observability  — JSON formatter (field promotion, one line, traceback folding,
                             unserializable degradation), /metrics shape, outcome labels,
                             route-template cardinality, gauge-vs-table agreement, auth
+A4 / A5    Terminal state — 'resolved' survives _increment_retry; dlq_depth counts backlog,
+                            dlq_total counts history; both gauges agree with /ledger/summary
 A0         Amount extract — per-event-type field priority; unknown amount → DLQ, never $0
 A1 / A2    DLQ integrity  — retry appends no rows; 'resolved' terminal (409); 'exhausted' replayable
 A3         Claim recovery — stale claim reclaimed, live claim not stolen, batch not aborted
 M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), prune_dlq retention
 ```
 
-**Mutation-verified.** A passing suite proves nothing until you watch it fail. Nine deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch.
+**Mutation-verified.** A passing suite proves nothing until you watch it fail. Eleven deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, and letting `dlq_depth` count resolved rows again — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch.
 
 **Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
 
