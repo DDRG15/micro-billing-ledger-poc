@@ -63,30 +63,53 @@ docker compose down -v       # wipes pgdata volume (full clean slate)
 
 ### Send test webhooks
 
+`POST /webhook/stripe` verifies an HMAC-SHA256 signature on **every** request, including
+when `STRIPE_WEBHOOK_SECRET` is still the placeholder. That is deliberate — an endpoint
+that accepts unsigned requests whenever it is misconfigured fails silently, which is
+worse than rejecting everything. So a bare `curl -d '{...}'` correctly returns `400`.
+
+`send_test_webhook.py` signs requests the way Stripe does, using whatever secret the
+stack is actually running with. Standard library only — no venv, no Stripe account:
+
 ```bash
-# Post a valid invoice
-curl -X POST http://localhost:8000/webhook/stripe \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "evt_001",
-    "type": "invoice.paid",
-    "data": {
-      "object": { "customer": "cus_abc123", "amount_paid": 4900, "currency": "usd" }
-    }
-  }'
-# → {"outcome":"POSTED","transaction_id":"evt_001","reason":null}
+python send_test_webhook.py --all
+```
 
-# Replay the same event — idempotency guard fires
-curl -X POST http://localhost:8000/webhook/stripe \
-  -H "Content-Type: application/json" \
-  -d '{"id":"evt_001","type":"invoice.paid","data":{"object":{"customer":"cus_abc123","amount_paid":4900,"currency":"usd"}}}'
-# → {"outcome":"DLQ_DUPLICATE","transaction_id":"evt_001","reason":"Already processed..."}
+```
+Valid invoice.paid:
+  POSTED expected: HTTP 200  {"outcome":"POSTED","transaction_id":"evt_demo_...","reason":null}
 
-# Inspect the ledger
-curl http://localhost:8000/ledger/summary
+Same event twice - the idempotency guard fires on the second:
+  1st -> POSTED: HTTP 200        {"outcome":"POSTED",...}
+  2nd -> DLQ_DUPLICATE: HTTP 200 {"outcome":"DLQ_DUPLICATE","reason":"Already processed..."}
 
-# Inspect the DLQ
-curl "http://localhost:8000/dlq/entries?limit=10"
+Invalid payload (currency 'xx' is not a real ISO 4217 code):
+  DLQ_INVALID expected: HTTP 200 {"outcome":"DLQ_INVALID","reason":"Pydantic validation failed: 1 errors"}
+
+Failed invoice - amount lives in amount_due, not amount_paid:
+  VOID expected, recorded at 7500: HTTP 200  {"outcome":"VOID",...}
+
+Ledger summary:
+  summary: HTTP 200  {"ledger":{"VOID":1,"POSTED":2},"dlq_depth":2,"outbox_pending":1}
+
+Prometheus metrics:
+  metrics: HTTP 200
+      webhook_events_total{outcome="POSTED"} 2.0
+      webhook_events_total{outcome="DLQ_DUPLICATE"} 1.0
+      webhook_events_total{outcome="DLQ_INVALID"} 1.0
+      webhook_events_total{outcome="VOID"} 1.0
+      dlq_depth 2.0
+      outbox_pending 1.0
+```
+
+Individual steps: `--duplicate`, `--invalid`, `--failed`, `--summary`, `--metrics`.
+Add `--url https://localhost` to go through Caddy instead of the direct port.
+
+The read endpoints need the API key (`dev_key_change_in_production` by default):
+
+```bash
+curl -H "X-Api-Key: dev_key_change_in_production" http://localhost:8000/ledger/summary
+curl -H "X-Api-Key: dev_key_change_in_production" "http://localhost:8000/dlq/entries?limit=10"
 ```
 
 ---
