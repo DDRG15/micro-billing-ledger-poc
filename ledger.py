@@ -558,7 +558,7 @@ if STRIPE_WEBHOOK_SECRET == _PLACEHOLDER_SECRET:
 # API key for ops endpoints (/ledger/summary, /dlq/entries).
 #     If empty (env var not set), the check is skipped — dev-mode convenience.
 #     In production: set to a strong random value, e.g., openssl rand -hex 32.
-#     ISO 27001 A.9.4.1: access to operational data must be access-controlled.
+#     Operational data (customer IDs, amounts, raw payloads) must not be world-readable.
 BILLING_API_KEY: str = os.environ.get("BILLING_API_KEY", "")
 
 # Fail-open on an empty key is a deliberate dev convenience — but a silent one is a
@@ -1070,6 +1070,17 @@ def _increment_retry(
 
     Single statement eliminates the TOCTOU race: the old SELECT + UPDATE pattern
     let two concurrent callers both read retry_count=N and both write N+1 instead of N+2.
+
+    The WHERE clause carries `AND status <> 'resolved'` because this is the one place
+    that writes dlq.status without checking what it currently is, which made 'resolved'
+    reversible. The trigger is narrow but real: in retry_dlq_batch, process_stripe_event
+    can succeed and the following `UPDATE ... status='resolved'` can still fail on a
+    transient database error - precisely the failure the TRANSIENT reason exists for.
+    The except handler then calls this function unconditionally, and without the guard it
+    reopened an entry whose money was already in the ledger, pushing it back to 'pending'
+    or, at the retry ceiling, to 'exhausted' - the state documented as needing human
+    intervention. An operator would then investigate an event that was never broken.
+    A no-op returns row=None, the same path already used for "row not found".
     """
     with _tx(conn) as cur:
         cur.execute(
@@ -1094,7 +1105,7 @@ def _increment_retry(
                         END
                     )
                 END
-            WHERE id = %s
+            WHERE id = %s AND status <> 'resolved'
             RETURNING retry_count, max_retries, status
             """,
             (dlq_id,),
@@ -1380,7 +1391,8 @@ _HTTP_LATENCY = Histogram(
     "Request latency by route template",
     ["method", "path"],
 )
-_DLQ_DEPTH = Gauge("dlq_depth", "Rows currently in the dead letter queue")
+_DLQ_DEPTH = Gauge("dlq_depth", "DLQ rows still needing action (pending, retrying or exhausted)")
+_DLQ_TOTAL = Gauge("dlq_total", "All DLQ rows ever written, resolved ones included")
 _OUTBOX_PENDING = Gauge("outbox_pending", "Outbox rows not yet dispatched downstream")
 
 
@@ -1432,7 +1444,7 @@ _pool: ThreadedConnectionPool = ThreadedConnectionPool(minconn=1, maxconn=20, ds
 def _require_api_key(x_api_key: str = Header(default="")) -> None:
     """FastAPI dependency for ops endpoints. Enforces X-Api-Key when BILLING_API_KEY is set.
     If BILLING_API_KEY is empty (default), the check is skipped — dev-mode convenience.
-    ISO 27001 A.9.4.1: access to operational data must be access-controlled in production.
+    Operational endpoints expose customer IDs, amounts and raw payloads; they need a key in production.
     """
     if not BILLING_API_KEY:
         return  # dev mode — no key configured, skip check
@@ -1466,13 +1478,13 @@ def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONRespo
     which is only correct for transient failures (e.g., DB down → 503).
     HMAC signature verification is active — stripe.Webhook.construct_event()
     validates the Stripe-Signature header before any business logic runs.
-    ISO 27001 A.14.1.2: authentication enforced at all ingestion entry points.
+    An unauthenticated ingestion endpoint lets anyone who knows the URL write to the ledger.
     """
     # ── HMAC SIGNATURE VERIFICATION ─────────────────────────────────────
     #     stripe.Webhook.construct_event() validates the HMAC-SHA256 in the
     #     Stripe-Signature header against the raw request body. Any body tampering
     #     or wrong/missing signature raises SignatureVerificationError → 400.
-    #     ISO 27001 A.14.1.2: authentication at all ingestion entry points.
+    #     Without this, anyone who knows the URL can forge billing events.
     # Request.body() is async def in Starlette — calling it without await returns a coroutine
     # object, not bytes. FastAPI already read and cached the body in request._body when it
     # parsed StripeWebhookPayload above. Access the cached attribute directly.
@@ -1530,9 +1542,18 @@ def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSO
             cur.execute("SELECT status, COUNT(*) FROM ledger GROUP BY status")
             counts = {row[0]: row[1] for row in cur.fetchall()}
 
+        # Two questions, two numbers. dlq_depth answers "how much still needs
+        #     attention" - what an operator reads to judge ingestion health - so it
+        #     excludes resolved rows. Counting every row ever written made it grow
+        #     monotonically with historical traffic and never come back down, because
+        #     prune_dlq only ages out DUPLICATE rows: a resolved INVALID or TRANSIENT
+        #     entry inflated "queue depth" forever. dlq_total keeps the audit count.
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM dlq")
-            dlq_depth = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FILTER (WHERE status IN ('pending','retrying','exhausted')), "
+                "       COUNT(*) FROM dlq"
+            )
+            dlq_depth, dlq_total = cur.fetchone()
 
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
@@ -1542,7 +1563,8 @@ def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSO
 
     return JSONResponse(content={
         "ledger":         counts,
-        "dlq_depth":      dlq_depth,      # Total entries in DLQ (all reasons)
+        "dlq_depth":      dlq_depth,      # Entries still needing action
+        "dlq_total":      dlq_total,      # Every DLQ row ever written, resolved included
         "outbox_pending": outbox_pending, # Events not yet dispatched downstream
     })
 
@@ -1570,8 +1592,13 @@ def metrics(request: Request, _: None = Depends(_require_api_key)) -> Response:
     conn = _pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM dlq")
-            _DLQ_DEPTH.set(cur.fetchone()[0])
+            cur.execute(
+                "SELECT COUNT(*) FILTER (WHERE status IN ('pending','retrying','exhausted')), "
+                "       COUNT(*) FROM dlq"
+            )
+            _actionable, _total = cur.fetchone()
+            _DLQ_DEPTH.set(_actionable)
+            _DLQ_TOTAL.set(_total)
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
             _OUTBOX_PENDING.set(cur.fetchone()[0])

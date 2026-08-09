@@ -1532,6 +1532,83 @@ claim_conn.close()
 
 
 # =============================================================================
+# A4: 'resolved' IS TERMINAL AT EVERY WRITE SITE, NOT JUST THE ENDPOINT
+# The 409 guards the manual endpoint. _increment_retry was the other door: it wrote
+#     dlq.status with a bare WHERE id=%s and no check of the current value, so a
+#     resolved entry could be pushed back to pending or exhausted. The trigger is
+#     narrow but real — in retry_dlq_batch, process_stripe_event can succeed and the
+#     following UPDATE ... status='resolved' can still fail transiently, after which
+#     the except handler calls _increment_retry unconditionally.
+# =============================================================================
+print("\n── A4: _increment_retry cannot reopen a resolved entry ─────────────────")
+
+term2_conn = fresh_conn()
+with term2_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute(
+        "INSERT INTO dlq (transaction_id, reason, raw_payload, status, retry_count, max_retries) "
+        "VALUES ('evt_terminal_guard', 'TRANSIENT', '{}', 'resolved', 1, 3) RETURNING id"
+    )
+    _tid = c.fetchone()[0]
+    c.execute("COMMIT")
+
+L._increment_retry(term2_conn, _tid, "evt_terminal_guard")
+_st, _rc = _qall(term2_conn, "SELECT status, retry_count FROM dlq WHERE id=%s", (_tid,))[0]
+chk("resolved entry survives _increment_retry", _st == "resolved", f"got {_st!r}")
+chk("resolved entry's retry_count is untouched", _rc == 1, f"got {_rc}")
+
+# A non-resolved entry must still be incremented — the guard must not disable the mechanism.
+with term2_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute(
+        "INSERT INTO dlq (transaction_id, reason, raw_payload, status, retry_count, max_retries) "
+        "VALUES ('evt_terminal_open', 'TRANSIENT', '{}', 'retrying', 0, 3) RETURNING id"
+    )
+    _oid = c.fetchone()[0]
+    c.execute("COMMIT")
+L._increment_retry(term2_conn, _oid, "evt_terminal_open")
+_st2, _rc2 = _qall(term2_conn, "SELECT status, retry_count FROM dlq WHERE id=%s", (_oid,))[0]
+chk("non-resolved entry still increments", _rc2 == 1 and _st2 == "pending", f"got {_st2!r}/{_rc2}")
+term2_conn.close()
+
+
+# =============================================================================
+# A5: dlq_depth MEASURES BACKLOG, NOT HISTORY
+# dlq_depth is what an operator reads to decide whether ingestion is failing. It
+#     counted every row ever written, so a resolved INVALID or TRANSIENT entry
+#     inflated it permanently — prune_dlq only ages out DUPLICATE rows. The number
+#     grew with historical traffic and never came back down.
+# =============================================================================
+print("\n── A5: dlq_depth counts backlog; dlq_total keeps the audit count ───────")
+
+depth_conn = fresh_conn()
+original_pool_depth = L._pool
+L._pool = _MockPool(depth_conn)
+depth_client = TestClient(L.app)
+
+with depth_conn.cursor() as c:
+    c.execute("BEGIN")
+    for _tid_s, _status in [("d1", "pending"), ("d2", "retrying"), ("d3", "exhausted"),
+                            ("d4", "resolved"), ("d5", "resolved")]:
+        c.execute(
+            "INSERT INTO dlq (transaction_id, reason, raw_payload, status) VALUES (%s,'INVALID','{}',%s)",
+            (_tid_s, _status),
+        )
+    c.execute("COMMIT")
+
+_sum = depth_client.get("/ledger/summary").json()
+chk("dlq_depth excludes resolved rows", _sum["dlq_depth"] == 3, f"got {_sum.get('dlq_depth')}")
+chk("dlq_total still reports every row", _sum["dlq_total"] == 5, f"got {_sum.get('dlq_total')}")
+
+_m = depth_client.get("/metrics").text
+chk("dlq_depth gauge matches the backlog", "dlq_depth 3.0" in _m, "gauge disagrees with summary")
+chk("dlq_total gauge exposed for audit", "dlq_total 5.0" in _m, "dlq_total missing")
+
+L._pool = original_pool_depth
+depth_conn.close()
+
+
+# =============================================================================
 # PHASE 12a: STRUCTURED JSON LOGGING
 # Plain text is unparseable exactly when it matters. "Which transaction_id failed,
 #     how often, how slow" becomes a regex over a human sentence that changes the

@@ -175,11 +175,13 @@ The `dispatched=1` update happens in the **same `BEGIN…COMMIT`** as the dispat
 
 ---
 
-## Enterprise Security & SOC 2 Compliance
+## Security Controls
 
-**Stripe HMAC-SHA256 Signature Verification** — Every inbound webhook is authenticated via `stripe.Webhook.construct_event()` using the endpoint's signing secret. Unsigned or tampered requests return HTTP 400 before touching the database. Satisfies ISO 27001 A.14.1.2 — the first control a SOC 2 auditor checks on a payment ingestion endpoint.
+**Stripe HMAC-SHA256 Signature Verification** — Every inbound webhook is authenticated via `stripe.Webhook.construct_event()` using the endpoint's signing secret. Unsigned or tampered requests return HTTP 400 before touching the database. Verification stays on even when `STRIPE_WEBHOOK_SECRET` is left at its placeholder: an endpoint that accepts unsigned requests whenever it is misconfigured fails silently, which is worse than rejecting everything.
 
-**API Key Authentication** — `/ledger/summary` and `/dlq/entries` require an `X-API-Key` header validated against the `BILLING_API_KEY` environment variable. Missing or invalid keys return HTTP 401. Satisfies ISO 27001 A.9.4.1.
+**API Key Authentication** — `/ledger/summary`, `/dlq/entries`, `/dlq/{id}/retry` and `/metrics` require an `X-Api-Key` header validated against the `BILLING_API_KEY` environment variable. Missing or invalid keys return HTTP 401. An empty `BILLING_API_KEY` disables the check entirely for local development, and the application logs a warning at startup when that happens — a fail-open default is defensible, a silent one is not.
+
+**These are engineering controls, not a compliance program.** They address request authenticity and access to operational data. They are not an ISMS, there is no audit trail of who read operational data, no formal risk assessment, and no external audit. See [SECURITY.md](SECURITY.md) for what this project deliberately does not attempt.
 
 ---
 
