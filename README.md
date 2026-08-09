@@ -90,7 +90,7 @@ Failed invoice - amount lives in amount_due, not amount_paid:
   VOID expected, recorded at 7500: HTTP 200  {"outcome":"VOID",...}
 
 Ledger summary:
-  summary: HTTP 200  {"ledger":{"VOID":1,"POSTED":2},"dlq_depth":2,"outbox_pending":1}
+  summary: HTTP 200  {"ledger":{"VOID":1,"POSTED":2},"dlq_depth":2,"dlq_total":2,"outbox_pending":1}
 
 Prometheus metrics:
   metrics: HTTP 200
@@ -99,6 +99,7 @@ Prometheus metrics:
       webhook_events_total{outcome="DLQ_INVALID"} 1.0
       webhook_events_total{outcome="VOID"} 1.0
       dlq_depth 2.0
+      dlq_total 2.0
       outbox_pending 1.0
 ```
 
@@ -373,7 +374,9 @@ CREATE INDEX IF NOT EXISTS idx_dlq_stale_claim ON dlq(status, claimed_at) WHERE 
 
 Plain text is unparseable at the moment you most need it: *"which `transaction_id` failed, how often, and how slow was it"* becomes a regex against a human sentence, and that regex breaks the next time someone rewords a log line. Consumers here read keys, not prose. Records are always one line — log shippers split on newlines, so a multi-line record arrives as several unparseable fragments — and tracebacks are folded into a single string field for the same reason. `worker.py` reuses the same formatter: two services logging the same event in two shapes cannot be correlated on `transaction_id`, which is exactly the field you want when tracing an event from ingest through to dispatch.
 
-**Metrics.** `GET /metrics` exposes `webhook_events_total{outcome}`, `http_requests_total{method,path,status}`, `http_request_duration_seconds{method,path}`, plus `dlq_depth` and `outbox_pending`.
+**Metrics.** `GET /metrics` exposes `webhook_events_total{outcome}`, `http_requests_total{method,path,status}`, `http_request_duration_seconds{method,path}`, plus `dlq_depth`, `dlq_total` and `outbox_pending`.
+
+`dlq_depth` counts only rows still needing action — `pending`, `retrying`, `exhausted`. `dlq_total` counts every row ever written. They are separate because they answer different questions and one was previously doing both jobs badly: a single number counting all rows grew monotonically with historical traffic and never came back down, since `prune_dlq` only ages out `DUPLICATE` rows. A resolved `INVALID` entry inflated "queue depth" forever. An alert set on a figure that only rises is an alert that eventually gets muted.
 
 Labels use the route **template** (`/dlq/{dlq_id}/retry`), never the resolved path. Labelling by resolved path gives every id its own time series — the standard way to take down a Prometheus server with your own instrumentation.
 
@@ -442,7 +445,7 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Runtime ingress (Caddy) | **CRITICAL** | Done | `CADDY_DOMAIN` never reached the Caddy container, so `{$CADDY_DOMAIN}` expanded to nothing, the site block degenerated into a global options block, and Caddy crash-looped on every `up` — HTTPS ingress had never worked. Fixed, plus an admin-API healthcheck so nothing gates on a container that silently never started. |
 | `X-Forwarded-For` trust | **HIGH** | Done | Was `--forwarded-allow-ips "*"`, letting any caller pick its own rate-limit bucket. Now pinned to Caddy's static address. See *Rate Limiting* above. |
 | Container healthcheck | **HIGH** | Done | Probed bare `localhost`, which musl resolves to `::1` while uvicorn binds IPv4 only — a healthy service reported `unhealthy` on every start. Now probes `127.0.0.1`. |
-| DLQ self-amplification | **HIGH** | Done | Retrying an entry whose event already reached the ledger appended a *new* DLQ row while resolving the old one, so the queue grew by one row per retry and `dlq_depth` became inflatable by retry activity. A replay now never creates DLQ rows, and `resolved` is terminal (409). |
+| DLQ self-amplification | **HIGH** | Done | Retrying an entry whose event already reached the ledger appended a *new* DLQ row while resolving the old one, so the queue grew by one row per retry and `dlq_depth` became inflatable by retry activity. A replay now never creates DLQ rows, and `resolved` is terminal — 409 at the endpoint and a `status <> 'resolved'` guard on the one UPDATE that wrote status without checking it. |
 | Stranded retry claims | **HIGH** | Done | `retry_dlq_batch` commits its claim before doing the work; a failure in the recovery path left rows in `retrying` that the claim query never selected again. Migration 0003 adds `claimed_at`; stale claims are reclaimed automatically. |
 | Outbox worker | **HIGH** | Done | Standalone Docker service — `SELECT FOR UPDATE SKIP LOCKED`, exponential backoff, SIGTERM-safe. |
 | DLQ retry budget | **HIGH** | Done | `retry_count`/`max_retries`/`next_retry_at` columns, exponential backoff, `POST /dlq/{id}/retry`, and a worker retry loop are implemented. Only `TRANSIENT` entries auto-retry; nothing in the live ingest path classifies an event as `TRANSIENT` yet (single-event DB failures return 503 so Stripe retries). The mechanism is provisioned for a future non-Stripe / async source with no upstream retrier. |
@@ -450,7 +453,7 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Schema migrations | **HIGH** | Done | Alembic migrations in `alembic/versions/` manage the production schema; the `migrate` service runs `alembic upgrade head` before the API starts. `_bootstrap()` mirrors the DDL with `IF NOT EXISTS` guards so CI runs against the same schema. |
 | Per-event-type amount extraction | **MEDIUM** | Done | A failed invoice carries `amount_paid=0` with the real figure in `amount_due`, so reading `amount_paid` for every type dead-lettered every `invoice.payment_failed` — the events dunning runs on. `_AMOUNT_FIELDS_BY_TYPE` now maps each type to its field priority. An event with no amount field at all still routes to the DLQ: an unknown amount recorded as $0 reconciles cleanly and is therefore invisible. |
 | Structured JSON logging | **MEDIUM** | Done | `LOG_FORMAT=json` emits one JSON object per line; `transaction_id`, `outcome`, `duration_ms`, `path` and `status` are top-level fields. API and worker share the formatter so an event can be correlated from ingest to dispatch. |
-| Prometheus `/metrics` | **MEDIUM** | Done | `webhook_events_total{outcome}`, `http_requests_total`, `http_request_duration_seconds`, `dlq_depth`, `outbox_pending`. Key-protected, labelled by route template. |
+| Prometheus `/metrics` | **MEDIUM** | Done | `webhook_events_total{outcome}`, `http_requests_total`, `http_request_duration_seconds`, `dlq_depth` (backlog), `dlq_total` (audit count), `outbox_pending`. Key-protected, labelled by route template. |
 | Currency normalization | **LOW** | Done | Lowercased at the entry boundary by a `mode="before"` validator, so `USD` is accepted and stored as `usd` rather than dead-lettered. `LedgerEntry` still rejects un-normalized input as a second layer. |
 | Dependency pins | **MEDIUM** | Done | `psycopg2-binary==2.9.9` had no cp313 wheel, so the documented "Python 3.12+" prerequisite could not be followed. Bumped to 2.9.12; supported range stated explicitly. |
 | CI blind spot | **HIGH** | Done | No workflow built the image or started compose, which is why the three runtime findings above survived four audit cycles with green badges. `stack.yml` now builds, boots, and attacks the stack. |
