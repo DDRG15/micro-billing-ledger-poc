@@ -58,13 +58,20 @@ WORKER_LOG_ONLY: bool = os.environ.get("WORKER_LOG_ONLY", "false").lower() == "t
 
 # ---------------------------------------------------------------------------
 # Logging
+# Reuses the formatter from ledger.py so the API and the worker emit the same
+#     shape. Two services logging the same event in two different formats means a
+#     log backend needs two sets of parsing rules and cannot correlate them on
+#     transaction_id, which is the one field you want when tracing an event from
+#     ingest to dispatch. LOG_FORMAT=json switches both at once.
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [worker] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-    stream=sys.stdout,
-)
+_worker_handler = logging.StreamHandler(stream=sys.stdout)
+if _ledger.LOG_FORMAT == "json":
+    _worker_handler.setFormatter(_ledger.JsonLogFormatter())
+else:
+    _worker_handler.setFormatter(
+        logging.Formatter("%(asctime)s [worker] %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+    )
+logging.basicConfig(level=logging.INFO, handlers=[_worker_handler])
 log = logging.getLogger("worker")
 
 # ---------------------------------------------------------------------------

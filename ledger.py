@@ -54,19 +54,66 @@ from enum import Enum  # Enums for EventType, LedgerStatus, DLQReason — preven
 #     payload for manual replay. RotatingFileHandler prevents unbounded disk growth
 #     at high ingestion rates — at 500 TPS with frequent DLQ errors, a plain
 #     FileHandler fills disk in hours.
+#
+# Format is JSON when LOG_FORMAT=json (the default in Docker), plain text otherwise.
+#     Plain text is unparseable at the point you most need it: "which transaction_id
+#     failed, how often, and how slow was it" becomes a regex against a human sentence,
+#     and the answer changes whenever someone rewords a log line. Emitting one JSON
+#     object per line makes those fields queryable in any log backend without parsing
+#     rules, and it survives rewording because consumers read keys, not prose.
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),                          # stderr
-        RotatingFileHandler(
-            "billing_ledger.log",
-            maxBytes=10_485_760,   # 10 MB per file
-            backupCount=5,          # keep .1 through .5 → 50 MB max
-        ),
-    ],
-)
+LOG_FORMAT = os.getenv("LOG_FORMAT", "text").strip().lower()
+
+# Attributes LogRecord always carries. Anything outside this set was attached by the
+#     caller via extra={...} and belongs in the JSON output as a top-level field.
+_LOGRECORD_BUILTINS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None)))
+
+
+class JsonLogFormatter(logging.Formatter):
+    """Render each record as a single-line JSON object.
+
+    One line per record, no embedded newlines: log shippers split on newlines, so a
+    multi-line record becomes several unparseable fragments. Exception tracebacks are
+    folded into a single string field for that reason.
+
+    Any key passed through extra={...} is promoted to a top-level field, which is what
+    makes transaction_id, outcome and duration_ms queryable instead of buried in prose.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts":      datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+            "level":   record.levelname,
+            "logger":  record.name,
+            "message": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _LOGRECORD_BUILTINS and not key.startswith("_"):
+                payload[key] = value
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        # default=str so a stray datetime or Decimal degrades to its string form
+        #     instead of raising inside the logging call and losing the record.
+        return json.dumps(payload, default=str)
+
+
+def _build_log_handlers() -> list:
+    formatter: logging.Formatter = (
+        JsonLogFormatter() if LOG_FORMAT == "json"
+        else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    stream_handler = logging.StreamHandler()               # stderr
+    file_handler = RotatingFileHandler(
+        "billing_ledger.log",
+        maxBytes=10_485_760,   # 10 MB per file
+        backupCount=5,          # keep .1 through .5 → 50 MB max
+    )
+    for handler in (stream_handler, file_handler):
+        handler.setFormatter(formatter)
+    return [stream_handler, file_handler]
+
+
+logging.basicConfig(level=logging.INFO, handlers=_build_log_handlers())
 _log = logging.getLogger("ledger")
 
 # ---------------------------------------------------------------------------
@@ -75,11 +122,18 @@ _log = logging.getLogger("ledger")
 #     All pinned in requirements.txt — no surprise version changes.
 # ---------------------------------------------------------------------------
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import JSONResponse, Response  # noqa: E402
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator  # noqa: E402
 from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: E402
 from slowapi.util import get_remote_address  # noqa: E402
 from slowapi.errors import RateLimitExceeded  # noqa: E402
+from prometheus_client import (  # noqa: E402
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
 
 # ===========================================================================
 # SECTION 1: ENUMS AND PYDANTIC MODELS (Phase 1 + Phase 2)
@@ -1301,6 +1355,68 @@ _limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = _limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# ---------------------------------------------------------------------------
+# Metrics
+# Counters and a latency histogram, exported at GET /metrics.
+#     Counters only ever increase, so a scrape that is missed or arrives late loses
+#     no information — the next one still carries the true total. A gauge sampled at
+#     scrape time cannot say that, which is why dlq_depth and outbox_pending are read
+#     from the database on each scrape rather than tracked incrementally in memory:
+#     an in-memory counter of queue depth drifts from the table the moment anything
+#     else writes to it, including the worker, and a drifting depth is worse than none.
+# ---------------------------------------------------------------------------
+_WEBHOOK_EVENTS = Counter(
+    "webhook_events_total",
+    "Webhook events by terminal outcome",
+    ["outcome"],
+)
+_HTTP_REQUESTS = Counter(
+    "http_requests_total",
+    "HTTP requests by route template and status code",
+    ["method", "path", "status"],
+)
+_HTTP_LATENCY = Histogram(
+    "http_request_duration_seconds",
+    "Request latency by route template",
+    ["method", "path"],
+)
+_DLQ_DEPTH = Gauge("dlq_depth", "Rows currently in the dead letter queue")
+_OUTBOX_PENDING = Gauge("outbox_pending", "Outbox rows not yet dispatched downstream")
+
+
+@app.middleware("http")
+async def _observability(request: Request, call_next):
+    """Emit one structured log line and one metrics sample per request.
+
+    Labels use the route TEMPLATE (/dlq/{dlq_id}/retry), never the resolved path.
+    Labelling by resolved path gives every dlq_id its own time series, which turns a
+    handful of routes into unbounded cardinality and is the standard way to take down
+    a Prometheus server with your own instrumentation.
+    """
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or "unmatched"
+    status_code = str(response.status_code)
+
+    _HTTP_REQUESTS.labels(request.method, path, status_code).inc()
+    _HTTP_LATENCY.labels(request.method, path).observe(duration_ms / 1000.0)
+
+    _log.info(
+        "request %s %s -> %s", request.method, path, status_code,
+        extra={
+            "event":       "http_request",
+            "method":      request.method,
+            "path":        path,
+            "status":      response.status_code,
+            "duration_ms": duration_ms,
+            "client_ip":   get_remote_address(request),
+        },
+    )
+    return response
+
 # Ensure all three tables and their indexes exist before the pool opens connections.
 #     The bootstrap connection is closed immediately — it is not reused.
 _bootstrap_conn = _bootstrap()
@@ -1377,10 +1493,24 @@ def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONRespo
         # RuntimeError from _tx() means a DB-level failure (locked, corrupt, disk full).
         #     503 tells Stripe to back off and retry — the correct behavior for transient errors.
         #     Do NOT return 200 here — that would tell Stripe "got it" when we didn't.
+        _WEBHOOK_EVENTS.labels("DB_ERROR").inc()
         raise HTTPException(status_code=503, detail=str(exc))
     finally:
         _pool.putconn(conn)
 
+    outcome = result.get("outcome", "UNKNOWN")
+    _WEBHOOK_EVENTS.labels(outcome).inc()
+    # The outcome is the fact worth querying later — "how many events were dead-lettered
+    #     as duplicates last Tuesday" should be a filter, not a regex over prose.
+    _log.info(
+        "webhook processed %s", outcome,
+        extra={
+            "event":          "webhook_processed",
+            "transaction_id": result.get("transaction_id"),
+            "outcome":        outcome,
+            "reason":         result.get("reason"),
+        },
+    )
     return JSONResponse(content=result)
 
 
@@ -1415,6 +1545,40 @@ def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSO
         "dlq_depth":      dlq_depth,      # Total entries in DLQ (all reasons)
         "outbox_pending": outbox_pending, # Events not yet dispatched downstream
     })
+
+
+@app.get("/metrics")
+@_limiter.limit("60/minute")
+def metrics(request: Request, _: None = Depends(_require_api_key)) -> Response:
+    """
+    Prometheus exposition endpoint.
+
+    Requires X-Api-Key for the same reason /ledger/summary does: it publishes
+    dlq_depth and outbox_pending, the same operational figures, and leaving one door
+    open while locking the other is not a security boundary. Point Prometheus at it
+    with an authorization header in the scrape config:
+
+        scrape_configs:
+          - job_name: billing
+            authorization: {type: X-Api-Key, credentials_file: /etc/prom/billing.key}
+
+    The two queue gauges are read from the database on each scrape rather than kept
+    in memory. The worker drains the outbox and prunes the DLQ from a different
+    process, so any in-memory count would silently diverge from the tables it claims
+    to describe — and a queue depth that is confidently wrong is worse than absent.
+    """
+    conn = _pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM dlq")
+            _DLQ_DEPTH.set(cur.fetchone()[0])
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
+            _OUTBOX_PENDING.set(cur.fetchone()[0])
+    finally:
+        _pool.putconn(conn)
+
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/dlq/entries")

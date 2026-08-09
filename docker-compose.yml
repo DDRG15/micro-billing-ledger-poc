@@ -69,6 +69,9 @@ services:
       #     A subnet like 172.28.0.0/16 here would match nothing and silently
       #     disable X-Forwarded-For entirely. Use a literal address.
       FORWARDED_ALLOW_IPS:     ${FORWARDED_ALLOW_IPS:-172.28.0.10}
+      # JSON logs in containers: stdout goes to a log driver, and one object per
+      #     line is queryable without parsing rules. Unset it for plain text locally.
+      LOG_FORMAT:              ${LOG_FORMAT:-json}
     ports:
       # Exposed on localhost only for local development and tests.
       #     In production, traffic reaches billing through Caddy (port 443).
@@ -111,6 +114,9 @@ services:
       WORKER_LOG_ONLY:     ${WORKER_LOG_ONLY}
       WORKER_BATCH_SIZE:   ${WORKER_BATCH_SIZE}
       WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL}
+      # Same format as the billing service — correlating an event from ingest to
+      #     dispatch needs both sides emitting the same shape on transaction_id.
+      LOG_FORMAT:          ${LOG_FORMAT:-json}
     depends_on:
       postgres:
         condition: service_healthy

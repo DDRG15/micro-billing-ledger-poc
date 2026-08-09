@@ -16,6 +16,7 @@ can run it with a plain Python install.
 # ---------------------------------------------------------------------------
 import io          # Used to wrap stdout for UTF-8 output on Windows
 import json        # Used to verify raw_payload round-trips correctly
+import logging     # Phase 12: build LogRecords to assert the JSON formatter's output
 import sys         # stdout override for Windows UTF-8 encoding
 import time        # Used in benchmark timing
 import threading   # Used for the concurrent idempotency test
@@ -1528,6 +1529,136 @@ with claim_conn.cursor() as c:
 chk("pre-migration claim (claimed_at NULL) is reclaimed",
     L.retry_dlq_batch(claim_conn, claim_timeout_seconds=900) == 1)
 claim_conn.close()
+
+
+# =============================================================================
+# PHASE 12a: STRUCTURED JSON LOGGING
+# Plain text is unparseable exactly when it matters. "Which transaction_id failed,
+#     how often, how slow" becomes a regex over a human sentence that changes the
+#     next time someone rewords a log line. One JSON object per line makes those
+#     fields queryable, and consumers read keys rather than prose.
+# =============================================================================
+print("\n── Phase 12a: structured JSON logging ──────────────────────────────────")
+
+_json_fmt = L.JsonLogFormatter()
+
+_rec = logging.LogRecord(
+    name="ledger", level=logging.INFO, pathname=__file__, lineno=1,
+    msg="webhook processed %s", args=("POSTED",), exc_info=None,
+)
+_rec.transaction_id = "evt_json_001"
+_rec.outcome = "POSTED"
+_rec.duration_ms = 12.5
+_parsed = json.loads(_json_fmt.format(_rec))
+
+chk("log line is valid JSON",                    isinstance(_parsed, dict))
+chk("message is interpolated, not a format string",
+    _parsed["message"] == "webhook processed POSTED", f"got {_parsed['message']!r}")
+chk("level is present",                          _parsed["level"] == "INFO")
+chk("logger name is present",                    _parsed["logger"] == "ledger")
+chk("timestamp is ISO-8601 with timezone",
+    "T" in _parsed["ts"] and ("+" in _parsed["ts"] or _parsed["ts"].endswith("Z")),
+    f"got {_parsed['ts']!r}")
+chk("extra= transaction_id promoted to top level", _parsed["transaction_id"] == "evt_json_001")
+chk("extra= outcome promoted to top level",        _parsed["outcome"] == "POSTED")
+chk("extra= duration_ms promoted to top level",    _parsed["duration_ms"] == 12.5)
+
+# One record must never span multiple lines: shippers split on newlines, so a
+#     multi-line record arrives as several unparseable fragments.
+_rec_multi = logging.LogRecord(
+    name="ledger", level=logging.ERROR, pathname=__file__, lineno=1,
+    msg="broke on\ntwo lines", args=(), exc_info=None,
+)
+chk("embedded newline does not split the record",
+    "\n" not in L.JsonLogFormatter().format(_rec_multi))
+
+try:
+    raise ValueError("simulated failure")
+except ValueError:
+    _rec_exc = logging.LogRecord(
+        name="ledger", level=logging.ERROR, pathname=__file__, lineno=1,
+        msg="failed", args=(), exc_info=sys.exc_info(),
+    )
+_parsed_exc = json.loads(_json_fmt.format(_rec_exc))
+chk("traceback is folded into one JSON string field",
+    "ValueError" in _parsed_exc.get("exception", ""))
+chk("record with traceback is still one line",
+    "\n" not in _json_fmt.format(_rec_exc))
+
+# A value json cannot serialize must degrade, not raise — losing the record to a
+#     serialization error is strictly worse than logging its string form.
+_rec_odd = logging.LogRecord(
+    name="ledger", level=logging.INFO, pathname=__file__, lineno=1,
+    msg="odd", args=(), exc_info=None,
+)
+_rec_odd.when = datetime(2026, 8, 9, 12, 0, 0)
+chk("non-serializable extra degrades to string instead of raising",
+    "2026-08-09" in json.loads(_json_fmt.format(_rec_odd))["when"])
+
+
+# =============================================================================
+# PHASE 12b: PROMETHEUS /metrics
+# =============================================================================
+print("\n── Phase 12b: Prometheus /metrics endpoint ─────────────────────────────")
+
+metrics_conn = fresh_conn()
+original_pool_metrics = L._pool
+L._pool = _MockPool(metrics_conn)
+metrics_client = TestClient(L.app)
+
+with patch("stripe.Webhook.construct_event"):
+    metrics_client.post("/webhook/stripe", json=fake_event(eid="evt_metrics_001"))
+    metrics_client.post("/webhook/stripe", json=fake_event(eid="evt_metrics_001"))  # duplicate
+
+r_metrics = metrics_client.get("/metrics")
+chk("GET /metrics → 200", r_metrics.status_code == 200, f"got {r_metrics.status_code}")
+chk("content type is Prometheus exposition",
+    "text/plain" in r_metrics.headers.get("content-type", ""),
+    r_metrics.headers.get("content-type", ""))
+
+_body = r_metrics.text
+for _metric in ("webhook_events_total", "http_requests_total",
+                "http_request_duration_seconds", "dlq_depth", "outbox_pending"):
+    chk(f"exposes {_metric}", _metric in _body)
+
+chk("webhook outcomes are labelled, not collapsed",
+    'webhook_events_total{outcome="POSTED"}' in _body, "POSTED label missing")
+chk("duplicate outcome counted separately",
+    'webhook_events_total{outcome="DLQ_DUPLICATE"}' in _body, "DLQ_DUPLICATE label missing")
+
+# Gauges are read from the DB at scrape time, so they must match what the tables say.
+_dlq_now = _q1(metrics_conn, "SELECT COUNT(*) FROM dlq")
+chk("dlq_depth gauge matches the table at scrape time",
+    f"dlq_depth {float(_dlq_now)}" in _body, f"expected {_dlq_now}")
+
+# Route templates, never resolved paths: labelling by resolved path gives every
+#     dlq_id its own time series and turns instrumentation into a cardinality bomb.
+metrics_client.post("/dlq/999999/retry")
+_body2 = metrics_client.get("/metrics").text
+chk("histogram labels use the route template",
+    '/dlq/{dlq_id}/retry' in _body2, "route template label missing")
+chk("resolved id never becomes a label value",
+    '/dlq/999999/retry' not in _body2, "resolved path leaked into labels")
+
+L._pool = original_pool_metrics
+metrics_conn.close()
+
+# /metrics publishes dlq_depth and outbox_pending — the same operational figures as
+#     /ledger/summary, which is key-protected. Leaving one door open is not a boundary.
+auth_metrics_conn = fresh_conn()
+original_pool_am = L._pool
+L._pool = _MockPool(auth_metrics_conn)
+L.BILLING_API_KEY = "test_secret_key"
+try:
+    am_client = TestClient(L.app)
+    chk("/metrics without X-Api-Key → 401",
+        am_client.get("/metrics").status_code == 401)
+    chk("/metrics with correct X-Api-Key → 200",
+        am_client.get("/metrics", headers={"X-Api-Key": "test_secret_key"}).status_code == 200)
+finally:
+    L.BILLING_API_KEY = ""
+    L._pool = original_pool_am
+    auth_metrics_conn.close()
 
 
 # =============================================================================

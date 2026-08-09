@@ -61,6 +61,10 @@ alembic==1.18.4
 #     Only used for migration execution, not for ORM queries (psycopg2 handles all app queries).
 sqlalchemy==2.0.41
 
-# Uncomment when adding Prometheus /metrics endpoint.
-# prometheus-client==0.21.0
+# prometheus-client 0.21.0 — Prometheus exposition for GET /metrics (Phase 12).
+#     Provides Counter/Gauge/Histogram and generate_latest(). Used instead of
+#     hand-rolling the text format because the escaping rules for label values and
+#     the histogram bucket layout are easy to get subtly wrong, and a metrics
+#     endpoint that emits almost-valid exposition fails at the scraper, not here.
+prometheus-client==0.21.0
 # ---------------------------------------------------------------------------
