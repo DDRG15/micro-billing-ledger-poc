@@ -34,7 +34,13 @@ pydantic==2.9.2
 #     Set STRIPE_WEBHOOK_SECRET in the environment to activate enforcement.
 stripe==10.12.0
 
-psycopg2-binary==2.9.9  # PostgreSQL sync driver — ACTIVE. Binary package includes libpq; no OS headers needed.
+# psycopg2-binary 2.9.12 — PostgreSQL sync driver. ACTIVE.
+#     Binary package includes libpq; no OS headers needed.
+#     Was pinned to 2.9.9, which has no cp313 wheel: anyone on Python 3.13 following
+#     the README's own stated prerequisite hit "pg_config executable not found" as pip
+#     fell back to a source build. 2.9.12 ships wheels for 3.12 and 3.13, so the pin
+#     and the documented prerequisite finally agree.
+psycopg2-binary==2.9.12
 
 # httpx 0.27.2 — required by starlette.testclient (TestClient transport layer).
 #     starlette>=0.21 dropped requests in favour of httpx. Without it, importing

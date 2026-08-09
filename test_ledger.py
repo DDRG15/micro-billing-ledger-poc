@@ -984,16 +984,24 @@ import subprocess
 
 conn_mig = fresh_conn()
 
-# Test 1 — alembic upgrade head runs without error and reaches revision 0001.
+# Invoke alembic through the SAME interpreter running this suite, not through a bare
+#     "alembic" on PATH. A bare name resolves to whichever installation happens to come
+#     first, which on a dev box is easily a different Python with a different alembic —
+#     so these tests could pass against a toolchain the project never pins, while the
+#     venv under test had no alembic at all. sys.executable -m makes the environment
+#     being tested and the environment doing the testing the same one.
+_ALEMBIC = [sys.executable, "-m", "alembic"]
+
+# Test 1 — alembic upgrade head runs without error and reaches the latest revision.
 result = subprocess.run(
-    ["alembic", "upgrade", "head"],
+    [*_ALEMBIC, "upgrade", "head"],
     capture_output=True, text=True,
     env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
 )
 chk("alembic upgrade head exits 0", result.returncode == 0, result.stderr.strip())
 
 result2 = subprocess.run(
-    ["alembic", "current"],
+    [*_ALEMBIC, "current"],
     capture_output=True, text=True,
     env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
 )
@@ -1002,7 +1010,7 @@ result2 = subprocess.run(
 #     which trains people to edit the assertion instead of reading it. What actually
 #     matters is that `upgrade head` landed on the latest revision, not its number.
 result_heads = subprocess.run(
-    ["alembic", "heads"],
+    [*_ALEMBIC, "heads"],
     capture_output=True, text=True,
     env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
 )
@@ -1044,14 +1052,14 @@ chk("outbox.dispatched_at column exists", col is not None, "column missing")
 
 # Test 4 — downgrade to base then upgrade back to head (round-trip).
 result_down = subprocess.run(
-    ["alembic", "downgrade", "base"],
+    [*_ALEMBIC, "downgrade", "base"],
     capture_output=True, text=True,
     env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
 )
 chk("alembic downgrade base exits 0", result_down.returncode == 0, result_down.stderr.strip())
 
 result_up = subprocess.run(
-    ["alembic", "upgrade", "head"],
+    [*_ALEMBIC, "upgrade", "head"],
     capture_output=True, text=True,
     env={**__import__("os").environ, "DATABASE_URL": L.DATABASE_URL},
 )

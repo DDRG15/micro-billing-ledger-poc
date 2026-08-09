@@ -29,7 +29,7 @@ Two concurrent retries pass the `exists()` check before either commits. The resu
 
 ## Quick Start
 
-**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) · Python 3.12+
+**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) · Python 3.12 or 3.13
 
 ```bash
 # 1. Start PostgreSQL
