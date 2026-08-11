@@ -382,6 +382,12 @@ Labels use the route **template** (`/dlq/{dlq_id}/retry`), never the resolved pa
 
 The two queue gauges are read from the database on each scrape rather than tracked in memory. The worker drains the outbox and prunes the DLQ from a different process, so an in-memory count would diverge from the tables it claims to describe, and a queue depth that is confidently wrong is worse than no queue depth at all.
 
+**Secret provenance.** The startup log emits a `secrets_loaded` event and `/metrics` exposes `billing_secrets_info`, each carrying a SHA-256 prefix of the live secrets and where they came from (`env` or `file`). This exists because the failure it catches is otherwise silent: **`docker compose restart` does not re-read `.env`** — it restarts the existing container with its original environment, so a rotated secret is not live until `docker compose up -d` recreates the container. Without a fingerprint, an operator who edits `.env` and restarts gets no error, no log and no metric telling them the old credential is still in use.
+
+Secrets can also be supplied as files via `BILLING_API_KEY_FILE` and `STRIPE_WEBHOOK_SECRET_FILE` — the Docker/Kubernetes convention, and the only way to rotate without replacing the container, since a container's environment is immutable for its lifetime while a mounted file is not. A configured but unreadable `*_FILE` stops the service rather than falling back to the environment variable.
+
+Publishing a hash is safe for a high-entropy secret and not for a guessable one; see [SECURITY.md](SECURITY.md).
+
 `/metrics` requires `X-Api-Key` because it publishes the same operational figures as `/ledger/summary`; locking one door and leaving the other open is not a boundary. Scrape config:
 
 ```yaml

@@ -17,6 +17,7 @@ can run it with a plain Python install.
 import io          # Used to wrap stdout for UTF-8 output on Windows
 import json        # Used to verify raw_payload round-trips correctly
 import logging     # Phase 12: build LogRecords to assert the JSON formatter's output
+import os          # A6: manipulate env vars to exercise the *_FILE secret sources
 import sys         # stdout override for Windows UTF-8 encoding
 import time        # Used in benchmark timing
 import threading   # Used for the concurrent idempotency test
@@ -1606,6 +1607,88 @@ chk("dlq_total gauge exposed for audit", "dlq_total 5.0" in _m, "dlq_total missi
 
 L._pool = original_pool_depth
 depth_conn.close()
+
+
+# =============================================================================
+# A6: SECRET PROVENANCE
+# A container's environment is immutable for its lifetime, so a secret delivered by
+#     env var cannot be rotated without replacing the container — and `docker compose
+#     restart` does NOT re-read .env, it restarts the existing container with its
+#     original environment. An operator who edits .env and restarts believes the new
+#     secret is live when it is not, with no error, no log and no metric to say so.
+#     Two answers: read secrets from a mounted file (which CAN change), and fingerprint
+#     whatever is actually live so the mistake is visible.
+# =============================================================================
+print("\n── A6: secret provenance — *_FILE sources and fingerprints ─────────────")
+
+import tempfile  # noqa: E402
+
+chk("empty secret fingerprints as 'unset'", L._secret_fingerprint("") == "unset")
+_fp = L._secret_fingerprint("whsec_abc123")
+chk("fingerprint is 12 hex chars", len(_fp) == 12 and all(c in "0123456789abcdef" for c in _fp), _fp)
+chk("fingerprint is deterministic", L._secret_fingerprint("whsec_abc123") == _fp)
+chk("different secrets fingerprint differently", L._secret_fingerprint("whsec_xyz789") != _fp)
+chk("fingerprint does not leak the secret",
+    "whsec_abc123" not in _fp and "abc123" not in _fp, _fp)
+
+_sec_dir = tempfile.mkdtemp()
+_sec_path = os.path.join(_sec_dir, "api_key")
+with io.open(_sec_path, "w", encoding="utf-8") as _fh:
+    _fh.write("secret_from_file_value\n")   # trailing newline: how files are usually written
+
+_saved = {k: os.environ.get(k) for k in ("A6_TEST_SECRET", "A6_TEST_SECRET_FILE")}
+try:
+    os.environ.pop("A6_TEST_SECRET", None)
+    os.environ.pop("A6_TEST_SECRET_FILE", None)
+    chk("falls back to the default when nothing is set",
+        L._read_secret("A6_TEST_SECRET", "fallback") == "fallback")
+
+    os.environ["A6_TEST_SECRET"] = "value_from_env"
+    chk("reads the env var when no _FILE is set",
+        L._read_secret("A6_TEST_SECRET", "fallback") == "value_from_env")
+
+    os.environ["A6_TEST_SECRET_FILE"] = _sec_path
+    chk("_FILE takes precedence over the env var",
+        L._read_secret("A6_TEST_SECRET", "fallback") == "secret_from_file_value")
+    chk("trailing newline is stripped from the file",
+        "\n" not in L._read_secret("A6_TEST_SECRET", "fallback"))
+
+    # The important one: a configured but unreadable _FILE must NOT fall back to the
+    # env var. Falling back starts the service on the wrong credential and logs nothing.
+    os.environ["A6_TEST_SECRET_FILE"] = os.path.join(_sec_dir, "does_not_exist")
+    _raised = None
+    try:
+        L._read_secret("A6_TEST_SECRET", "fallback")
+    except RuntimeError as _exc:
+        _raised = _exc
+    chk("unreadable _FILE raises instead of falling back", _raised is not None,
+        "silently fell back to the env var")
+    chk("the error names the variable and the path",
+        _raised is not None and "A6_TEST_SECRET_FILE" in str(_raised),
+        str(_raised))
+finally:
+    for _k, _v in _saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+# Fingerprints must reach /metrics so a scraper can alert on an unexpected change —
+#     or on the absence of a change after a rotation that was supposed to happen.
+sec_conn = fresh_conn()
+original_pool_sec = L._pool
+L._pool = _MockPool(sec_conn)
+sec_client = TestClient(L.app)
+_sec_body = sec_client.get("/metrics").text
+chk("billing_secrets_info is exposed", "billing_secrets_info" in _sec_body)
+chk("the live stripe fingerprint appears",
+    L._SECRET_FINGERPRINTS["stripe_webhook_secret"] in _sec_body)
+chk("the secret source (env|file) is labelled",
+    'stripe_secret_source="env"' in _sec_body or 'stripe_secret_source="file"' in _sec_body)
+chk("no raw secret value is exposed in metrics",
+    L.STRIPE_WEBHOOK_SECRET not in _sec_body, "raw secret leaked into /metrics")
+L._pool = original_pool_sec
+sec_conn.close()
 
 
 # =============================================================================

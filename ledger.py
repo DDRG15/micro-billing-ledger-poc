@@ -32,6 +32,7 @@ Usage:
 # All built-in Python modules — no external dependencies here.
 # ---------------------------------------------------------------------------
 import argparse       # CLI argument parsing for --silent/--events flags
+import hashlib        # SHA-256 fingerprints of live secrets — see _secret_fingerprint
 import json           # JSON serialization for raw payload archiving
 import logging        # Structured log output to file and stderr
 from logging.handlers import RotatingFileHandler  # Rotating file handler — caps log file size to prevent disk fill
@@ -132,6 +133,7 @@ from prometheus_client import (  # noqa: E402
     Counter,
     Gauge,
     Histogram,
+    Info,
     generate_latest,
 )
 
@@ -533,12 +535,62 @@ DATABASE_URL: str = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/billing"
 )
 
-# Stripe webhook signing secret — sourced from environment, never hardcoded.
+def _read_secret(name: str, default: str = "") -> str:
+    """Resolve a secret from `<NAME>_FILE` if set, otherwise from `<NAME>`.
+
+    The _FILE form is the Docker/Kubernetes secrets convention: the orchestrator mounts
+    the value as a file and the process reads it. It exists here for a specific reason —
+    a container's environment is IMMUTABLE for its lifetime, so a secret delivered by env
+    var cannot be rotated without replacing the container. A mounted file can change under
+    a running process, which is what makes rotation possible at all.
+
+    A configured but unreadable _FILE raises instead of falling back to the env var.
+    Falling back would start the service on the wrong credential and log nothing, which is
+    the failure this whole section exists to prevent.
+    """
+    path = os.environ.get(f"{name}_FILE", "").strip()
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError as exc:
+            raise RuntimeError(
+                f"{name}_FILE is set to {path!r} but could not be read: {exc}. "
+                f"Refusing to fall back to ${name} — starting on the wrong secret silently "
+                f"is worse than not starting."
+            ) from exc
+    return os.environ.get(name, default)
+
+
+def _secret_fingerprint(secret: str) -> str:
+    """First 12 hex chars of SHA-256, or 'unset'.
+
+    Answers one operational question: is the secret this process is running with the same
+    one I think I deployed? Compare against `sha256(value)` computed locally.
+
+    Why it is needed at all: `docker compose restart` does NOT re-read `.env`. It restarts
+    the existing container with its original environment, so an operator who edits .env and
+    restarts believes the new secret is live when it is not — `docker compose up -d`, which
+    recreates the container, is the command that applies it. Without a fingerprint that
+    mistake produces no error, no log line and no metric. With one it is visible in both.
+
+    The fingerprint is safe to log and to expose on the key-protected /metrics endpoint for
+    a HIGH-ENTROPY secret, which is what the docs demand (openssl rand -hex 32). It is NOT
+    safe for a guessable one: publishing a hash of a low-entropy value invites an offline
+    dictionary attack. Treating a weak secret as confidential was never going to work
+    anyway, but the trade-off belongs in the open.
+    """
+    if not secret:
+        return "unset"
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+
+
+# Stripe webhook signing secret — sourced from environment or a mounted file, never hardcoded.
 #     Get from: Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret
 #     Format: whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 #     Without this set to a real value, stripe.Webhook.construct_event() will reject
 #     ALL incoming requests with 400. Set it before receiving live Stripe traffic.
-STRIPE_WEBHOOK_SECRET: str = os.environ.get("STRIPE_WEBHOOK_SECRET", "whsec_YOUR_SECRET_HERE")
+STRIPE_WEBHOOK_SECRET: str = _read_secret("STRIPE_WEBHOOK_SECRET", "whsec_YOUR_SECRET_HERE")
 
 # Guard against placeholder secret reaching production. The default value
 #     "whsec_YOUR_SECRET_HERE" is not a valid Stripe signing secret. If the env var
@@ -559,7 +611,7 @@ if STRIPE_WEBHOOK_SECRET == _PLACEHOLDER_SECRET:
 #     If empty (env var not set), the check is skipped — dev-mode convenience.
 #     In production: set to a strong random value, e.g., openssl rand -hex 32.
 #     Operational data (customer IDs, amounts, raw payloads) must not be world-readable.
-BILLING_API_KEY: str = os.environ.get("BILLING_API_KEY", "")
+BILLING_API_KEY: str = _read_secret("BILLING_API_KEY", "")
 
 # Fail-open on an empty key is a deliberate dev convenience — but a silent one is a
 #     liability. If a production deploy forgets BILLING_API_KEY, /dlq/entries would
@@ -571,6 +623,22 @@ if not BILLING_API_KEY:
         "are UNAUTHENTICATED. Dev mode only. Set a strong key (openssl rand -hex 32) "
         "before any network-reachable deployment."
     )
+
+# Which secrets this process actually came up with. An operator can compare these against
+#     `sha256(value)` computed locally to confirm a rotation landed, without either value
+#     ever appearing in a log. See _secret_fingerprint for why this is worth the line.
+_SECRET_FINGERPRINTS = {
+    "stripe_webhook_secret": _secret_fingerprint(STRIPE_WEBHOOK_SECRET),
+    "billing_api_key":       _secret_fingerprint(BILLING_API_KEY),
+    "stripe_secret_source":  "file" if os.environ.get("STRIPE_WEBHOOK_SECRET_FILE") else "env",
+    "billing_key_source":    "file" if os.environ.get("BILLING_API_KEY_FILE") else "env",
+}
+_log.info(
+    "secrets loaded stripe=%s(%s) billing_api_key=%s(%s)",
+    _SECRET_FINGERPRINTS["stripe_webhook_secret"], _SECRET_FINGERPRINTS["stripe_secret_source"],
+    _SECRET_FINGERPRINTS["billing_api_key"],       _SECRET_FINGERPRINTS["billing_key_source"],
+    extra={"event": "secrets_loaded", **_SECRET_FINGERPRINTS},
+)
 
 
 # ===========================================================================
@@ -1393,6 +1461,17 @@ _HTTP_LATENCY = Histogram(
 )
 _DLQ_DEPTH = Gauge("dlq_depth", "DLQ rows still needing action (pending, retrying or exhausted)")
 _DLQ_TOTAL = Gauge("dlq_total", "All DLQ rows ever written, resolved ones included")
+
+# Fingerprints of the secrets this process is running with, and where each came from.
+#     Constant for the life of the process — that is the point. Alert on it changing
+#     unexpectedly (a deploy you did not make) or failing to change after a rotation you
+#     did make. The second case is the silent one: `docker compose restart` does not
+#     re-read .env, so a rotation can appear applied while the old secret stays live.
+#     Safe to expose here because /metrics requires the API key and a SHA-256 prefix of a
+#     high-entropy secret is not reversible. Not safe if the secret is guessable — see
+#     _secret_fingerprint.
+_SECRETS_INFO = Info("billing_secrets", "Fingerprint and source of the secrets in use")
+_SECRETS_INFO.info(_SECRET_FINGERPRINTS)
 _OUTBOX_PENDING = Gauge("outbox_pending", "Outbox rows not yet dispatched downstream")
 
 

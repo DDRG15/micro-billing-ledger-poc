@@ -50,6 +50,41 @@ before anything is reachable from a network. `BILLING_API_KEY` left empty disabl
 authentication on the operational endpoints entirely; the application logs a warning at
 startup when that happens, and that warning is not decorative.
 
+## Secrets and rotation
+
+Secrets come from environment variables, or from a file when `<NAME>_FILE` is set —
+`BILLING_API_KEY_FILE`, `STRIPE_WEBHOOK_SECRET_FILE`. The file form is the
+Docker/Kubernetes secrets convention and it exists for a concrete reason: a container's
+environment is immutable for its lifetime, so a secret delivered by environment variable
+cannot be rotated without replacing the container. A mounted file can change underneath a
+running process.
+
+A configured but unreadable `*_FILE` makes the service refuse to start rather than fall
+back to the environment variable. Starting on the wrong credential and logging nothing is
+a worse outcome than not starting.
+
+**`docker compose restart` does not re-read `.env`.** It restarts the existing container
+with its original environment, so a rotated secret is not live until the container is
+recreated with `docker compose up -d`. Before this was made observable, that mistake
+produced no error, no log line and no metric — the operator believed a rotation had landed
+while the old credential kept working.
+
+To confirm which secret a process is actually running with, without printing it: the
+startup log emits a `secrets_loaded` event, and `/metrics` exposes `billing_secrets_info`.
+Both carry a SHA-256 prefix and the source (`env` or `file`), which you can compare against
+a locally computed hash. Alert on that fingerprint changing when you did not deploy, and on
+it *failing* to change after a rotation you did perform.
+
+A published hash is only safe for a high-entropy secret, which is what this project asks
+for (`openssl rand -hex 32`). For a guessable value, publishing its hash invites an offline
+dictionary attack — the fingerprint does not make a weak secret safe, and nothing else will
+either.
+
+**Not attempted:** live reload. Secrets are read once at startup. Rotation means recreating
+the container or restarting the process. Re-reading a file on every request would add an
+I/O call to the hot path and a new class of failure — a half-written secret file read
+mid-rotation — to solve a problem that a deploy already solves.
+
 ## Dependencies
 
 Production dependencies are pinned to exact versions in `requirements.txt`. Pinning
