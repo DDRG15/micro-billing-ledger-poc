@@ -8,8 +8,8 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 221 / 221 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
-**Throughput:** ~5,000 TPS batch ingest (`execute_values`) · 26 TPS per-event, the cost of 4 synchronous round trips per event · measured on Docker-on-Windows localhost, see Performance Benchmarks
+**Tests:** 243 / 243 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Throughput:** 4,699 TPS batch · 152 TPS over HTTP at 16 concurrent clients (p50 96ms) · 28 TPS per-event · all reproducible via `python benchmark.py`
 
 ---
 
@@ -47,7 +47,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. Run the full test suite — 221 tests, live PostgreSQL, no mocks
+# 4. Run the full test suite — 243 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 5. Start the full stack (postgres + billing + worker + caddy)
@@ -244,19 +244,32 @@ Layer 5 — DLQ routing
 
 ## Performance Benchmarks
 
-All numbers from `python test_ledger.py` against a live Docker PostgreSQL 16 container.  
-Environment: Windows 10 · Docker-on-WSL2 · Python 3.12 · single core · ~8ms/round trip.
-
-### Why single-event was slow (26 TPS)
+Every number below comes from `python benchmark.py`, which is in the repository. Run it
+yourself; do not quote these figures for your own hardware.
 
 ```
-Per event: BEGIN + INSERT ledger + INSERT outbox + COMMIT = 4 round trips
-5,000 events × 4 round trips × ~8ms/round trip = ~160 seconds → 26 TPS
+python benchmark.py --events 5000 --http-events 1500 --concurrency 16
 ```
 
-Each event was a separate synchronous fsync through WAL. The bottleneck was not CPU, not Pydantic, not the constraint check — it was the number of synchronous network round trips to a Docker container on WSL2.
+Measured on Windows 10 · Docker Desktop · Python 3.13.7 · PostgreSQL 16 in a container:
 
-### Why batch is fast (~5,000 TPS)
+| Path | Events | Time | Throughput | Latency |
+|---|---|---|---|---|
+| Single-event (`process_stripe_event`) | 5,000 | 179.1s | **28 TPS** | — |
+| Batch (`process_stripe_event_batch`) | 5,000 | 1.06s | **4,699 TPS** | — |
+| HTTP end-to-end (`POST /webhook/stripe`) | 1,500 | 9.88s | **152 TPS** | p50 96ms · p95 170ms · p99 208ms |
+
+### Why single-event is bounded by round trips, not CPU
+
+```
+Per event: BEGIN + INSERT ledger + INSERT outbox + COMMIT = 4 synchronous round trips
+5,000 events × 4 round trips ≈ 179 seconds → 28 TPS
+```
+
+The bottleneck is not CPU, not Pydantic, not the constraint check — it is the count of
+synchronous round trips to PostgreSQL, each ending in a WAL fsync.
+
+### Why batch is 168× faster
 
 ```
 5,000 events → 12 round trips total:
@@ -264,17 +277,45 @@ Each event was a separate synchronous fsync through WAL. The bottleneck was not 
   5  bulk ledger INSERTs  (execute_values, page_size=1000, RETURNING transaction_id)
   5  bulk outbox INSERTs  (execute_values, page_size=1000)
   1  COMMIT
-= ~1.0 second elapsed → ~5,000 TPS  (192× improvement)
+= 1.06 seconds elapsed → 4,699 TPS
 ```
 
-`psycopg2.extras.execute_values` collapses N individual INSERT statements into `ceil(N / page_size)` multi-row statements. PostgreSQL does the same total work; the application makes 192× fewer network calls. `page_size=1000` is chosen because 9 ledger columns × 1,000 rows = 9,000 bind parameters — safely within PostgreSQL's 65,535-parameter statement limit.
+`execute_values` collapses N INSERT statements into `ceil(N / page_size)` multi-row
+statements. PostgreSQL does the same total work; the application makes far fewer network
+calls. `page_size=1000` is chosen because 9 ledger columns × 1,000 rows = 9,000 bind
+parameters, safely within PostgreSQL's 65,535-parameter statement limit.
 
-### Results
+### What writing this benchmark found
 
-| Path | Events | Time | TPS |
-|---|---|---|---|
-| Per-event (pre-batch) | 5,000 | ~195s | 26 |
-| Batch (`execute_values`) | 5,000 | ~1.0s | ~5,000 |
+The HTTP figure did not exist before, and producing it exposed a defect the other two
+numbers could never have shown. Throughput **collapsed** as clients were added — 23 TPS
+at one client, 15 at two, then **1 TPS at four, with p50 latency of 4.2 seconds**.
+
+The cause was the connection pool. psycopg2 returns a connection to the idle pool only
+while `len(self._pool) < self.minconn`; every other release calls `conn.close()`. With
+`minconn=1, maxconn=20` the pool retained exactly one connection, so under concurrency
+each request opened a fresh PostgreSQL connection and closed it on release — and
+`_connect()` runs inside `getconn` while the pool lock is held, which serialized every
+caller. Setting `minconn == maxconn` fixed it:
+
+| Concurrency | Before | After |
+|---|---|---|
+| 1 | 23 TPS | 15 TPS |
+| 2 | 15 TPS | 22 TPS |
+| 4 | 1 TPS | **61 TPS** |
+| 8 | 1 TPS | **106 TPS** |
+| 16 | did not finish | **143 TPS** |
+
+Two diagnoses were wrong before that one was right. First suspect was the rate limiter's
+in-memory storage, which does an O(n) list prepend under a lock — disproved by re-running
+against a limiter with empty state and getting identical numbers. Second was Windows TCP,
+since latency snapped to 4.2s and 8.4s, the SYN retransmission timers — disproved by
+switching the benchmark client to connection reuse and getting identical numbers. What
+settled it was the service's own `duration_ms` middleware reporting 4,200ms against a
+client-side 4,224ms, which placed the time inside the process.
+
+The lesson is the ordinary one: a benchmark measures the whole system including the thing
+doing the measuring, and the first plausible explanation is usually not the true one.
 
 The 500 TPS floor is a hard test assertion in `test_ledger.py` — not a metric, a test.
 
@@ -405,7 +446,7 @@ scrape_configs:
 ## Test Coverage
 
 ```
-221 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+243 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -418,6 +459,9 @@ Phase 11   DLQ retry      — TRANSIENT backoff, exhaustion, manual POST /dlq/{i
 Phase 12   Observability  — JSON formatter (field promotion, one line, traceback folding,
                             unserializable degradation), /metrics shape, outcome labels,
                             route-template cardinality, gauge-vs-table agreement, auth
+A6 / A7    Ops surface   — secret *_FILE sources, fingerprints, unreadable-file refusal;
+                            the pool hands back the same connection instead of reopening
+A8         Config        — rate-limit defaults pinned so "configurable" stays unchanged
 A4 / A5    Terminal state — 'resolved' survives _increment_retry; dlq_depth counts backlog,
                             dlq_total counts history; both gauges agree with /ledger/summary
 A0         Amount extract — per-event-type field priority; unknown amount → DLQ, never $0
@@ -426,7 +470,7 @@ A3         Claim recovery — stale claim reclaimed, live claim not stolen, batc
 M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), prune_dlq retention
 ```
 
-**Mutation-verified.** A passing suite proves nothing until you watch it fail. Eleven deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, and letting `dlq_depth` count resolved rows again — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch.
+**Mutation-verified.** A passing suite proves nothing until you watch it fail. Thirteen deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, letting `dlq_depth` count resolved rows again, reverting the pool to `minconn=1`, and quietly changing a rate-limit default — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch.
 
 **Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
 
