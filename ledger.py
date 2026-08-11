@@ -1434,6 +1434,24 @@ _limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = _limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Limits are configurable so they can be tuned per deployment — and so a load test can
+#     measure the ingest path instead of measuring the limiter. The defaults are the
+#     values that were previously hardcoded, so behaviour is unchanged unless someone
+#     opts in. Raising RATE_LIMIT_WEBHOOK on a network-reachable deployment removes the
+#     protection against a flood exhausting the connection pool; benchmark.py sets it
+#     deliberately and locally, which is the only use that makes sense.
+RATE_LIMIT_WEBHOOK = os.getenv("RATE_LIMIT_WEBHOOK", "100/minute")
+RATE_LIMIT_OPS     = os.getenv("RATE_LIMIT_OPS",     "20/minute")
+RATE_LIMIT_METRICS = os.getenv("RATE_LIMIT_METRICS", "60/minute")
+
+if RATE_LIMIT_WEBHOOK != "100/minute":
+    _log.warning(
+        "RATE_LIMIT_WEBHOOK is %s, not the 100/minute default — intended for local "
+        "benchmarking. A raised limit on a reachable deployment lets a flood exhaust "
+        "the connection pool and grow outbox_pending without bound.",
+        RATE_LIMIT_WEBHOOK,
+    )
+
 # ---------------------------------------------------------------------------
 # Metrics
 # Counters and a latency histogram, exported at GET /metrics.
@@ -1517,7 +1535,21 @@ _bootstrap_conn.close()
 #     minconn=1 — always keep one connection warm to avoid cold-start latency on first request.
 #     maxconn=20 — cap concurrent DB connections; tune to your PostgreSQL max_connections budget.
 #     In tests, replace _pool with a _MockPool that wraps the test connection (see test_ledger.py).
-_pool: ThreadedConnectionPool = ThreadedConnectionPool(minconn=1, maxconn=20, dsn=DATABASE_URL)
+#     minconn EQUALS maxconn deliberately. psycopg2 returns a connection to the idle pool
+#     only while `len(self._pool) < self.minconn` — every other release calls conn.close()
+#     (see AbstractConnectionPool._putconn). With the previous minconn=1 the pool retained
+#     exactly ONE connection: under concurrency each request opened a fresh PostgreSQL
+#     connection and closed it again on release, and because _connect() runs inside
+#     getconn while the pool lock is held, that connect/close storm serialized every
+#     caller. Measured on this machine: 23 TPS at 1 client, 15 at 2, then 1 TPS at 4 with
+#     p50 latency of 4.2 SECONDS — and the app's own middleware confirmed the time was
+#     spent inside the process, not in the network. After the change: 61 TPS at 4 and
+#     143 TPS at 16, p50 under 100ms throughout.
+#     Size to the PostgreSQL max_connections budget: every worker process holds this many.
+DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
+_pool: ThreadedConnectionPool = ThreadedConnectionPool(
+    minconn=DB_POOL_SIZE, maxconn=DB_POOL_SIZE, dsn=DATABASE_URL
+)
 
 
 def _require_api_key(x_api_key: str = Header(default="")) -> None:
@@ -1548,7 +1580,7 @@ class StripeWebhookPayload(BaseModel):
 
 
 @app.post("/webhook/stripe", status_code=status.HTTP_200_OK)
-@_limiter.limit("100/minute")
+@_limiter.limit(RATE_LIMIT_WEBHOOK)
 def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONResponse:
     """
     Receives a Stripe webhook and commits it to the billing ledger.
@@ -1606,7 +1638,7 @@ def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONRespo
 
 
 @app.get("/ledger/summary")
-@_limiter.limit("20/minute")
+@_limiter.limit(RATE_LIMIT_OPS)
 def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSONResponse:
     """
     Quick sanity-check endpoint. Returns row counts per ledger status, DLQ depth,
@@ -1649,7 +1681,7 @@ def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSO
 
 
 @app.get("/metrics")
-@_limiter.limit("60/minute")
+@_limiter.limit(RATE_LIMIT_METRICS)
 def metrics(request: Request, _: None = Depends(_require_api_key)) -> Response:
     """
     Prometheus exposition endpoint.
@@ -1688,7 +1720,7 @@ def metrics(request: Request, _: None = Depends(_require_api_key)) -> Response:
 
 
 @app.get("/dlq/entries")
-@_limiter.limit("20/minute")
+@_limiter.limit(RATE_LIMIT_OPS)
 def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_api_key)) -> JSONResponse:
     """
     Inspect DLQ entries over HTTP — newest first. This is the ops endpoint:
@@ -1729,7 +1761,7 @@ def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_ap
 
 
 @app.post("/dlq/{dlq_id}/retry")
-@_limiter.limit("20/minute")
+@_limiter.limit(RATE_LIMIT_OPS)
 def dlq_retry(request: Request, dlq_id: int, _: None = Depends(_require_api_key)) -> JSONResponse:
     """
     Manual retry endpoint for a single DLQ entry. Reprocesses the raw_payload

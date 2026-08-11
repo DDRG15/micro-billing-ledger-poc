@@ -1692,6 +1692,51 @@ sec_conn.close()
 
 
 # =============================================================================
+# A7: CONNECTION POOL RETAINS ITS CONNECTIONS
+# psycopg2 returns a connection to the idle pool only while len(self._pool) < minconn;
+#     every other release calls conn.close(). With minconn=1 the pool retained exactly
+#     ONE connection, so under concurrency each request opened a fresh PostgreSQL
+#     connection and closed it on release — and since _connect() runs inside getconn
+#     while the pool lock is held, that serialized every caller.
+#     Measured before the fix: 1 TPS at 4 concurrent clients, p50 4.2 SECONDS.
+#     After: 61 TPS at 4, 143 TPS at 16, p50 under 100ms throughout.
+# =============================================================================
+print("\n── A7: the connection pool actually pools ──────────────────────────────")
+
+chk("pool retains connections (minconn == maxconn)",
+    L.DB_POOL_SIZE >= 1 and L._pool.minconn == L._pool.maxconn,
+    f"minconn={L._pool.minconn} maxconn={L._pool.maxconn} — with minconn < maxconn, "
+    f"psycopg2 closes every connection beyond the first on release")
+chk("pool size is configurable", isinstance(L.DB_POOL_SIZE, int) and L.DB_POOL_SIZE > 0)
+
+# A connection released and re-acquired must be the SAME object. If it is not, the pool
+#     closed it and opened another — which is the defect above, not pooling.
+_c1 = L._pool.getconn()
+_id1 = id(_c1)
+L._pool.putconn(_c1)
+_c2 = L._pool.getconn()
+chk("a released connection comes back, it is not reopened", id(_c2) == _id1,
+    "pool discarded the connection instead of retaining it")
+chk("the reused connection is still open", not _c2.closed)
+L._pool.putconn(_c2)
+
+
+# =============================================================================
+# A8: RATE LIMITS ARE CONFIGURABLE, DEFAULTS UNCHANGED
+# A load test cannot measure the ingest path while the limiter caps it at 100/minute.
+#     Making the limits configurable is what allowed the pool defect above to be found
+#     at all — but the defaults must stay exactly what they were.
+# =============================================================================
+print("\n── A8: rate limits configurable, defaults preserved ────────────────────")
+
+chk("webhook default is still 100/minute", L.RATE_LIMIT_WEBHOOK == "100/minute",
+    f"got {L.RATE_LIMIT_WEBHOOK!r}")
+chk("ops default is still 20/minute", L.RATE_LIMIT_OPS == "20/minute", f"got {L.RATE_LIMIT_OPS!r}")
+chk("metrics default is still 60/minute", L.RATE_LIMIT_METRICS == "60/minute",
+    f"got {L.RATE_LIMIT_METRICS!r}")
+
+
+# =============================================================================
 # PHASE 12a: STRUCTURED JSON LOGGING
 # Plain text is unparseable exactly when it matters. "Which transaction_id failed,
 #     how often, how slow" becomes a regex over a human sentence that changes the
