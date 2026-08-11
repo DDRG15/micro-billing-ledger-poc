@@ -401,11 +401,14 @@ chk("DLQEntry builds with valid data",          entry.transaction_id == "evt_tes
 chk("DLQEntry reason is enum value",            entry.reason == L.DLQReason.DUPLICATE)
 
 db_row = entry.to_db()
-chk("DLQEntry.to_db() is 8-tuple",              len(db_row) == 8)
-chk("to_db() reason is string not enum",        db_row[1] == "DUPLICATE")
-chk("to_db() payload is JSON string",           db_row[2] == '{"id": "evt_test_001"}')
+# org_id leads the tuple as of Phase 13 — column order must match the dlq INSERT.
+chk("DLQEntry.to_db() is 9-tuple (org_id first)", len(db_row) == 9)
+chk("to_db() org_id leads",                     db_row[0] == L.DEFAULT_ORG_ID)
+chk("to_db() transaction_id follows org_id",    db_row[1] == "evt_test_001")
+chk("to_db() reason is string not enum",        db_row[2] == "DUPLICATE")
+chk("to_db() payload is JSON string",           db_row[3] == '{"id": "evt_test_001"}')
 # received_at is now a timezone-aware datetime (TIMESTAMPTZ), not a float.
-chk("to_db() received_at is datetime",          isinstance(db_row[3], datetime))
+chk("to_db() received_at is datetime",          isinstance(db_row[4], datetime))
 
 try:
     L.DLQEntry(transaction_id="evt_x", reason="TYPO", raw_payload={})
@@ -439,12 +442,13 @@ chk("LedgerEntry builds with valid data",       le.transaction_id == "evt_le_001
 chk("LedgerEntry status is LedgerStatus",       le.status == L.LedgerStatus.POSTED)
 
 db_row = le.to_db()
-chk("LedgerEntry.to_db() is 9-tuple",           len(db_row) == 9)
-chk("to_db() event_type is string not enum",    db_row[1] == "invoice.paid")
-chk("to_db() status is string not enum",        db_row[5] == "POSTED")
-chk("to_db() amount_cents is int",              db_row[3] == 4900)
+chk("LedgerEntry.to_db() is 10-tuple (org_id first)", len(db_row) == 10)
+chk("to_db() org_id leads",                     db_row[0] == L.DEFAULT_ORG_ID)
+chk("to_db() event_type is string not enum",    db_row[2] == "invoice.paid")
+chk("to_db() status is string not enum",        db_row[6] == "POSTED")
+chk("to_db() amount_cents is int",              db_row[4] == 4900)
 # created_at is now a timezone-aware datetime (TIMESTAMPTZ), not a float.
-chk("to_db() created_at is datetime",           isinstance(db_row[8], datetime))
+chk("to_db() created_at is datetime",           isinstance(db_row[9], datetime))
 
 try:
     L.LedgerEntry(
@@ -1689,6 +1693,79 @@ chk("no raw secret value is exposed in metrics",
     L.STRIPE_WEBHOOK_SECRET not in _sec_body, "raw secret leaked into /metrics")
 L._pool = original_pool_sec
 sec_conn.close()
+
+
+# =============================================================================
+# A9: TENANT ISOLATION AT THE IDEMPOTENCY GUARD (Phase 13)
+# transaction_id IS the idempotency guard. Stripe event ids are unique within an
+#     account, not across accounts, so two tenants can legitimately present the same
+#     id. With transaction_id as the sole primary key the second tenant's event would
+#     hit ON CONFLICT, be discarded as a duplicate and dead-lettered — silent revenue
+#     loss, indistinguishable from the guard working correctly. The key is
+#     (org_id, transaction_id) so the guard is per-tenant.
+# =============================================================================
+print("\n── A9: the idempotency guard is per-tenant, not global ─────────────────")
+
+tenant_conn = fresh_conn()
+with tenant_conn.cursor() as c:
+    c.execute("BEGIN")
+    for _o in ("org_alpha", "org_beta"):
+        c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s) "
+                  "ON CONFLICT (org_id) DO NOTHING", (_o, _o, "whsec_test"))
+    c.execute("COMMIT")
+
+chk("ledger primary key is (org_id, transaction_id)",
+    _q1(tenant_conn,
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conrelid='ledger'::regclass AND contype='p'") == "PRIMARY KEY (org_id, transaction_id)",
+    str(_q1(tenant_conn, "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                         "WHERE conrelid='ledger'::regclass AND contype='p'")))
+
+# The same event id, from two different tenants. Both are real money.
+_shared_id = "evt_collision_001"
+_ev_a = fake_event(eid=_shared_id, customer="cus_alpha01", amount=1100)
+_ev_b = fake_event(eid=_shared_id, customer="cus_beta01",  amount=2200)
+
+_r_a = L.process_stripe_event(tenant_conn, _ev_a, org_id="org_alpha")
+_r_b = L.process_stripe_event(tenant_conn, _ev_b, org_id="org_beta")
+chk("tenant A's event posts", _r_a["outcome"] == "POSTED", f"got {_r_a}")
+chk("tenant B's identical id ALSO posts (was DLQ_DUPLICATE)",
+    _r_b["outcome"] == "POSTED", f"got {_r_b}")
+chk("both rows exist, one per tenant",
+    _q1(tenant_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id=%s", (_shared_id,)) == 2)
+chk("tenant A's amount is not tenant B's",
+    _q1(tenant_conn, "SELECT amount_cents FROM ledger WHERE org_id='org_alpha' AND transaction_id=%s",
+        (_shared_id,)) == 1100)
+chk("tenant B kept its own amount",
+    _q1(tenant_conn, "SELECT amount_cents FROM ledger WHERE org_id='org_beta' AND transaction_id=%s",
+        (_shared_id,)) == 2200)
+
+# Within one tenant the guard must still fire — isolation must not disable idempotency.
+_r_a2 = L.process_stripe_event(tenant_conn, _ev_a, org_id="org_alpha")
+chk("replay within the same tenant is still a duplicate",
+    _r_a2["outcome"] == "DLQ_DUPLICATE", f"got {_r_a2}")
+chk("no third ledger row appeared",
+    _q1(tenant_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id=%s", (_shared_id,)) == 2)
+
+# Outbox rows must land under the owning tenant, or downstream delivery crosses tenants.
+chk("outbox rows carry the owning tenant",
+    _qall(tenant_conn, "SELECT DISTINCT org_id FROM outbox WHERE transaction_id=%s ORDER BY org_id",
+          (_shared_id,)) == [("org_alpha",), ("org_beta",)])
+chk("the DLQ row from the replay belongs to tenant A only",
+    _q1(tenant_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id=%s AND org_id='org_alpha'",
+        (_shared_id,)) == 1)
+chk("tenant B has no DLQ row",
+    _q1(tenant_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id=%s AND org_id='org_beta'",
+        (_shared_id,)) == 0)
+
+# Batch path shares the guard and must isolate identically.
+_batch_id = "evt_collision_batch"
+L.process_stripe_event_batch(tenant_conn, [fake_event(eid=_batch_id, amount=500)], org_id="org_alpha")
+_rb = L.process_stripe_event_batch(tenant_conn, [fake_event(eid=_batch_id, amount=900)], org_id="org_beta")
+chk("batch path isolates tenants too", _rb[0]["outcome"] == "POSTED", f"got {_rb[0]}")
+chk("batch wrote one row per tenant",
+    _q1(tenant_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id=%s", (_batch_id,)) == 2)
+tenant_conn.close()
 
 
 # =============================================================================

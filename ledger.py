@@ -150,6 +150,12 @@ from prometheus_client import (  # noqa: E402
 #
 # ===========================================================================
 
+# The tenant that owns rows written before multi-tenancy existed, and the tenant a
+#     single-operator deployment runs as. Every table defaults to it, so a deployment
+#     that never creates a second org behaves exactly as it did before Phase 13.
+DEFAULT_ORG_ID: str = "default"
+
+
 class EventType(str, Enum):
     """
     The complete list of supported Stripe event types. If it's not in this
@@ -449,6 +455,11 @@ class DLQEntry(BaseModel):
     assumes a DLQ entry is unimportant.
     to_db() serializes to a tuple matching the dlq table column order exactly.
     """
+    # Owning tenant. Defaults so a single-operator deployment behaves exactly as it
+    #     did before Phase 13, and so every existing caller keeps working unchanged.
+    org_id: str = Field(default=DEFAULT_ORG_ID, min_length=1,
+                        description="Owning organisation")
+
     transaction_id: str        = Field(min_length=1)
     reason:         DLQReason
     raw_payload:    dict
@@ -468,7 +479,9 @@ class DLQEntry(BaseModel):
             object.__setattr__(self, "max_retries", 3)
 
     def to_db(self) -> tuple:
+        # org_id leads, matching the column order in every dlq INSERT.
         return (
+            self.org_id,
             self.transaction_id,
             self.reason.value,
             json.dumps(self.raw_payload),
@@ -488,6 +501,11 @@ class LedgerEntry(BaseModel):
     query-column sequence drift. If you add a field here, you must add it to
     to_db() and to the INSERT — the code will be obviously incomplete.
     """
+    # Owning tenant. Defaults so a single-operator deployment behaves exactly as it
+    #     did before Phase 13, and so every existing caller keeps working unchanged.
+    org_id: str = Field(default=DEFAULT_ORG_ID, min_length=1,
+                        description="Owning organisation")
+
     transaction_id:  str          = Field(min_length=1)           # Stripe event ID — PK
     event_type:      EventType                                     # Validated enum — not a raw string
     customer_id:     str          = Field(min_length=4)            # cus_ prefix validated upstream in StripeEvent
@@ -506,6 +524,7 @@ class LedgerEntry(BaseModel):
         exactly — any mismatch causes silent data corruption (wrong value in wrong column).
         """
         return (
+            self.org_id,
             self.transaction_id,
             self.event_type.value,    # EventType enum → string
             self.customer_id,
@@ -669,9 +688,32 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         # ledger — one row per unique Stripe event. transaction_id is the PK and the
         #     idempotency key. ON CONFLICT (transaction_id) DO NOTHING in the INSERT
         #     is what makes the deduplication zero-lock at the database level.
+        # org registry — mirrors Alembic migration 0004. Created first: ledger references it.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS org (
+                org_id                TEXT        PRIMARY KEY,
+                name                  TEXT        NOT NULL,
+                api_key_sha256        TEXT        UNIQUE,
+                stripe_webhook_secret TEXT        NOT NULL,
+                active                BOOLEAN     NOT NULL DEFAULT TRUE,
+                created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute(
+            "INSERT INTO org (org_id, name, stripe_webhook_secret) "
+            "VALUES (%s, %s, %s) ON CONFLICT (org_id) DO NOTHING",
+            (DEFAULT_ORG_ID, "Default organisation", STRIPE_WEBHOOK_SECRET),
+        )
+
+        # ledger — PRIMARY KEY is (org_id, transaction_id), not transaction_id alone.
+        #     transaction_id IS the idempotency guard, and Stripe event ids are unique
+        #     per account rather than globally, so a single-column key would let one
+        #     tenant's event silently discard another's as a duplicate. Composite key =
+        #     per-tenant idempotency, which is what the guard always meant.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS ledger (
-                transaction_id  TEXT    PRIMARY KEY,
+                org_id          TEXT    NOT NULL DEFAULT 'default' REFERENCES org(org_id),
+                transaction_id  TEXT    NOT NULL,
                 event_type      TEXT    NOT NULL,
                 customer_id     TEXT    NOT NULL,
                 amount_cents    BIGINT  NOT NULL,
@@ -679,7 +721,8 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
                 status          TEXT    NOT NULL,
                 idempotency_key TEXT    NOT NULL,
                 payload         TEXT    NOT NULL CHECK (length(payload) < 50000),
-                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (org_id, transaction_id)
             )
         """)
         # amount_cents BIGINT: PostgreSQL INTEGER max = 2,147,483,647 (~$21M). BIGINT
@@ -693,8 +736,10 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         cur.execute("""
             CREATE TABLE IF NOT EXISTS outbox (
                 id              BIGSERIAL   PRIMARY KEY,
-                transaction_id  TEXT        NOT NULL
-                                REFERENCES ledger(transaction_id) ON DELETE CASCADE,
+                org_id          TEXT        NOT NULL DEFAULT 'default',
+                transaction_id  TEXT        NOT NULL,
+                FOREIGN KEY (org_id, transaction_id)
+                    REFERENCES ledger(org_id, transaction_id) ON DELETE CASCADE,
                 event_type      TEXT        NOT NULL,
                 payload         TEXT        NOT NULL,
                 dispatched      INTEGER     NOT NULL DEFAULT 0,
@@ -716,6 +761,7 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         cur.execute("""
             CREATE TABLE IF NOT EXISTS dlq (
                 id              BIGSERIAL   PRIMARY KEY,
+                org_id          TEXT        NOT NULL DEFAULT 'default',
                 transaction_id  TEXT        NOT NULL,
                 reason          TEXT        NOT NULL,
                 raw_payload     TEXT        NOT NULL,
@@ -737,18 +783,22 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         # claimed_at mirrors Alembic migration 0003 — when the row was claimed for
         #     retry. Lets retry_dlq_batch reclaim a claim that was never released.
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS claimed_at    TIMESTAMPTZ")
+        # org_id on databases created before migration 0004.
+        for _t in ("ledger", "outbox", "dlq"):
+            cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS org_id TEXT "
+                        f"NOT NULL DEFAULT '{DEFAULT_ORG_ID}'")
 
         # Indexes for the two production query patterns:
         #     idx_ledger_customer_id — used by revenue-by-customer GROUP BY queries.
         #     idx_outbox_dispatched_id — partial index covering only undispatched rows;
         #       the outbox worker always queries WHERE dispatched=0 ORDER BY id.
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_ledger_customer_id
-            ON ledger(customer_id)
+            CREATE INDEX IF NOT EXISTS idx_ledger_org_customer
+            ON ledger(org_id, customer_id)
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id
-            ON outbox(dispatched, id)
+            CREATE INDEX IF NOT EXISTS idx_outbox_org_dispatched
+            ON outbox(org_id, dispatched, id)
             WHERE dispatched = 0
         """)
         # idx_dlq_retry — covers the WHERE clause in retry_dlq_batch:
@@ -819,6 +869,7 @@ def process_stripe_event(
     conn: "psycopg2.extensions.connection",
     event: dict,
     from_retry: bool = False,
+    org_id: str = DEFAULT_ORG_ID,
 ) -> dict:
     """
     Idempotently inserts a Stripe event into the ledger and outbox.
@@ -863,6 +914,7 @@ def process_stripe_event(
         #     DLQEntry.min_length=1 would reject "" so we use "unknown" as the floor.
         if not from_retry:
             dlq_entry = DLQEntry(
+                org_id=org_id,
                 transaction_id=transaction_id,
                 reason=DLQReason.INVALID,
                 raw_payload=event,
@@ -904,6 +956,7 @@ def process_stripe_event(
     payload_json  = json.dumps(event)
 
     ledger_entry = LedgerEntry(
+        org_id=org_id,
         transaction_id=transaction_id,
         event_type=event_type,
         customer_id=customer_id,
@@ -926,10 +979,10 @@ def process_stripe_event(
             cur.execute(
                 """
                 INSERT INTO ledger
-                  (transaction_id, event_type, customer_id, amount_cents,
+                  (org_id, transaction_id, event_type, customer_id, amount_cents,
                    currency, status, idempotency_key, payload, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (transaction_id) DO NOTHING
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (org_id, transaction_id) DO NOTHING
                 """,
                 ledger_entry.to_db(),
             )
@@ -940,10 +993,10 @@ def process_stripe_event(
                 #     Same transaction = zero dual-write gap between ledger and outbox.
                 cur.execute(
                     """
-                    INSERT INTO outbox (transaction_id, event_type, payload, created_at)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO outbox (org_id, transaction_id, event_type, payload, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (transaction_id, event_type.value, payload_json, now),
+                    (org_id, transaction_id, event_type.value, payload_json, now),
                 )
     except psycopg2.OperationalError as exc:
         # DB-level error (connection lost, server down). Raise RuntimeError so the
@@ -961,6 +1014,7 @@ def process_stripe_event(
         #     Writing another would grow the queue by one row per retry, forever.
         if not from_retry:
             dlq_entry = DLQEntry(
+                org_id=org_id,
                 transaction_id=transaction_id,
                 reason=DLQReason.DUPLICATE,
                 raw_payload=event,
@@ -992,9 +1046,9 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
     try:
         with _tx(conn) as cur:
             cur.execute(
-                "INSERT INTO dlq (transaction_id, reason, raw_payload, received_at,"
+                "INSERT INTO dlq (org_id, transaction_id, reason, raw_payload, received_at,"
                 " status, retry_count, max_retries, next_retry_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 entry.to_db(),
             )
     except Exception as exc:
@@ -1224,6 +1278,7 @@ def process_stripe_event_batch(
     conn: "psycopg2.extensions.connection",
     events: list[dict],
     page_size: int = 1000,
+    org_id: str = DEFAULT_ORG_ID,
 ) -> list[dict]:
     """
     Batch variant of process_stripe_event(). Collapses N single-event round trips
@@ -1296,6 +1351,7 @@ def process_stripe_event_batch(
             continue
         data_obj = validated.data.object
         entry = LedgerEntry(
+            org_id=org_id,
             transaction_id=validated.id,
             event_type=validated.type,
             customer_id=data_obj.customer,
@@ -1343,10 +1399,10 @@ def process_stripe_event_batch(
                     cur,
                     """
                     INSERT INTO ledger
-                      (transaction_id, event_type, customer_id, amount_cents,
+                      (org_id, transaction_id, event_type, customer_id, amount_cents,
                        currency, status, idempotency_key, payload, created_at)
                     VALUES %s
-                    ON CONFLICT (transaction_id) DO NOTHING
+                    ON CONFLICT (org_id, transaction_id) DO NOTHING
                     RETURNING transaction_id
                     """,
                     [entry.to_db() for _, _, entry in valid],
@@ -1369,7 +1425,8 @@ def process_stripe_event_batch(
                 if entry.transaction_id in remaining_ids:
                     remaining_ids.discard(entry.transaction_id)  # consume so duplicate in same batch routes correctly
                     outbox_rows.append(
-                        (entry.transaction_id, entry.event_type.value, entry.payload, now)
+                        (entry.org_id, entry.transaction_id, entry.event_type.value,
+                         entry.payload, now)
                     )
                     results[idx] = {
                         "outcome":        entry.status.value,
@@ -1394,7 +1451,7 @@ def process_stripe_event_batch(
                 execute_values(
                     cur,
                     "INSERT INTO outbox"
-                    " (transaction_id, event_type, payload, created_at) VALUES %s",
+                    " (org_id, transaction_id, event_type, payload, created_at) VALUES %s",
                     outbox_rows,
                     page_size=page_size,
                 )
@@ -1404,7 +1461,7 @@ def process_stripe_event_batch(
                 execute_values(
                     cur,
                     "INSERT INTO dlq"
-                    " (transaction_id, reason, raw_payload, received_at,"
+                    " (org_id, transaction_id, reason, raw_payload, received_at,"
                     "  status, retry_count, max_retries, next_retry_at) VALUES %s",
                     all_dlq,
                     page_size=page_size,
