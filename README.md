@@ -8,7 +8,7 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 284 / 284 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 296 / 296 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** 4,699 TPS batch · 152 TPS over HTTP at 16 concurrent clients (p50 96ms) · 28 TPS per-event · all reproducible via `python benchmark.py`
 
 ---
@@ -47,7 +47,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. Run the full test suite — 284 tests, live PostgreSQL, no mocks
+# 4. Run the full test suite — 296 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 5. Start the full stack (postgres + billing + worker + caddy)
@@ -476,7 +476,7 @@ scrape_configs:
 ## Test Coverage
 
 ```
-284 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+296 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -489,6 +489,9 @@ Phase 11   DLQ retry      — TRANSIENT backoff, exhaustion, manual POST /dlq/{i
 Phase 12   Observability  — JSON formatter (field promotion, one line, traceback folding,
                             unserializable degradation), /metrics shape, outcome labels,
                             route-template cardinality, gauge-vs-table agreement, auth
+A12 / A13  Tenant delivery — a DLQ replay lands in the owning tenant (entry resolved AND
+                            that tenant's ledger holding the row); each tenant's events reach
+                            only its own endpoint; a quiet tenant is not starved by a noisy one
 A11        Per-tenant ingest — signature proves the tenant; one tenant's secret cannot
                             post into another's path; unknown org is byte-identical to a
                             bad signature; same event id ingests for both tenants
@@ -546,7 +549,7 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Currency normalization | **LOW** | Done | Lowercased at the entry boundary by a `mode="before"` validator, so `USD` is accepted and stored as `usd` rather than dead-lettered. `LedgerEntry` still rejects un-normalized input as a second layer. |
 | Dependency pins | **MEDIUM** | Done | `psycopg2-binary==2.9.9` had no cp313 wheel, so the documented "Python 3.12+" prerequisite could not be followed. Bumped to 2.9.12; supported range stated explicitly. |
 | CI blind spot | **HIGH** | Done | No workflow built the image or started compose, which is why the three runtime findings above survived four audit cycles with green badges. `stack.yml` now builds, boots, and attacks the stack. |
-| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the caller's tenant is derived from their API key rather than a header; ops queries scoped; per-tenant ingest at `/webhook/stripe/{org_id}` verified with that tenant's own signing secret. Remaining: the outbox worker does not partition by tenant, and there is no admin credential — see [SECURITY.md](SECURITY.md). |
+| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the tenant is derived from the API key rather than a header; ops queries scoped; per-tenant ingest verified with that tenant's own signing secret; the worker delivers to each tenant's `downstream_url` and drains round-robin so one tenant's backlog cannot starve another. Remaining: no admin credential, and no row-level security — see [SECURITY.md](SECURITY.md). |
 | GDPR / LGPD erasure | — | Not attempted | Conflicts directly with the append-only ledger this system is built around. Resolving that needs a documented retention and pseudonymization policy first, not code. |
 | PgBouncer + Kubernetes | — | Not attempted | Deployment topology, not application behavior. The `--workers 1` / `maxconn=20` note above is the prerequisite to settle first. |
 

@@ -54,8 +54,23 @@ does not hold. An unknown or inactive org returns exactly what a bad signature r
 so the endpoint cannot be used to enumerate tenants; the distinction appears only in the
 server log.
 
+**Delivery is per tenant.** `org.downstream_url` gives each tenant its own destination,
+and the outbox worker resolves it per row. Forwarding every tenant's events to one shared
+URL would have been the largest leak in the system — the outbox payload carries customer
+ids and amounts — since isolating the database means nothing if the data is then handed to
+a shared endpoint. NULL falls back to the process-wide `DOWNSTREAM_URL`, so a
+single-operator deployment is unchanged. Dispatch carries `X-Org-Id` so the receiver knows
+which tenant it is being handed.
+
+The worker also drains round-robin across tenants rather than by global id order. That is
+an availability property rather than a confidentiality one: a shared queue drained in id
+order lets a tenant with a large backlog own every batch, making a noisy tenant an outage
+for the quiet ones.
+
 **Not attempted, within tenancy.** There is no admin credential, so no operator-wide view
-across tenants exists. No row-level security in PostgreSQL — isolation is enforced in
+across tenants exists. Isolation is enforced in application queries rather than PostgreSQL
+row-level security, so a future query that omits its `org_id` predicate would not be caught
+by the database. No row-level security in PostgreSQL — isolation is enforced in
 application queries, which means a future query that forgets its `org_id` predicate would
 not be caught by the database. Treat the tenancy here as demonstrated, not finished. No authentication beyond a single shared API key — no user accounts, no
 roles, no rotation. No audit log of who read operational data. No encryption at rest
