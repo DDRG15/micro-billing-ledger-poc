@@ -90,6 +90,16 @@ services:
       # JSON logs in containers: stdout goes to a log driver, and one object per
       #     line is queryable without parsing rules. Unset it for plain text locally.
       LOG_FORMAT:              ${LOG_FORMAT:-json}
+      # Documented in .env.example, so they have to actually reach the container.
+      #     Compose forwards only the keys named here — a variable set in .env that
+      #     is not listed is silently ignored, which turns a documented tunable into
+      #     one that quietly does nothing in the deployment path the README recommends.
+      DB_POOL_SIZE:            "${DB_POOL_SIZE:-20}"
+      RATE_LIMIT_WEBHOOK:      "${RATE_LIMIT_WEBHOOK:-100/minute}"
+      RATE_LIMIT_OPS:          "${RATE_LIMIT_OPS:-20/minute}"
+      RATE_LIMIT_METRICS:      "${RATE_LIMIT_METRICS:-60/minute}"
+      BILLING_API_KEY_FILE:      "${BILLING_API_KEY_FILE:-}"
+      STRIPE_WEBHOOK_SECRET_FILE: "${STRIPE_WEBHOOK_SECRET_FILE:-}"
     ports:
       # Exposed on localhost only for local development and tests.
       #     In production, traffic reaches billing through Caddy (port 443).

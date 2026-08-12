@@ -1357,7 +1357,14 @@ def process_stripe_event_batch(
         except ValidationError as e:
             tid = event.get("id") or "unknown"
             invalid_dlq_rows.append(
-                DLQEntry(transaction_id=tid, reason=DLQReason.INVALID, raw_payload=event).to_db()
+                # org_id=org_id, not the model default. A DLQ row written under the
+                #     wrong tenant is not merely mislabelled: the retry paths trust
+                #     dlq.org_id to decide where a replay lands, so a row stamped
+                #     'default' lets the default tenant see another tenant's raw
+                #     payload and replay it into its own ledger — the same Stripe
+                #     event POSTED under two tenants.
+                DLQEntry(org_id=org_id, transaction_id=tid,
+                         reason=DLQReason.INVALID, raw_payload=event).to_db()
             )
             results[idx] = {
                 "outcome":        "DLQ_INVALID",
@@ -1452,6 +1459,7 @@ def process_stripe_event_batch(
                 else:
                     dup_dlq_rows.append(
                         DLQEntry(
+                            org_id=org_id,          # see the INVALID branch above
                             transaction_id=entry.transaction_id,
                             reason=DLQReason.DUPLICATE,
                             raw_payload=event,

@@ -198,7 +198,7 @@ The `dispatched=1` update happens in the **same `BEGIN…COMMIT`** as the dispat
 
 ## Infrastructure Resilience
 
-**Connection Pooling** — `psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=20)` replaces the single module-level connection. Each request leases a connection via `getconn()` and returns it in a `finally` block via `putconn()`. No connection exhaustion under concurrent load; no leaked connections on exception paths.
+**Connection Pooling** — `psycopg2.pool.ThreadedConnectionPool(minconn=maxconn=DB_POOL_SIZE)` (default 20) replaces the single module-level connection. `minconn` and `maxconn` are deliberately equal: psycopg2 returns a connection to the idle pool only while `len(pool) < minconn` and closes every other one on release, so `minconn=1` made the pool retain exactly one connection and reopen the rest per request — see *Performance Benchmarks* for what that measured. Each request leases a connection via `getconn()` and returns it in a `finally` block via `putconn()`. No connection exhaustion under concurrent load; no leaked connections on exception paths.
 
 **Async/Sync Thread Dispatch** — All database-hitting routes — `POST /webhook/stripe`, `/ledger/summary`, `/dlq/entries` — are declared `def`, not `async def`. FastAPI runs synchronous routes in an external thread pool, so psycopg2's blocking calls never stall the asyncio event loop. The webhook handler reads the raw body from `request._body` (cached by Starlette when it parses the request) for HMAC verification — no `await` needed.
 

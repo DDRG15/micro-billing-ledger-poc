@@ -204,11 +204,24 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
     with _tx(conn) as cur:
         cur.execute(
             """
-            WITH ranked AS (
-                SELECT id,
-                       ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
+            WITH capped AS (
+                -- Bound what the window function sees. PostgreSQL cannot push the
+                -- outer LIMIT into a WindowAgg, so ranking the unbounded backlog
+                -- sorts EVERY dispatched=0 row on every poll: with a stuck
+                -- downstream the drain query grows more expensive exactly as the
+                -- backlog it is meant to drain grows, on the same database the
+                -- ingest path depends on. Taking the oldest N x 10 in id order
+                -- keeps the cost flat; fairness still holds across every tenant
+                -- with work inside that window.
+                SELECT id, org_id
                 FROM   outbox
                 WHERE  dispatched = 0
+                ORDER  BY id
+                LIMIT  %(window_size)s
+            ), ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
+                FROM   capped
             ), picked AS (
                 SELECT id FROM ranked ORDER BY rn, id LIMIT %(batch_size)s
             )
@@ -220,7 +233,7 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
             ORDER  BY o.id
             FOR UPDATE OF o SKIP LOCKED
             """,
-            {"batch_size": WORKER_BATCH_SIZE},
+            {"batch_size": WORKER_BATCH_SIZE, "window_size": WORKER_BATCH_SIZE * 10},
         )
         rows = cur.fetchall()
 

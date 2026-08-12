@@ -2103,6 +2103,62 @@ finally:
 
 
 # =============================================================================
+# A14: BATCH-BORN DLQ ROWS CARRY THEIR OWN TENANT
+# The batch path built DLQEntry without org_id, so every DLQ row it produced landed
+#     under 'default' regardless of the tenant that sent the event. That is not a
+#     labelling error: the retry paths trust dlq.org_id to decide where a replay
+#     lands, so the default tenant could see another tenant's raw payload AND replay
+#     it into its own ledger — the same Stripe event POSTED under two tenants, which
+#     is double-counted revenue in the source of truth.
+#     A9 covered ledger isolation on the batch path but never asserted dlq.org_id,
+#     which is exactly how this survived.
+# =============================================================================
+print("\n── A14: batch DLQ rows belong to the sending tenant ────────────────────")
+
+bt_conn = fresh_conn()
+with bt_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES ('bt_t','bt_t','whsec_x') "
+              "ON CONFLICT (org_id) DO NOTHING")
+    c.execute("COMMIT")
+
+# DUPLICATE via the batch path.
+_bt_ev = fake_event(eid="evt_batch_dup_tenant", amount=500)
+L.process_stripe_event_batch(bt_conn, [_bt_ev], org_id="bt_t")
+_r_dup = L.process_stripe_event_batch(bt_conn, [_bt_ev], org_id="bt_t")
+chk("second batch ingest is a duplicate", _r_dup[0]["outcome"] == "DLQ_DUPLICATE", str(_r_dup[0]))
+chk("the DUPLICATE row belongs to the sending tenant, not 'default'",
+    _q1(bt_conn, "SELECT org_id FROM dlq WHERE transaction_id='evt_batch_dup_tenant'") == "bt_t",
+    str(_q1(bt_conn, "SELECT org_id FROM dlq WHERE transaction_id='evt_batch_dup_tenant'")))
+chk("no batch DLQ row leaked into the default tenant",
+    _q1(bt_conn, "SELECT COUNT(*) FROM dlq WHERE org_id=%s", (L.DEFAULT_ORG_ID,)) == 0)
+
+# INVALID via the batch path.
+_bt_bad = fake_event(eid="evt_batch_bad_tenant", currency="xx")
+L.process_stripe_event_batch(bt_conn, [_bt_bad], org_id="bt_t")
+chk("the INVALID row belongs to the sending tenant too",
+    _q1(bt_conn, "SELECT org_id FROM dlq WHERE transaction_id='evt_batch_bad_tenant'") == "bt_t")
+
+# The consequence the bug produced: replaying that row must not mint a second ledger
+#     row under a different tenant for the same Stripe event.
+_dup_id = _q1(bt_conn, "SELECT id FROM dlq WHERE transaction_id='evt_batch_dup_tenant'")
+_row_org = _q1(bt_conn, "SELECT org_id FROM dlq WHERE id=%s", (_dup_id,))
+L.process_stripe_event(bt_conn, _bt_ev, from_retry=True, org_id=_row_org)
+chk("the event exists under exactly one tenant after a replay",
+    _q1(bt_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_batch_dup_tenant'") == 1,
+    "the same Stripe event is POSTED under more than one tenant")
+chk("and that tenant is the sender",
+    _q1(bt_conn, "SELECT org_id FROM ledger WHERE transaction_id='evt_batch_dup_tenant'") == "bt_t")
+
+with bt_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+    c.execute("DELETE FROM org WHERE org_id <> 'default'")
+    c.execute("COMMIT")
+bt_conn.close()
+
+
+# =============================================================================
 # A7: CONNECTION POOL RETAINS ITS CONNECTIONS
 # psycopg2 returns a connection to the idle pool only while len(self._pool) < minconn;
 #     every other release calls conn.close(). With minconn=1 the pool retained exactly
