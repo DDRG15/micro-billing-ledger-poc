@@ -328,8 +328,28 @@ The 500 TPS floor is a hard test assertion in `test_ledger.py` — not a metric,
 -- ON CONFLICT (transaction_id) DO NOTHING makes replay a zero-lock no-op at DB level.
 -- BIGINT: covers amounts up to ~$92 quadrillion (INTEGER max is only ~$21M).
 -- CHECK (length(payload) < 50000): prevents unbounded growth from malicious payloads.
+-- Tenant registry (migration 0004). The API key is stored only as a SHA-256, so a
+-- database dump does not hand over working credentials. The Stripe signing secret
+-- cannot be hashed — verifying an HMAC needs the value — so in production it belongs
+-- in a secret manager with this column holding a reference.
+CREATE TABLE org (
+    org_id                TEXT        PRIMARY KEY,
+    name                  TEXT        NOT NULL,
+    api_key_sha256        TEXT        UNIQUE,
+    stripe_webhook_secret TEXT        NOT NULL,
+    active                BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- PRIMARY KEY is (org_id, transaction_id), NOT transaction_id alone.
+--   transaction_id IS the idempotency guard, and Stripe event ids are unique per
+--   ACCOUNT rather than globally. With a single-column key, one tenant's event would
+--   hit ON CONFLICT against another tenant's and be discarded as a duplicate —
+--   silent revenue loss, indistinguishable from the guard working correctly.
+--   The composite key makes the guard per-tenant, which is what it always meant.
 CREATE TABLE ledger (
-    transaction_id  TEXT        PRIMARY KEY,
+    org_id          TEXT        NOT NULL DEFAULT 'default' REFERENCES org(org_id),
+    transaction_id  TEXT        NOT NULL,
     event_type      TEXT        NOT NULL,
     customer_id     TEXT        NOT NULL,
     amount_cents    BIGINT      NOT NULL,
@@ -337,11 +357,12 @@ CREATE TABLE ledger (
     status          TEXT        NOT NULL,   -- POSTED | VOID | PENDING
     idempotency_key TEXT        NOT NULL,
     payload         TEXT        NOT NULL CHECK (length(payload) < 50000),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (org_id, transaction_id)
 );
 
 -- Written in the same BEGIN...COMMIT as the ledger row.
--- transaction_id REFERENCES ledger(transaction_id) ON DELETE CASCADE:
+-- (org_id, transaction_id) REFERENCES ledger ON DELETE CASCADE:
 --   enforces Transactional Outbox invariant at DB level — an outbox row
 --   cannot exist without its corresponding ledger row.
 --   Application logic alone is not sufficient; the FK constraint is the guarantee.
@@ -349,17 +370,22 @@ CREATE TABLE ledger (
 -- A worker flips to dispatched=1 in the same TX as delivery confirmation.
 CREATE TABLE outbox (
     id             BIGSERIAL   PRIMARY KEY,
+    org_id         TEXT        NOT NULL DEFAULT 'default',
     transaction_id TEXT        NOT NULL,
     event_type     TEXT        NOT NULL,
     payload        TEXT        NOT NULL,
     dispatched     INTEGER     NOT NULL DEFAULT 0,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Composite, following the ledger key above.
+    FOREIGN KEY (org_id, transaction_id)
+        REFERENCES ledger(org_id, transaction_id) ON DELETE CASCADE
 );
 
 -- Every rejection lands here. raw_payload is never corrected, never truncated.
 -- Humans review DLQ entries. The system never assumes a DLQ entry is unimportant.
 CREATE TABLE dlq (
     id             BIGSERIAL   PRIMARY KEY,
+    org_id         TEXT        NOT NULL DEFAULT 'default',
     transaction_id TEXT        NOT NULL,
     reason         TEXT        NOT NULL,   -- DUPLICATE | INVALID | TRANSIENT | UNKNOWN_TYPE
     raw_payload    TEXT        NOT NULL,
@@ -377,10 +403,13 @@ CREATE TABLE dlq (
 );
 
 -- Indexes for hot query paths
-CREATE INDEX IF NOT EXISTS idx_ledger_customer_id ON ledger(customer_id);
-CREATE INDEX IF NOT EXISTS idx_outbox_dispatched_id ON outbox(dispatched, id) WHERE dispatched=0;
-CREATE INDEX IF NOT EXISTS idx_dlq_retry ON dlq(status, next_retry_at) WHERE status='pending';
+-- org_id leads every composite index: each query is scoped to one tenant, and an
+-- index that does not lead with the predicate's first column cannot serve it.
+CREATE INDEX IF NOT EXISTS idx_ledger_org_customer ON ledger(org_id, customer_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_org_dispatched ON outbox(org_id, dispatched, id) WHERE dispatched=0;
+CREATE INDEX IF NOT EXISTS idx_dlq_org_retry ON dlq(org_id, status, next_retry_at) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS idx_dlq_stale_claim ON dlq(status, claimed_at) WHERE status='retrying';
+CREATE INDEX IF NOT EXISTS idx_org_api_key ON org(api_key_sha256) WHERE api_key_sha256 IS NOT NULL AND active;
 ```
 
 | Status | Event types | Meaning |
