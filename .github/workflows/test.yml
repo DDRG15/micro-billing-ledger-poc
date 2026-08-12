@@ -1,5 +1,5 @@
 # test.yml — run the full test suite on every push and PR
-# All 272 tests hit a real PostgreSQL 16 container — zero mocks.
+# All 284 tests hit a real PostgreSQL 16 container — zero mocks.
 
 name: Tests
 

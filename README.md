@@ -8,7 +8,7 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 272 / 272 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 284 / 284 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** 4,699 TPS batch · 152 TPS over HTTP at 16 concurrent clients (p50 96ms) · 28 TPS per-event · all reproducible via `python benchmark.py`
 
 ---
@@ -47,7 +47,7 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. Run the full test suite — 272 tests, live PostgreSQL, no mocks
+# 4. Run the full test suite — 284 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
 # 5. Start the full stack (postgres + billing + worker + caddy)
@@ -395,7 +395,8 @@ CREATE INDEX IF NOT EXISTS idx_dlq_stale_claim ON dlq(status, claimed_at) WHERE 
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/webhook/stripe` | Ingest webhook. Always 200 for valid JSON; 503 on DB failure (correct Stripe retry protocol). |
+| `POST` | `/webhook/stripe` | Ingest for the default tenant. Always 200 for valid JSON; 503 on DB failure (correct Stripe retry protocol). |
+| `POST` | `/webhook/stripe/{org_id}` | Per-tenant ingest. Signature verified with that tenant's secret, so the path cannot be used to write into another tenant. Unknown org returns the same 400 as a bad signature — no enumeration. |
 | `GET` | `/health` | Liveness check |
 | `GET` | `/ledger/summary` | Row counts by status, DLQ depth, outbox pending count |
 | `GET` | `/dlq/entries?limit=N` | Inspect DLQ, newest first. Default 50, capped at 1,000. |
@@ -446,7 +447,7 @@ scrape_configs:
 ## Test Coverage
 
 ```
-272 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+284 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -459,6 +460,9 @@ Phase 11   DLQ retry      — TRANSIENT backoff, exhaustion, manual POST /dlq/{i
 Phase 12   Observability  — JSON formatter (field promotion, one line, traceback folding,
                             unserializable degradation), /metrics shape, outcome labels,
                             route-template cardinality, gauge-vs-table agreement, auth
+A11        Per-tenant ingest — signature proves the tenant; one tenant's secret cannot
+                            post into another's path; unknown org is byte-identical to a
+                            bad signature; same event id ingests for both tenants
 A9 / A10   Tenancy       — same event id from two tenants both post and keep their own
                             amounts; replay within a tenant is still a duplicate; a tenant
                             cannot read or retry another's rows; X-Org-Id cannot override
@@ -513,7 +517,7 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Currency normalization | **LOW** | Done | Lowercased at the entry boundary by a `mode="before"` validator, so `USD` is accepted and stored as `usd` rather than dead-lettered. `LedgerEntry` still rejects un-normalized input as a second layer. |
 | Dependency pins | **MEDIUM** | Done | `psycopg2-binary==2.9.9` had no cp313 wheel, so the documented "Python 3.12+" prerequisite could not be followed. Bumped to 2.9.12; supported range stated explicitly. |
 | CI blind spot | **HIGH** | Done | No workflow built the image or started compose, which is why the three runtime findings above survived four audit cycles with green badges. `stack.yml` now builds, boots, and attacks the stack. |
-| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the caller's tenant is derived from their API key rather than a header; every ops query is scoped. Ingest is still single-tenant and there is no admin credential — see [SECURITY.md](SECURITY.md). |
+| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the caller's tenant is derived from their API key rather than a header; ops queries scoped; per-tenant ingest at `/webhook/stripe/{org_id}` verified with that tenant's own signing secret. Remaining: the outbox worker does not partition by tenant, and there is no admin credential — see [SECURITY.md](SECURITY.md). |
 | GDPR / LGPD erasure | — | Not attempted | Conflicts directly with the append-only ledger this system is built around. Resolving that needs a documented retention and pseudonymization policy first, not code. |
 | PgBouncer + Kubernetes | — | Not attempted | Deployment topology, not application behavior. The `--workers 1` / `maxconn=20` note above is the prerequisite to settle first. |
 

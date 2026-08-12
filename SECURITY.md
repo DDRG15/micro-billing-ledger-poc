@@ -46,9 +46,15 @@ is scoped to the derived tenant, and `POST /dlq/{id}/retry` scopes in the WHERE 
 another tenant's entry is indistinguishable from a nonexistent one — a check applied after
 the fetch would leak existence through the status code.
 
-**Not attempted, within tenancy.** The ingest endpoint is not yet per-tenant: webhooks
-still resolve to the default org, so a multi-tenant deployment cannot yet accept traffic
-for more than one Stripe account. There is no admin credential, so no operator-wide view
+**Ingest is per-tenant.** `POST /webhook/stripe/{org_id}` verifies the HMAC with that
+tenant's registered signing secret. This is self-validating — a Stripe signature only
+checks out against the account that produced the event — so the path segment routes the
+request without being trusted, and a caller cannot write into a tenant whose secret it
+does not hold. An unknown or inactive org returns exactly what a bad signature returns,
+so the endpoint cannot be used to enumerate tenants; the distinction appears only in the
+server log.
+
+**Not attempted, within tenancy.** There is no admin credential, so no operator-wide view
 across tenants exists. No row-level security in PostgreSQL — isolation is enforced in
 application queries, which means a future query that forgets its `org_id` predicate would
 not be caught by the database. Treat the tenancy here as demonstrated, not finished. No authentication beyond a single shared API key — no user accounts, no
