@@ -37,8 +37,21 @@ API key on the operational endpoints (`/ledger/summary`, `/dlq/entries`,
 trusted only from the proxy's own address. TLS and security headers at the proxy.
 The container runs as a non-root user.
 
-**Not attempted.** No multi-tenancy, so there is no tenant isolation boundary to breach
-or defend. No authentication beyond a single shared API key — no user accounts, no
+**Tenant isolation (partial).** `ledger`, `outbox` and `dlq` carry `org_id`, and the
+ledger primary key is `(org_id, transaction_id)` so the idempotency guard is per-tenant —
+without that, two tenants presenting the same Stripe event id would silently discard one
+another's revenue. The caller's tenant is derived from their API key and is never accepted
+from a header: a tenant supplied by the caller is not a boundary. Every operational query
+is scoped to the derived tenant, and `POST /dlq/{id}/retry` scopes in the WHERE clause so
+another tenant's entry is indistinguishable from a nonexistent one — a check applied after
+the fetch would leak existence through the status code.
+
+**Not attempted, within tenancy.** The ingest endpoint is not yet per-tenant: webhooks
+still resolve to the default org, so a multi-tenant deployment cannot yet accept traffic
+for more than one Stripe account. There is no admin credential, so no operator-wide view
+across tenants exists. No row-level security in PostgreSQL — isolation is enforced in
+application queries, which means a future query that forgets its `org_id` predicate would
+not be caught by the database. Treat the tenancy here as demonstrated, not finished. No authentication beyond a single shared API key — no user accounts, no
 roles, no rotation. No audit log of who read operational data. No encryption at rest
 beyond whatever PostgreSQL is configured to provide. No GDPR/LGPD erasure path; the
 ledger is deliberately append-only and resolving that conflict needs a retention policy
