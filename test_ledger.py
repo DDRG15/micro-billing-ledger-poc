@@ -32,6 +32,32 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 # Import the ledger module directly — all tests call its functions and use
 #     its models. This is the module under test.
+# Reset the org registry BEFORE importing ledger. ledger computes _ANY_ORG_KEYS once at
+#     import time, and that single boolean decides between dev mode and enforced auth for
+#     the whole process. A previous run that left a tenant key behind would flip this run
+#     into enforced auth and 401 every unauthenticated call — the suite passed on a clean
+#     database and failed on re-run. A test suite whose result depends on the last run is
+#     not a test suite.
+def _reset_org_registry() -> None:
+    import psycopg2 as _pg
+    _dsn = __import__("os").environ.get(
+        "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/billing")
+    try:
+        _c = _pg.connect(_dsn)
+        _c.autocommit = True
+        with _c.cursor() as _cur:
+            _cur.execute("SELECT to_regclass('org')")
+            if _cur.fetchone()[0] is not None:
+                _cur.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+                _cur.execute("DELETE FROM org WHERE org_id <> 'default'")
+                _cur.execute("UPDATE org SET api_key_sha256 = NULL WHERE org_id = 'default'")
+        _c.close()
+    except Exception:  # noqa: BLE001 — a database without the org table predates 0004
+        pass
+
+
+_reset_org_registry()
+
 import ledger as L
 import worker as W  # Phase 7: outbox drain worker
 
@@ -95,6 +121,9 @@ def fresh_conn():
     conn = L._bootstrap()
     with conn.cursor() as cur:
         cur.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+        # Tenants too: org rows are not truncated by the line above (ledger references
+        #     them), so without this a section inherits the tenants another one created.
+        cur.execute("DELETE FROM org WHERE org_id <> 'default'")
     _open_conns.append(conn)  # M7: tracked for guaranteed close at end of run
     return conn
 
@@ -1842,6 +1871,12 @@ try:
     chk("metrics are scoped to the caller's org", "dlq_total 1.0" in _ma, "expected A's own total")
 finally:
     L._pool, L.BILLING_API_KEY, L._ANY_ORG_KEYS = original_pool_iso, original_key_iso, original_any_iso
+    # Leave no credentials behind: they would flip the NEXT process into enforced auth.
+    with iso_conn.cursor() as c:
+        c.execute("BEGIN")
+        c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+        c.execute("DELETE FROM org WHERE org_id <> 'default'")
+        c.execute("COMMIT")
     iso_conn.close()
 
 
