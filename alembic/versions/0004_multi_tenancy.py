@@ -86,18 +86,64 @@ def upgrade() -> None:
     # ── recompose the keys ──────────────────────────────────────────────────────
     #     The outbox foreign key must be dropped before the ledger primary key it
     #     depends on, and recreated against the new composite key afterwards.
-    op.execute("ALTER TABLE outbox DROP CONSTRAINT IF EXISTS outbox_transaction_id_fkey")
-    op.execute("ALTER TABLE ledger DROP CONSTRAINT IF EXISTS ledger_pkey")
-    op.execute("ALTER TABLE ledger ADD PRIMARY KEY (org_id, transaction_id)")
+    # Drop whatever foreign key outbox holds against ledger, whichever name it carries.
+    #     The name differs by origin: Alembic's inline REFERENCES yields
+    #     outbox_transaction_id_fkey, while _bootstrap's composite form yields
+    #     outbox_org_id_transaction_id_fkey. Dropping by a guessed name silently does
+    #     nothing when it guesses wrong, and the next statement then fails with
+    #     "cannot drop constraint ledger_pkey because other objects depend on it".
     op.execute("""
-        ALTER TABLE outbox
-        ADD CONSTRAINT outbox_org_transaction_fkey
-        FOREIGN KEY (org_id, transaction_id)
-        REFERENCES ledger(org_id, transaction_id) ON DELETE CASCADE
+        DO $$
+        DECLARE c RECORD;
+        BEGIN
+            FOR c IN
+                SELECT conname FROM pg_constraint
+                WHERE conrelid = 'outbox'::regclass
+                  AND contype = 'f'
+                  AND confrelid = 'ledger'::regclass
+            LOOP
+                EXECUTE format('ALTER TABLE outbox DROP CONSTRAINT %I', c.conname);
+            END LOOP;
+        END $$;
+    """)
+    op.execute("ALTER TABLE ledger DROP CONSTRAINT IF EXISTS ledger_pkey")
+    # Idempotent: _bootstrap may already have created the composite key.
+    op.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid='ledger'::regclass AND contype='p'
+            ) THEN
+                ALTER TABLE ledger ADD PRIMARY KEY (org_id, transaction_id);
+            END IF;
+        END $$;
     """)
     op.execute("""
-        ALTER TABLE ledger
-        ADD CONSTRAINT ledger_org_fkey FOREIGN KEY (org_id) REFERENCES org(org_id)
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid='outbox'::regclass AND contype='f'
+                  AND confrelid='ledger'::regclass
+            ) THEN
+                ALTER TABLE outbox
+                ADD CONSTRAINT outbox_org_transaction_fkey
+                FOREIGN KEY (org_id, transaction_id)
+                REFERENCES ledger(org_id, transaction_id) ON DELETE CASCADE;
+            END IF;
+        END $$;
+    """)
+    op.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'ledger_org_fkey'
+            ) THEN
+                ALTER TABLE ledger
+                ADD CONSTRAINT ledger_org_fkey FOREIGN KEY (org_id) REFERENCES org(org_id);
+            END IF;
+        END $$;
     """)
 
     # ── org-leading indexes ─────────────────────────────────────────────────────
@@ -145,7 +191,26 @@ def downgrade() -> None:
         ON outbox(dispatched, id) WHERE dispatched = 0
     """)
 
-    op.execute("ALTER TABLE outbox DROP CONSTRAINT IF EXISTS outbox_org_transaction_fkey")
+    # Drop whatever foreign key outbox holds against ledger, whichever name it carries.
+    #     The name differs by origin: Alembic's inline REFERENCES yields
+    #     outbox_transaction_id_fkey, while _bootstrap's composite form yields
+    #     outbox_org_id_transaction_id_fkey. Dropping by a guessed name silently does
+    #     nothing when it guesses wrong, and the next statement then fails with
+    #     "cannot drop constraint ledger_pkey because other objects depend on it".
+    op.execute("""
+        DO $$
+        DECLARE c RECORD;
+        BEGIN
+            FOR c IN
+                SELECT conname FROM pg_constraint
+                WHERE conrelid = 'outbox'::regclass
+                  AND contype = 'f'
+                  AND confrelid = 'ledger'::regclass
+            LOOP
+                EXECUTE format('ALTER TABLE outbox DROP CONSTRAINT %I', c.conname);
+            END LOOP;
+        END $$;
+    """)
     op.execute("ALTER TABLE ledger DROP CONSTRAINT IF EXISTS ledger_org_fkey")
     op.execute("ALTER TABLE ledger DROP CONSTRAINT IF EXISTS ledger_pkey")
     op.execute("ALTER TABLE ledger ADD PRIMARY KEY (transaction_id)")

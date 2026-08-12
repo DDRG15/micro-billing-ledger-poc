@@ -701,8 +701,15 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
             )
         """)
         cur.execute(
+            # DO UPDATE, not DO NOTHING. For the default org the signing secret IS
+            #     STRIPE_WEBHOOK_SECRET by definition, so a stale row would make the
+            #     legacy /webhook/stripe route verify against a secret the operator
+            #     already rotated away from — and the failure would look like Stripe
+            #     sending bad signatures. Other orgs are never touched here; their
+            #     secrets live only in the registry.
             "INSERT INTO org (org_id, name, stripe_webhook_secret) "
-            "VALUES (%s, %s, %s) ON CONFLICT (org_id) DO NOTHING",
+            "VALUES (%s, %s, %s) "
+            "ON CONFLICT (org_id) DO UPDATE SET stripe_webhook_secret = EXCLUDED.stripe_webhook_secret",
             (DEFAULT_ORG_ID, "Default organisation", STRIPE_WEBHOOK_SECRET),
         )
 
@@ -1653,6 +1660,24 @@ def _lookup_org_by_key(conn: "psycopg2.extensions.connection", api_key: str) -> 
     return row[0] if row else None
 
 
+def _org_webhook_secret(conn: "psycopg2.extensions.connection", org_id: str) -> Optional[str]:
+    """The Stripe signing secret registered for this tenant, or None if unknown/inactive.
+
+    Read per request rather than cached. A cache would save one indexed lookup on the
+    ingest path, but it would also mean a rotated signing secret keeps verifying against
+    the old value until the entry expires — and the whole point of resolving the secret
+    per tenant is that the signature is the proof of which tenant sent the event. Correct
+    first; benchmark.py exists to say whether the lookup is worth optimising.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT stripe_webhook_secret FROM org WHERE org_id = %s AND active",
+            (org_id,),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def _require_api_key(x_api_key: str = Header(default="")) -> str:
     """FastAPI dependency for ops endpoints. Returns the caller's org_id.
 
@@ -1709,62 +1734,88 @@ class StripeWebhookPayload(BaseModel):
     request: dict = Field(default_factory=dict)
 
 
-@app.post("/webhook/stripe", status_code=status.HTTP_200_OK)
-@_limiter.limit(RATE_LIMIT_WEBHOOK)
-def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONResponse:
+def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str) -> JSONResponse:
+    """Verify the signature with the tenant's own secret, then ingest under that tenant.
+
+    Resolving the org from the URL and verifying with THAT org's secret is
+    self-validating: a signature only checks out against the account that produced the
+    event, so a caller cannot post into a tenant it does not hold the secret for. The
+    path segment is a routing hint, not a trusted claim.
+
+    An unknown or inactive org returns exactly what a bad signature returns. Anything
+    else — a 404, a different message — turns this endpoint into an org enumerator for
+    anyone on the internet. The distinction is recorded in the log, where operators can
+    see it and attackers cannot.
     """
-    Receives a Stripe webhook and commits it to the billing ledger.
-    Always returns HTTP 200 for valid JSON — even for duplicates and invalid
-    events that end up in DLQ. Returning non-200 tells Stripe to retry,
-    which is only correct for transient failures (e.g., DB down → 503).
-    HMAC signature verification is active — stripe.Webhook.construct_event()
-    validates the Stripe-Signature header before any business logic runs.
-    An unauthenticated ingestion endpoint lets anyone who knows the URL write to the ledger.
-    """
-    # ── HMAC SIGNATURE VERIFICATION ─────────────────────────────────────
-    #     stripe.Webhook.construct_event() validates the HMAC-SHA256 in the
-    #     Stripe-Signature header against the raw request body. Any body tampering
-    #     or wrong/missing signature raises SignatureVerificationError → 400.
-    #     Without this, anyone who knows the URL can forge billing events.
-    # Request.body() is async def in Starlette — calling it without await returns a coroutine
-    # object, not bytes. FastAPI already read and cached the body in request._body when it
-    # parsed StripeWebhookPayload above. Access the cached attribute directly.
     raw_body   = request._body
     sig_header = request.headers.get("stripe-signature", "")
-    try:
-        stripe.Webhook.construct_event(raw_body, sig_header, STRIPE_WEBHOOK_SECRET)
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or missing Stripe signature"
-        )
 
     conn = _pool.getconn()
     try:
-        result = process_stripe_event(conn, payload.model_dump())
-    except RuntimeError as exc:
-        # RuntimeError from _tx() means a DB-level failure (locked, corrupt, disk full).
-        #     503 tells Stripe to back off and retry — the correct behavior for transient errors.
-        #     Do NOT return 200 here — that would tell Stripe "got it" when we didn't.
-        _WEBHOOK_EVENTS.labels("DB_ERROR").inc()
-        raise HTTPException(status_code=503, detail=str(exc))
+        secret = _org_webhook_secret(conn, org_id)
+        if secret is None:
+            _log.warning(
+                "webhook for unknown or inactive org org_id=%s", org_id,
+                extra={"event": "webhook_unknown_org", "org_id": org_id},
+            )
+            _WEBHOOK_EVENTS.labels("UNKNOWN_ORG").inc()
+            raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
+
+        try:
+            stripe.Webhook.construct_event(raw_body, sig_header, secret)
+        except stripe.error.SignatureVerificationError:
+            raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
+
+        try:
+            result = process_stripe_event(conn, payload.model_dump(), org_id=org_id)
+        except RuntimeError as exc:
+            # A DB-level failure. 503 tells Stripe to back off and retry, which is correct
+            #     for a transient error; 200 would say "got it" when we did not.
+            _WEBHOOK_EVENTS.labels("DB_ERROR").inc()
+            raise HTTPException(status_code=503, detail=str(exc))
     finally:
         _pool.putconn(conn)
 
     outcome = result.get("outcome", "UNKNOWN")
     _WEBHOOK_EVENTS.labels(outcome).inc()
-    # The outcome is the fact worth querying later — "how many events were dead-lettered
-    #     as duplicates last Tuesday" should be a filter, not a regex over prose.
     _log.info(
         "webhook processed %s", outcome,
         extra={
             "event":          "webhook_processed",
+            "org_id":         org_id,
             "transaction_id": result.get("transaction_id"),
             "outcome":        outcome,
             "reason":         result.get("reason"),
         },
     )
     return JSONResponse(content=result)
+
+
+@app.post("/webhook/stripe/{org_id}", status_code=status.HTTP_200_OK)
+@_limiter.limit(RATE_LIMIT_WEBHOOK)
+def stripe_webhook_for_org(request: Request, org_id: str,
+                           payload: StripeWebhookPayload) -> JSONResponse:
+    """
+    Per-tenant ingest. Point each Stripe account's webhook at its own path; the
+    signature is verified with that tenant's registered signing secret, so the URL
+    cannot be used to write into someone else's ledger.
+    """
+    return _ingest_webhook(request, payload, org_id)
+
+
+@app.post("/webhook/stripe", status_code=status.HTTP_200_OK)
+@_limiter.limit(RATE_LIMIT_WEBHOOK)
+def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONResponse:
+    """
+    Single-tenant ingest, kept so existing Stripe endpoints keep working unchanged.
+    Routes to DEFAULT_ORG_ID, whose registered secret is seeded from
+    STRIPE_WEBHOOK_SECRET at bootstrap.
+
+    Always returns HTTP 200 for valid JSON — including duplicates and invalid events
+    that end up in the DLQ. A non-200 tells Stripe to retry, which is only correct for
+    transient failures (DB down -> 503).
+    """
+    return _ingest_webhook(request, payload, DEFAULT_ORG_ID)
 
 
 @app.get("/ledger/summary")

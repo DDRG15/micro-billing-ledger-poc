@@ -1881,6 +1881,97 @@ finally:
 
 
 # =============================================================================
+# A11: PER-TENANT INGEST (Phase 13.3)
+# POST /webhook/stripe/{org_id} verifies the signature with THAT tenant's registered
+#     secret. This is self-validating: a signature only checks out against the account
+#     that produced the event, so the path segment is a routing hint rather than a
+#     trusted claim — a caller cannot post into a tenant whose secret it does not hold.
+#     An unknown org must be indistinguishable from a bad signature, or the endpoint
+#     becomes an org enumerator for anyone on the internet.
+# =============================================================================
+print("\n── A11: per-tenant ingest, signature proves the tenant ─────────────────")
+
+ing_conn = fresh_conn()
+_SEC_A, _SEC_B = "whsec_alpha_signing", "whsec_beta_signing"
+with ing_conn.cursor() as c:
+    c.execute("BEGIN")
+    for _o, _sec in (("ing_a", _SEC_A), ("ing_b", _SEC_B)):
+        c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s) "
+                  "ON CONFLICT (org_id) DO UPDATE SET stripe_webhook_secret=EXCLUDED.stripe_webhook_secret",
+                  (_o, _o, _sec))
+    c.execute("COMMIT")
+
+original_pool_ing = L._pool
+L._pool = _MockPool(ing_conn)
+ing_client = TestClient(L.app)
+
+
+def _signed(body_obj, secret):
+    """Build the Stripe-Signature header the way Stripe does: HMAC over '<ts>.<body>'."""
+    body = json.dumps(body_obj)
+    ts = int(time.time())
+    mac = hashlib.sha256  # named for clarity below
+    digest = __import__("hmac").new(secret.encode(), f"{ts}.{body}".encode(), mac).hexdigest()
+    return body, {"Content-Type": "application/json", "Stripe-Signature": f"t={ts},v1={digest}"}
+
+
+try:
+    _ev = fake_event(eid="evt_ing_001", amount=3300)
+
+    # Correct tenant, correct secret.
+    _b, _h = _signed(_ev, _SEC_A)
+    _r = ing_client.post("/webhook/stripe/ing_a", content=_b, headers=_h)
+    chk("signed for its own tenant → 200", _r.status_code == 200, f"got {_r.status_code}: {_r.text}")
+    chk("outcome is POSTED", _r.json().get("outcome") == "POSTED", str(_r.json()))
+    chk("the row landed under that tenant",
+        _q1(ing_conn, "SELECT org_id FROM ledger WHERE transaction_id='evt_ing_001'") == "ing_a")
+
+    # Tenant A's secret aimed at tenant B's path. The signature is the identity proof,
+    #     so this must fail — otherwise the URL alone would let anyone write anywhere.
+    _b2, _h2 = _signed(fake_event(eid="evt_ing_002"), _SEC_A)
+    _r2 = ing_client.post("/webhook/stripe/ing_b", content=_b2, headers=_h2)
+    chk("A's secret cannot post into B's tenant", _r2.status_code == 400, f"got {_r2.status_code}")
+    chk("nothing was written for the rejected event",
+        _q1(ing_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_ing_002'") == 0)
+
+    # An unknown org must look exactly like a bad signature — no enumeration.
+    _b3, _h3 = _signed(fake_event(eid="evt_ing_003"), _SEC_A)
+    _r3 = ing_client.post("/webhook/stripe/does_not_exist", content=_b3, headers=_h3)
+    _r4 = ing_client.post("/webhook/stripe/ing_a", content=_b3,
+                          headers={**_h3, "Stripe-Signature": "t=1,v1=deadbeef"})
+    chk("unknown org returns 400, not 404", _r3.status_code == 400, f"got {_r3.status_code}")
+    chk("unknown org is indistinguishable from a bad signature",
+        (_r3.status_code, _r3.json()) == (_r4.status_code, _r4.json()),
+        f"unknown={_r3.json()} badsig={_r4.json()}")
+
+    # Same event id from both tenants — the composite key must let both through.
+    _shared = fake_event(eid="evt_ing_shared", amount=4400)
+    _ba, _ha = _signed(_shared, _SEC_A)
+    _bb, _hb = _signed(_shared, _SEC_B)
+    chk("tenant A posts the shared id",
+        ing_client.post("/webhook/stripe/ing_a", content=_ba, headers=_ha).json()["outcome"] == "POSTED")
+    chk("tenant B posts the same id over HTTP too",
+        ing_client.post("/webhook/stripe/ing_b", content=_bb, headers=_hb).json()["outcome"] == "POSTED")
+    chk("both rows exist, one per tenant",
+        _q1(ing_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_ing_shared'") == 2)
+
+    # The legacy path still works and still routes to the default org.
+    with patch("stripe.Webhook.construct_event"):
+        _rl = ing_client.post("/webhook/stripe", json=fake_event(eid="evt_ing_legacy"))
+    chk("legacy /webhook/stripe still returns 200", _rl.status_code == 200, f"got {_rl.status_code}")
+    chk("legacy route writes to the default org",
+        _q1(ing_conn, "SELECT org_id FROM ledger WHERE transaction_id='evt_ing_legacy'") == L.DEFAULT_ORG_ID)
+finally:
+    L._pool = original_pool_ing
+    with ing_conn.cursor() as c:
+        c.execute("BEGIN")
+        c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+        c.execute("DELETE FROM org WHERE org_id <> 'default'")
+        c.execute("COMMIT")
+    ing_conn.close()
+
+
+# =============================================================================
 # A7: CONNECTION POOL RETAINS ITS CONNECTIONS
 # psycopg2 returns a connection to the idle pool only while len(self._pool) < minconn;
 #     every other release calls conn.close(). With minconn=1 the pool retained exactly
