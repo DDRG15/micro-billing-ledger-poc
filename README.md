@@ -127,7 +127,7 @@ flowchart TD
     V -->|Valid StripeEvent| P[process_stripe_event\nor\nprocess_stripe_event_batch]
 
     P -->|BEGIN| TX[PostgreSQL Transaction]
-    TX -->|INSERT ... ON CONFLICT\nDO NOTHING| L[(ledger\ntransaction_id PRIMARY KEY)]
+    TX -->|INSERT ... ON CONFLICT\nDO NOTHING| L[(ledger\nPK: org_id + transaction_id)]
     TX -->|RETURNING transaction_id| R{Inserted?}
 
     R -->|in RETURNING set — new event| O[(outbox\ndispatched=0)]
@@ -136,7 +136,8 @@ flowchart TD
     TX -->|COMMIT| C[HTTP 200 to Stripe]
 
     O -->|worker.py polls every N seconds\nSELECT FOR UPDATE SKIP LOCKED| W[Worker Service\ndispatched=0 → dispatched=1]
-    W -->|HTTP POST if DOWNSTREAM_URL set| DS[Downstream System]
+    W -->|POST to that tenant's downstream_url| DS[Downstream System
+per tenant]
     W -->|structured log if WORKER_LOG_ONLY| LOG[Log / Audit]
 
     DI --> OPS[Ops — GET /dlq/entries]
@@ -158,12 +159,21 @@ The Transactional Outbox pattern guarantees that a `ledger` row and its correspo
 **`SELECT FOR UPDATE SKIP LOCKED`** is the concurrency mechanism:
 
 ```sql
-SELECT id, transaction_id, event_type, payload
-FROM outbox
-WHERE dispatched = 0
-ORDER BY id
-LIMIT 100
-FOR UPDATE SKIP LOCKED;
+-- Round-robin across tenants, then lock. ROW_NUMBER() interleaves tenants so one
+-- tenant's backlog cannot own every batch; the ranking sits in a CTE because
+-- PostgreSQL rejects FOR UPDATE in a query containing a window function.
+WITH ranked AS (
+    SELECT id, ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
+    FROM   outbox WHERE dispatched = 0
+), picked AS (
+    SELECT id FROM ranked ORDER BY rn, id LIMIT 100
+)
+SELECT o.id, o.transaction_id, o.event_type, o.payload, o.org_id, g.downstream_url
+FROM   outbox o
+LEFT   JOIN org g ON g.org_id = o.org_id
+WHERE  o.id IN (SELECT id FROM picked)
+ORDER  BY o.id
+FOR UPDATE OF o SKIP LOCKED;   -- locks outbox rows only, never the org registry
 ```
 
 `FOR UPDATE` locks the selected rows for the duration of the transaction. `SKIP LOCKED` skips rows already locked by another worker — rather than blocking, it moves on. Two worker replicas running simultaneously process different rows without any coordination. No event is dispatched twice.
