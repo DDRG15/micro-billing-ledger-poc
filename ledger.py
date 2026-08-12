@@ -791,6 +791,9 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         # claimed_at mirrors Alembic migration 0003 — when the row was claimed for
         #     retry. Lets retry_dlq_batch reclaim a claim that was never released.
         cur.execute("ALTER TABLE dlq ADD COLUMN IF NOT EXISTS claimed_at    TIMESTAMPTZ")
+        # Per-tenant delivery destination (migration 0005). NULL = use the worker's
+        #     process-wide DOWNSTREAM_URL, so existing deployments are unaffected.
+        cur.execute("ALTER TABLE org ADD COLUMN IF NOT EXISTS downstream_url TEXT")
         # org_id on databases created before migration 0004.
         for _t in ("ledger", "outbox", "dlq"):
             cur.execute(f"ALTER TABLE {_t} ADD COLUMN IF NOT EXISTS org_id TEXT "

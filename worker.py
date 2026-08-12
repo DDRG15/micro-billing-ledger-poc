@@ -120,25 +120,33 @@ def _tx(
 # Dispatch
 # ---------------------------------------------------------------------------
 
-def _dispatch_row(row: psycopg2.extras.RealDictRow) -> None:
+def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] = None) -> None:
     """
-    Forward a single outbox row to the downstream system.
-    If DOWNSTREAM_URL is set: HTTP POST the payload JSON.
-    If not set:               structured log line (POC mode).
+    Forward a single outbox row to its tenant's downstream system.
+    destination is that tenant's org.downstream_url, falling back to the process-wide
+    DOWNSTREAM_URL when the tenant has not set one.
+    If neither is set: structured log line (POC mode).
     Raises on failure so the caller skips the UPDATE (row retried next poll).
+
+    The destination is resolved per tenant because delivering one tenant's billing
+    events — customer ids, amounts, raw payloads — to another tenant's endpoint would
+    be the largest leak in the system. Isolating the database and then forwarding
+    everything to one shared URL is not isolation.
     """
-    if DOWNSTREAM_URL:
+    target = destination or DOWNSTREAM_URL
+    if target:
         import urllib.request
         import urllib.error
 
         data = row["payload"].encode()
         req = urllib.request.Request(
-            DOWNSTREAM_URL,
+            target,
             data=data,
             headers={
                 "Content-Type": "application/json",
                 "X-Event-Type": row["event_type"],
                 "X-Transaction-Id": row["transaction_id"],
+                "X-Org-Id": row.get("org_id", "default"),
             },
             method="POST",
         )
@@ -172,20 +180,45 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow) -> None:
 
 def drain_batch(conn: psycopg2.extensions.connection) -> int:
     """
-    Read up to WORKER_BATCH_SIZE undispatched rows, dispatch each one,
-    then mark them dispatched=1 in the same transaction.
-    Returns the number of rows successfully dispatched.
-    Returns 0 when the queue is empty.
+    Read up to WORKER_BATCH_SIZE undispatched rows, dispatch each to ITS OWN tenant's
+    destination, then mark them dispatched=1 in the same transaction.
+    Returns the number of rows successfully dispatched. Returns 0 when the queue is empty.
+
+    FAIRNESS. The batch is selected round-robin across tenants rather than by plain
+        `ORDER BY id`. With a global ordering, one tenant that enqueues a hundred
+        thousand events owns every batch until it drains, and every other tenant's
+        events wait behind it — the queue is shared, so a noisy tenant becomes an
+        outage for the quiet ones. ROW_NUMBER() partitioned by org_id interleaves them:
+        each cycle takes roughly the same number from every tenant with work pending.
+        Ordering within a tenant is still by id, which is what the outbox guarantees;
+        across tenants there was never an ordering to preserve.
+
+    The ranking lives in a CTE because PostgreSQL rejects FOR UPDATE in a query that
+        contains a window function. `FOR UPDATE OF o` then locks only the outbox rows;
+        locking the org registry alongside them would serialise every worker replica
+        behind the same handful of tenant rows.
+
+    The join to org resolves each tenant's downstream_url in the same query, so
+        dispatching does not issue a lookup per row.
     """
     with _tx(conn) as cur:
         cur.execute(
             """
-            SELECT id, transaction_id, event_type, payload
-            FROM   outbox
-            WHERE  dispatched = 0
-            ORDER  BY id
-            LIMIT  %(batch_size)s
-            FOR UPDATE SKIP LOCKED
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
+                FROM   outbox
+                WHERE  dispatched = 0
+            ), picked AS (
+                SELECT id FROM ranked ORDER BY rn, id LIMIT %(batch_size)s
+            )
+            SELECT o.id, o.transaction_id, o.event_type, o.payload, o.org_id,
+                   g.downstream_url
+            FROM   outbox o
+            LEFT   JOIN org g ON g.org_id = o.org_id
+            WHERE  o.id IN (SELECT id FROM picked)
+            ORDER  BY o.id
+            FOR UPDATE OF o SKIP LOCKED
             """,
             {"batch_size": WORKER_BATCH_SIZE},
         )
@@ -201,7 +234,7 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
 
         for row in rows:
             try:
-                _dispatch_row(row)
+                _dispatch_row(row, row.get("downstream_url"))
                 dispatched_ids.append(row["id"])
             except Exception as exc:
                 log.warning(

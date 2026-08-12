@@ -2032,6 +2032,77 @@ finally:
 
 
 # =============================================================================
+# A13: THE WORKER DELIVERS TO EACH TENANT'S OWN DESTINATION, FAIRLY (Phase 13.4)
+# Isolating the database and then forwarding every tenant's events to one shared URL
+#     is not isolation — it is the largest leak in the system, since the payload
+#     carries customer ids and amounts. And a shared queue drained by `ORDER BY id`
+#     lets one tenant with a large backlog own every batch, which turns a noisy
+#     neighbour into an outage for the quiet ones.
+# =============================================================================
+print("\n── A13: per-tenant delivery and fair draining ──────────────────────────")
+
+wrk_conn = fresh_conn()
+with wrk_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret, downstream_url) "
+              "VALUES ('wrk_a','wrk_a','whsec_x','https://a.example/hook') "
+              "ON CONFLICT (org_id) DO UPDATE SET downstream_url=EXCLUDED.downstream_url")
+    c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret, downstream_url) "
+              "VALUES ('wrk_b','wrk_b','whsec_x','https://b.example/hook') "
+              "ON CONFLICT (org_id) DO UPDATE SET downstream_url=EXCLUDED.downstream_url")
+    c.execute("COMMIT")
+
+# Tenant A floods the queue; tenant B enqueues two events afterwards. Under a global
+#     ORDER BY id, B would wait behind all of A's rows.
+for _i in range(30):
+    L.process_stripe_event(wrk_conn, fake_event(eid=f"evt_wrk_a{_i}"), org_id="wrk_a")
+for _i in range(2):
+    L.process_stripe_event(wrk_conn, fake_event(eid=f"evt_wrk_b{_i}"), org_id="wrk_b")
+
+_seen: list = []
+_orig_dispatch = W._dispatch_row
+W._dispatch_row = lambda row, destination=None: _seen.append((row["org_id"], destination))
+_orig_batch = W.WORKER_BATCH_SIZE
+W.WORKER_BATCH_SIZE = 10          # smaller than A's backlog, so fairness is observable
+try:
+    _n = W.drain_batch(wrk_conn)
+    chk("the batch drained rows", _n == 10, f"got {_n}")
+
+    _a_dest = {d for o, d in _seen if o == "wrk_a"}
+    _b_dest = {d for o, d in _seen if o == "wrk_b"}
+    chk("tenant A's events go to A's endpoint", _a_dest == {"https://a.example/hook"}, str(_a_dest))
+    chk("tenant B's events go to B's endpoint", _b_dest == {"https://b.example/hook"}, str(_b_dest))
+    chk("no event was sent to another tenant's endpoint",
+        not (_a_dest & _b_dest), f"A={_a_dest} B={_b_dest}")
+
+    # The fairness claim: B is not starved behind A's 30 rows.
+    _b_count = sum(1 for o, _ in _seen if o == "wrk_b")
+    chk("the quiet tenant is not starved by the noisy one", _b_count == 2,
+        f"tenant B got {_b_count} of {len(_seen)} slots — a global ORDER BY id gives it 0")
+finally:
+    W._dispatch_row = _orig_dispatch
+    W.WORKER_BATCH_SIZE = _orig_batch
+
+# A tenant with no downstream_url falls back to the process-wide DOWNSTREAM_URL,
+#     so single-operator deployments are unaffected by any of this.
+_seen2: list = []
+W._dispatch_row = lambda row, destination=None: _seen2.append(destination)
+try:
+    L.process_stripe_event(wrk_conn, fake_event(eid="evt_wrk_default"), org_id=L.DEFAULT_ORG_ID)
+    W.drain_batch(wrk_conn)
+    chk("a tenant without its own URL yields None, so the worker falls back",
+        None in _seen2, str(_seen2))
+finally:
+    W._dispatch_row = _orig_dispatch
+    with wrk_conn.cursor() as c:
+        c.execute("BEGIN")
+        c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+        c.execute("DELETE FROM org WHERE org_id <> 'default'")
+        c.execute("COMMIT")
+    wrk_conn.close()
+
+
+# =============================================================================
 # A7: CONNECTION POOL RETAINS ITS CONNECTIONS
 # psycopg2 returns a connection to the idle pool only while len(self._pool) < minconn;
 #     every other release calls conn.close(). With minconn=1 the pool retained exactly
