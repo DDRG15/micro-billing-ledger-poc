@@ -1972,6 +1972,66 @@ finally:
 
 
 # =============================================================================
+# A12: A REPLAY LANDS IN THE TENANT THAT OWNS THE ENTRY
+# Both retry paths reprocess a stored raw_payload. If the replay does not carry the
+#     DLQ row's own org_id it falls back to the default, so the ledger row is written
+#     under the wrong tenant while the entry is marked 'resolved' — an entry asserting
+#     that the event was reprocessed for an owner whose ledger is still empty. Revenue
+#     credited to the wrong tenant, and a terminal state that is not true.
+# =============================================================================
+print("\n── A12: retry replays into the owning tenant, not the default ──────────")
+
+rep_conn = fresh_conn()
+with rep_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES ('rep_t','rep_t','whsec_x') "
+              "ON CONFLICT (org_id) DO NOTHING")
+    c.execute("COMMIT")
+
+# A TRANSIENT entry owned by rep_t, holding a replayable payload.
+_rep_ev = fake_event(eid="evt_replay_owner", amount=6600)
+L._write_dlq(rep_conn, L.DLQEntry(org_id="rep_t", transaction_id="evt_replay_owner",
+                                  reason=L.DLQReason.TRANSIENT, raw_payload=_rep_ev))
+
+_attempted = L.retry_dlq_batch(rep_conn)
+chk("the batch picked up the tenant's entry", _attempted == 1, f"got {_attempted}")
+chk("the replayed row landed in the owning tenant, not 'default'",
+    _q1(rep_conn, "SELECT org_id FROM ledger WHERE transaction_id='evt_replay_owner'") == "rep_t",
+    str(_q1(rep_conn, "SELECT org_id FROM ledger WHERE transaction_id='evt_replay_owner'")))
+chk("no row was written under the default org",
+    _q1(rep_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_replay_owner' "
+                  "AND org_id=%s", (L.DEFAULT_ORG_ID,)) == 0)
+# 'resolved' promises the ledger row exists FOR THAT TENANT. Assert both together —
+#     the bug produced a resolved entry whose owner had nothing.
+chk("entry resolved AND the owner's ledger actually has the row",
+    _q1(rep_conn, "SELECT status FROM dlq WHERE transaction_id='evt_replay_owner'") == "resolved"
+    and _q1(rep_conn, "SELECT COUNT(*) FROM ledger WHERE org_id='rep_t' "
+                      "AND transaction_id='evt_replay_owner'") == 1)
+
+# Same through the manual endpoint.
+original_pool_rep = L._pool
+L._pool = _MockPool(rep_conn)
+rep_client = TestClient(L.app)
+try:
+    _ev2 = fake_event(eid="evt_replay_manual", amount=7700)
+    L._write_dlq(rep_conn, L.DLQEntry(org_id=L.DEFAULT_ORG_ID, transaction_id="evt_replay_manual",
+                                      reason=L.DLQReason.TRANSIENT, raw_payload=_ev2))
+    _mid = _q1(rep_conn, "SELECT id FROM dlq WHERE transaction_id='evt_replay_manual'")
+    chk("manual retry → 200", rep_client.post(f"/dlq/{_mid}/retry").status_code == 200)
+    chk("manual replay lands in the caller's tenant",
+        _q1(rep_conn, "SELECT org_id FROM ledger WHERE transaction_id='evt_replay_manual'")
+        == L.DEFAULT_ORG_ID)
+finally:
+    L._pool = original_pool_rep
+    with rep_conn.cursor() as c:
+        c.execute("BEGIN")
+        c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+        c.execute("DELETE FROM org WHERE org_id <> 'default'")
+        c.execute("COMMIT")
+    rep_conn.close()
+
+
+# =============================================================================
 # A7: CONNECTION POOL RETAINS ITS CONNECTIONS
 # psycopg2 returns a connection to the idle pool only while len(self._pool) < minconn;
 #     every other release calls conn.close(). With minconn=1 the pool retained exactly

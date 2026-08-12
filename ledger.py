@@ -1145,7 +1145,7 @@ def retry_dlq_batch(
                 LIMIT %s
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, transaction_id, raw_payload
+            RETURNING id, transaction_id, raw_payload, org_id
             """,
             (claim_timeout_seconds, batch_size),
         )
@@ -1153,7 +1153,7 @@ def retry_dlq_batch(
 
     attempted = 0
     for row in rows:
-        dlq_id, transaction_id, raw_payload_str = row[0], row[1], row[2]
+        dlq_id, transaction_id, raw_payload_str, row_org_id = row[0], row[1], row[2], row[3]
         attempted += 1
         try:
             payload = json.loads(raw_payload_str)
@@ -1161,7 +1161,12 @@ def retry_dlq_batch(
             #     must not append another DLQ row. Without it every retry of an entry whose
             #     event already reached the ledger left one more pending row behind than it
             #     consumed, and each of those was itself retry-eligible.
-            result = process_stripe_event(conn, payload, from_retry=True)
+            # org_id comes from the DLQ row, not from a default. Replaying without it
+            #     writes the ledger row under 'default' while the entry is marked
+            #     resolved — the tenant's ledger stays empty and the DLQ claims the
+            #     event was reprocessed. Wrong tenant credited, and a resolved entry
+            #     asserting a side effect that never happened for its owner.
+            result = process_stripe_event(conn, payload, from_retry=True, org_id=row_org_id)
             outcome = result.get("outcome", "")
             if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
                 with _tx(conn) as cur:
@@ -1987,7 +1992,9 @@ def dlq_retry(request: Request, dlq_id: int,
             )
 
         payload = json.loads(raw_payload_str)
-        result = process_stripe_event(conn, payload, from_retry=True)
+        # Same reason as retry_dlq_batch: the replay must land in the tenant that
+        #     owns the entry, which the scoped SELECT above has already established.
+        result = process_stripe_event(conn, payload, from_retry=True, org_id=org_id)
         outcome = result.get("outcome", "")
 
         if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
