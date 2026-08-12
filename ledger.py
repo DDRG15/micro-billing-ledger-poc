@@ -32,7 +32,8 @@ Usage:
 # All built-in Python modules — no external dependencies here.
 # ---------------------------------------------------------------------------
 import argparse       # CLI argument parsing for --silent/--events flags
-import hashlib        # SHA-256 fingerprints of live secrets — see _secret_fingerprint
+import hashlib        # SHA-256 fingerprints of live secrets and API-key lookups
+import hmac           # compare_digest for constant-time API key comparison
 import json           # JSON serialization for raw payload archiving
 import logging        # Structured log output to file and stderr
 from logging.handlers import RotatingFileHandler  # Rotating file handler — caps log file size to prevent disk fill
@@ -1609,17 +1610,89 @@ _pool: ThreadedConnectionPool = ThreadedConnectionPool(
 )
 
 
-def _require_api_key(x_api_key: str = Header(default="")) -> None:
-    """FastAPI dependency for ops endpoints. Enforces X-Api-Key when BILLING_API_KEY is set.
-    If BILLING_API_KEY is empty (default), the check is skipped — dev-mode convenience.
-    Operational endpoints expose customer IDs, amounts and raw payloads; they need a key in production.
+def _any_org_keys() -> bool:
+    """True if any active org has registered an API key.
+
+    Decides between dev mode (no credential configured anywhere, everything is the
+    default org) and enforced auth. Read once at startup rather than per request: an
+    org is provisioned at deploy time, and a query on every call would put the auth
+    check on the hot path. Restart after provisioning the first tenant — the startup
+    log line says which mode the process came up in.
     """
-    if not BILLING_API_KEY:
-        return  # dev mode — no key configured, skip check
+    _c = _pool.getconn()
+    try:
+        with _c.cursor() as cur:
+            cur.execute("SELECT EXISTS (SELECT 1 FROM org WHERE api_key_sha256 IS NOT NULL AND active)")
+            return bool(cur.fetchone()[0])
+    except Exception:  # noqa: BLE001 — a missing org table means a pre-0004 database
+        return False
+    finally:
+        _pool.putconn(_c)
+
+
+_ANY_ORG_KEYS: bool = _any_org_keys()
+_log.info(
+    "tenancy mode=%s", "multi-tenant" if _ANY_ORG_KEYS else "single-org",
+    extra={"event": "tenancy_mode", "multi_tenant": _ANY_ORG_KEYS,
+           "default_org": DEFAULT_ORG_ID},
+)
+
+
+def _lookup_org_by_key(conn: "psycopg2.extensions.connection", api_key: str) -> Optional[str]:
+    """Return the org that owns this API key, or None.
+
+    Compares SHA-256 digests: the registry never stores the key itself, so a database
+    dump does not hand over working credentials.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT org_id FROM org WHERE api_key_sha256 = %s AND active",
+            (hashlib.sha256(api_key.encode("utf-8")).hexdigest(),),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _require_api_key(x_api_key: str = Header(default="")) -> str:
+    """FastAPI dependency for ops endpoints. Returns the caller's org_id.
+
+    The tenant is DERIVED from the credential; it is never accepted from the caller.
+    An X-Org-Id header validated against a shared key would not be an isolation
+    boundary at all — anyone holding that key could read another tenant's data by
+    editing a header. Whoever presents the key IS the org, and that is the only claim
+    about identity this system trusts.
+
+    Resolution order:
+      1. BILLING_API_KEY empty and no org has registered a key — dev mode, everything
+         is DEFAULT_ORG_ID. The startup warning already says the endpoints are open.
+      2. The presented key matches a registered org — that org.
+      3. The presented key matches BILLING_API_KEY — DEFAULT_ORG_ID. This keeps
+         single-operator deployments working exactly as before Phase 13.
+      4. Otherwise 401.
+
+    Operational endpoints expose customer IDs, amounts and raw payloads, so the key is
+    what stands between a tenant and everyone else's revenue data.
+    """
+    if not BILLING_API_KEY and not _ANY_ORG_KEYS:
+        return DEFAULT_ORG_ID  # dev mode — no credential configured anywhere
     if not x_api_key:
         raise HTTPException(status_code=401, detail="X-Api-Key header required")
-    if x_api_key != BILLING_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    if _ANY_ORG_KEYS:
+        conn = _pool.getconn()
+        try:
+            org_id = _lookup_org_by_key(conn, x_api_key)
+        finally:
+            _pool.putconn(conn)
+        if org_id:
+            return org_id
+
+    # compare_digest, not ==. String equality short-circuits on the first differing
+    #     byte, which leaks the length of a correct prefix to anyone timing the response.
+    if BILLING_API_KEY and hmac.compare_digest(x_api_key, BILLING_API_KEY):
+        return DEFAULT_ORG_ID
+
+    raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 class StripeWebhookPayload(BaseModel):
@@ -1696,7 +1769,7 @@ def stripe_webhook(request: Request, payload: StripeWebhookPayload) -> JSONRespo
 
 @app.get("/ledger/summary")
 @_limiter.limit(RATE_LIMIT_OPS)
-def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSONResponse:
+def ledger_summary(request: Request, org_id: str = Depends(_require_api_key)) -> JSONResponse:
     """
     Quick sanity-check endpoint. Returns row counts per ledger status, DLQ depth,
     and outbox pending count. Requires X-Api-Key header when BILLING_API_KEY is set.
@@ -1707,7 +1780,8 @@ def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSO
     try:
         # GROUP BY status gives {POSTED: N, VOID: N, PENDING: N} in one query.
         with conn.cursor() as cur:
-            cur.execute("SELECT status, COUNT(*) FROM ledger GROUP BY status")
+            cur.execute("SELECT status, COUNT(*) FROM ledger WHERE org_id=%s GROUP BY status",
+                        (org_id,))
             counts = {row[0]: row[1] for row in cur.fetchall()}
 
         # Two questions, two numbers. dlq_depth answers "how much still needs
@@ -1719,17 +1793,18 @@ def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSO
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FILTER (WHERE status IN ('pending','retrying','exhausted')), "
-                "       COUNT(*) FROM dlq"
+                "       COUNT(*) FROM dlq WHERE org_id=%s", (org_id,)
             )
             dlq_depth, dlq_total = cur.fetchone()
 
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
+            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0 AND org_id=%s", (org_id,))
             outbox_pending = cur.fetchone()[0]
     finally:
         _pool.putconn(conn)
 
     return JSONResponse(content={
+        "org_id":         org_id,
         "ledger":         counts,
         "dlq_depth":      dlq_depth,      # Entries still needing action
         "dlq_total":      dlq_total,      # Every DLQ row ever written, resolved included
@@ -1739,7 +1814,7 @@ def ledger_summary(request: Request, _: None = Depends(_require_api_key)) -> JSO
 
 @app.get("/metrics")
 @_limiter.limit(RATE_LIMIT_METRICS)
-def metrics(request: Request, _: None = Depends(_require_api_key)) -> Response:
+def metrics(request: Request, org_id: str = Depends(_require_api_key)) -> Response:
     """
     Prometheus exposition endpoint.
 
@@ -1762,13 +1837,13 @@ def metrics(request: Request, _: None = Depends(_require_api_key)) -> Response:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FILTER (WHERE status IN ('pending','retrying','exhausted')), "
-                "       COUNT(*) FROM dlq"
+                "       COUNT(*) FROM dlq WHERE org_id=%s", (org_id,)
             )
             _actionable, _total = cur.fetchone()
             _DLQ_DEPTH.set(_actionable)
             _DLQ_TOTAL.set(_total)
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
+            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0 AND org_id=%s", (org_id,))
             _OUTBOX_PENDING.set(cur.fetchone()[0])
     finally:
         _pool.putconn(conn)
@@ -1778,7 +1853,8 @@ def metrics(request: Request, _: None = Depends(_require_api_key)) -> Response:
 
 @app.get("/dlq/entries")
 @_limiter.limit(RATE_LIMIT_OPS)
-def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_api_key)) -> JSONResponse:
+def dlq_entries(request: Request, limit: int = 50,
+                org_id: str = Depends(_require_api_key)) -> JSONResponse:
     """
     Inspect DLQ entries over HTTP — newest first. This is the ops endpoint:
     without it, "check the DLQ" means "SSH into the box and run a psql query."
@@ -1795,8 +1871,8 @@ def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_ap
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id, transaction_id, reason, raw_payload, received_at "
-                "FROM dlq ORDER BY id DESC LIMIT %s",
-                (min(limit, 1000),),  # cap at 1000 — never dump the entire table
+                "FROM dlq WHERE org_id=%s ORDER BY id DESC LIMIT %s",
+                (org_id, min(limit, 1000)),  # cap at 1000 — never dump the entire table
             )
             rows = cur.fetchall()
     finally:
@@ -1819,7 +1895,8 @@ def dlq_entries(request: Request, limit: int = 50, _: None = Depends(_require_ap
 
 @app.post("/dlq/{dlq_id}/retry")
 @_limiter.limit(RATE_LIMIT_OPS)
-def dlq_retry(request: Request, dlq_id: int, _: None = Depends(_require_api_key)) -> JSONResponse:
+def dlq_retry(request: Request, dlq_id: int,
+              org_id: str = Depends(_require_api_key)) -> JSONResponse:
     """
     Manual retry endpoint for a single DLQ entry. Reprocesses the raw_payload
     immediately, ignoring retry_count and backoff. Useful for ops: fix the
@@ -1839,8 +1916,13 @@ def dlq_retry(request: Request, dlq_id: int, _: None = Depends(_require_api_key)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT transaction_id, raw_payload, status FROM dlq WHERE id=%s",
-                (dlq_id,),
+                # org_id in the WHERE clause, not checked after the fetch. A tenant must
+                #     not be able to learn that another tenant's dlq id exists, and a
+                #     retry is a WRITE — it replays a payload into the ledger. Scoping the
+                #     lookup makes another tenant's entry indistinguishable from a
+                #     nonexistent one: both are 404.
+                "SELECT transaction_id, raw_payload, status FROM dlq WHERE id=%s AND org_id=%s",
+                (dlq_id, org_id),
             )
             row = cur.fetchone()
         if row is None:

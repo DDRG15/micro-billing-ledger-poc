@@ -16,6 +16,7 @@ can run it with a plain Python install.
 # ---------------------------------------------------------------------------
 import io          # Used to wrap stdout for UTF-8 output on Windows
 import json        # Used to verify raw_payload round-trips correctly
+import hashlib     # A10: hash API keys the way the org registry stores them
 import logging     # Phase 12: build LogRecords to assert the JSON formatter's output
 import os          # A6: manipulate env vars to exercise the *_FILE secret sources
 import sys         # stdout override for Windows UTF-8 encoding
@@ -1766,6 +1767,82 @@ chk("batch path isolates tenants too", _rb[0]["outcome"] == "POSTED", f"got {_rb
 chk("batch wrote one row per tenant",
     _q1(tenant_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id=%s", (_batch_id,)) == 2)
 tenant_conn.close()
+
+
+# =============================================================================
+# A10: THE ORG IS DERIVED FROM THE CREDENTIAL, AND SCOPES EVERY OPS QUERY
+# The roadmap called for an X-Org-Id header validated against a shared key. That is
+#     not an isolation boundary: anyone holding the key reads another tenant's data by
+#     editing a header. Whoever presents the key IS the org. These tests assert a
+#     tenant cannot see, or act on, another tenant's rows — including the retry
+#     endpoint, which is a WRITE.
+# =============================================================================
+print("\n── A10: tenant isolation across every ops endpoint ─────────────────────")
+
+iso_conn = fresh_conn()
+_KEY_A, _KEY_B = "key_alpha_secret_value", "key_beta_secret_value"
+with iso_conn.cursor() as c:
+    c.execute("BEGIN")
+    for _o, _k in (("org_a", _KEY_A), ("org_b", _KEY_B)):
+        c.execute(
+            "INSERT INTO org (org_id, name, api_key_sha256, stripe_webhook_secret) "
+            "VALUES (%s,%s,%s,%s) ON CONFLICT (org_id) DO UPDATE SET api_key_sha256=EXCLUDED.api_key_sha256",
+            (_o, _o, hashlib.sha256(_k.encode()).hexdigest(), "whsec_test"),
+        )
+    c.execute("COMMIT")
+
+# Each tenant gets distinct data: A posts two events, B posts one.
+L.process_stripe_event(iso_conn, fake_event(eid="evt_a1", amount=1000), org_id="org_a")
+L.process_stripe_event(iso_conn, fake_event(eid="evt_a2", amount=2000), org_id="org_a")
+L.process_stripe_event(iso_conn, fake_event(eid="evt_b1", amount=9000), org_id="org_b")
+L.process_stripe_event(iso_conn, fake_event(eid="evt_a1", amount=1000), org_id="org_a")  # -> A's DLQ
+
+original_pool_iso, original_key_iso, original_any_iso = L._pool, L.BILLING_API_KEY, L._ANY_ORG_KEYS
+L._pool = _MockPool(iso_conn)
+L.BILLING_API_KEY = ""
+L._ANY_ORG_KEYS = True          # orgs now hold keys, so auth is enforced
+iso_client = TestClient(L.app)
+try:
+    _hA, _hB = {"X-Api-Key": _KEY_A}, {"X-Api-Key": _KEY_B}
+
+    chk("an unknown key is rejected",
+        iso_client.get("/ledger/summary", headers={"X-Api-Key": "not_a_real_key"}).status_code == 401)
+    chk("a missing key is rejected",
+        iso_client.get("/ledger/summary").status_code == 401)
+
+    _sa = iso_client.get("/ledger/summary", headers=_hA).json()
+    _sb = iso_client.get("/ledger/summary", headers=_hB).json()
+    chk("the response names the derived org, not a supplied one", _sa.get("org_id") == "org_a",
+        str(_sa.get("org_id")))
+    chk("tenant A sees only its 2 ledger rows", sum(_sa["ledger"].values()) == 2, str(_sa["ledger"]))
+    chk("tenant B sees only its 1 ledger row",  sum(_sb["ledger"].values()) == 1, str(_sb["ledger"]))
+    chk("tenant A sees its own DLQ row",  _sa["dlq_total"] == 1, str(_sa))
+    chk("tenant B sees no DLQ rows",      _sb["dlq_total"] == 0, str(_sb))
+
+    # A header cannot override the credential — that was the roadmap's flaw.
+    _spoof = iso_client.get("/ledger/summary", headers={**_hB, "X-Org-Id": "org_a"}).json()
+    chk("X-Org-Id cannot override the credential", _spoof.get("org_id") == "org_b",
+        str(_spoof.get("org_id")))
+    chk("the spoof attempt still sees only B's data", sum(_spoof["ledger"].values()) == 1)
+
+    _ea = iso_client.get("/dlq/entries", headers=_hA).json()["entries"]
+    _eb = iso_client.get("/dlq/entries", headers=_hB).json()["entries"]
+    chk("/dlq/entries is scoped to the caller", len(_ea) == 1 and len(_eb) == 0,
+        f"A={len(_ea)} B={len(_eb)}")
+
+    # The retry endpoint is a WRITE. Another tenant's id must be indistinguishable
+    #     from a nonexistent one, or the response becomes an existence oracle.
+    _a_dlq_id = _ea[0]["id"]
+    chk("tenant B cannot retry tenant A's DLQ entry (404, not 200)",
+        iso_client.post(f"/dlq/{_a_dlq_id}/retry", headers=_hB).status_code == 404)
+    chk("tenant A can retry its own entry",
+        iso_client.post(f"/dlq/{_a_dlq_id}/retry", headers=_hA).status_code == 200)
+
+    _ma = iso_client.get("/metrics", headers=_hA).text
+    chk("metrics are scoped to the caller's org", "dlq_total 1.0" in _ma, "expected A's own total")
+finally:
+    L._pool, L.BILLING_API_KEY, L._ANY_ORG_KEYS = original_pool_iso, original_key_iso, original_any_iso
+    iso_conn.close()
 
 
 # =============================================================================
