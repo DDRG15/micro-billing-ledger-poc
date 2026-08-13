@@ -169,9 +169,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      # The worker connects as billing_app, which does not exist until migration 0006
-      #     runs. Without this gate it crash-looped on "role does not exist" for as long
-      #     as the migration took, which reads as a broken deploy in `docker compose ps`.
+      # billing_app does not exist until migration 0006 runs, and the worker cannot wait
+      #     it out: it imports ledger.py, whose ThreadedConnectionPool opens its minconn
+      #     connections eagerly at construction and raises there. That is an import-time
+      #     failure, so the worker's own connect-retry loop never gets to run — the
+      #     process exits and `restart: unless-stopped` turns it into a crash loop.
+      #     Verified: building a pool against a role that does not exist raises
+      #     OperationalError at __init__, not on first use.
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
