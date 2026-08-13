@@ -48,9 +48,20 @@ services:
   migrate:
     build: .
     networks: [billing_net]
-    command: alembic upgrade head
+    # Schema first, then the deploy-time rows that need owner rights. provision.py syncs
+    #     the default tenant's signing secret from STRIPE_WEBHOOK_SECRET — a job the API
+    #     used to do at import, and cannot do any more now that it connects as a role with
+    #     SELECT-only on the org registry. `&&` so a failed migration stops the deploy
+    #     rather than provisioning against a half-migrated schema.
+    command: sh -c "alembic upgrade head && python provision.py"
     environment:
+      # The OWNER connection, and the only service that gets it. Migrations issue DDL and
+      #     create the restricted role, so they need rights the application must not hold.
       DATABASE_URL: "${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/billing}"
+      # Read, never printed — provision.py writes it to org.stripe_webhook_secret so the
+      #     legacy single-tenant route verifies against the operator's current value.
+      STRIPE_WEBHOOK_SECRET:      "${STRIPE_WEBHOOK_SECRET:-whsec_YOUR_SECRET_HERE}"
+      STRIPE_WEBHOOK_SECRET_FILE: "${STRIPE_WEBHOOK_SECRET_FILE:-}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,7 +84,14 @@ services:
     build: .
     networks: [billing_net]
     environment:
-      DATABASE_URL:            "${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/billing}"
+      # APP_DATABASE_URL only — DATABASE_URL is deliberately ABSENT from this container.
+      #     billing_app is NOSUPERUSER NOBYPASSRLS, which is what makes migration 0006's
+      #     policies apply instead of being decorative; the owner DSN in here would hand
+      #     the same process a way around them. A service that cannot authenticate as the
+      #     owner cannot drop a table or read another tenant even if its own credentials
+      #     leak. Confirm which world it came up in:
+      #       docker compose logs billing | grep -E 'rls_enforced|rls_inert'
+      APP_DATABASE_URL:        "${APP_DATABASE_URL:-postgresql://billing_app:billing_app@postgres:5432/billing}"
       STRIPE_WEBHOOK_SECRET:   "${STRIPE_WEBHOOK_SECRET:-whsec_YOUR_SECRET_HERE}"
       BILLING_API_KEY:         "${BILLING_API_KEY:-dev_key_change_in_production}"
       # Which peer addresses may set X-Forwarded-For. uvicorn reads this env var
@@ -137,7 +155,10 @@ services:
     networks: [billing_net]
     command: python worker.py
     environment:
-      DATABASE_URL:        "${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/billing}"
+      # Same restricted role as billing, same reason. The worker is the process that
+      #     legitimately crosses tenants (outbox drain, DLQ retry claim, retention), so
+      #     it is the one where an owner connection would quietly cost the most.
+      APP_DATABASE_URL:    "${APP_DATABASE_URL:-postgresql://billing_app:billing_app@postgres:5432/billing}"
       DOWNSTREAM_URL:      "${DOWNSTREAM_URL:-}"
       WORKER_LOG_ONLY:     "${WORKER_LOG_ONLY:-true}"
       WORKER_BATCH_SIZE:   "${WORKER_BATCH_SIZE:-100}"
@@ -148,6 +169,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # The worker connects as billing_app, which does not exist until migration 0006
+      #     runs. Without this gate it crash-looped on "role does not exist" for as long
+      #     as the migration took, which reads as a broken deploy in `docker compose ps`.
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------

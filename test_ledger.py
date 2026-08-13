@@ -2379,6 +2379,13 @@ if app_conn is not None:
         chk("the worker drains every tenant under RLS", _drained == 4, f"drained {_drained}")
         chk("nothing is left undispatched",
             _q1(app_owner, "SELECT COUNT(*) FROM outbox WHERE dispatched=0") == 0)
+    except _pg.Error as _rls_exc:    # noqa: BLE001
+        # A site that lost its scope does not return a wrong answer here — it raises
+        #     "new row violates row-level security policy" or reads nothing. Turning that
+        #     into a FAIL rather than letting it abort the process keeps the remaining
+        #     ~100 sections running and puts the offending statement in the output, which
+        #     is the whole diagnostic when 16 sites must all be right at once.
+        chk("every application query site carries an RLS scope", False, repr(_rls_exc))
     finally:
         L._pool, L._ANY_ORG_KEYS = original_pool_app, original_any_app
         app_conn.close()
@@ -2389,6 +2396,70 @@ with app_owner.cursor() as c:
     c.execute("DELETE FROM org WHERE org_id <> 'default'")
     c.execute("COMMIT")
 app_owner.close()
+
+
+# =============================================================================
+# A17: THE DEFAULT TENANT'S SIGNING SECRET STILL FOLLOWS ROTATION (Phase 13.7)
+# _bootstrap() did two unrelated jobs under one name: create the tables, and sync the
+#     default org's stripe_webhook_secret from STRIPE_WEBHOOK_SECRET. 13.7 stopped the
+#     API from calling it — billing_app cannot issue DDL and holds SELECT-only on the
+#     registry — and very nearly dropped the second job with the first.
+#
+#     Nothing would have failed loudly. Migration 0004 seeds the literal
+#     'whsec_YOUR_SECRET_HERE' under ON CONFLICT DO NOTHING and alembic re-runs nothing,
+#     so a fresh deploy would verify every legacy /webhook/stripe request against a
+#     placeholder and a rotation would never reach the registry — surfacing as Stripe
+#     apparently sending bad signatures, which points at the sender rather than the row.
+#     provision.py now does it from the migrate service, which holds the owner credential.
+# =============================================================================
+print("\n── A17: rotation still reaches the default tenant's registry row ───────")
+
+import provision as P  # noqa: E402
+
+prov_conn = fresh_conn()
+with prov_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("UPDATE org SET stripe_webhook_secret='whsec_stale_value' WHERE org_id='default'")
+    c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) "
+              "VALUES ('prov_other','prov_other','whsec_other_tenant') "
+              "ON CONFLICT (org_id) DO NOTHING")
+    c.execute("COMMIT")
+
+P.sync_default_org_secret(prov_conn, "whsec_rotated_value")
+chk("a rotated secret overwrites the stale registry row",
+    _q1(prov_conn, "SELECT stripe_webhook_secret FROM org WHERE org_id='default'")
+    == "whsec_rotated_value",
+    "DO NOTHING here would leave the legacy route verifying against the old secret")
+chk("other tenants' secrets are untouched",
+    _q1(prov_conn, "SELECT stripe_webhook_secret FROM org WHERE org_id='prov_other'")
+    == "whsec_other_tenant")
+
+# The reason this lives in provision.py and not in the service: the role that serves
+#     traffic must not be able to rewrite the registry that decides who a tenant is.
+_prov_refused = False
+try:
+    _prov_app = _pg.connect(_APP_DSN)
+    _prov_app.autocommit = True
+    try:
+        with _prov_app.cursor() as c:
+            c.execute("UPDATE org SET stripe_webhook_secret='whsec_seized' WHERE org_id='default'")
+    except _pg.Error:
+        _prov_refused = True
+    finally:
+        _prov_app.close()
+except _pg.Error as _exc:   # noqa: BLE001
+    chk("can connect as the restricted role for the registry check", False, str(_exc))
+chk("the application role cannot rewrite the org registry", _prov_refused,
+    "billing_app holds SELECT only — a service that can rewrite the registry can "
+    "reassign a tenant's signing secret to itself")
+
+with prov_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("DELETE FROM org WHERE org_id <> 'default'")
+    c.execute("UPDATE org SET stripe_webhook_secret=%s WHERE org_id='default'",
+              (L.STRIPE_WEBHOOK_SECRET,))
+    c.execute("COMMIT")
+prov_conn.close()
 
 
 # =============================================================================

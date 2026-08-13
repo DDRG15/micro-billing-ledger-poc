@@ -65,6 +65,28 @@ jobs:
             && { echo "FAIL: caddy is crash-looping"; docker compose logs caddy; exit 1; }
           exit 0
 
+      # --- Regression: RLS must be IN FORCE, not merely present (Phase 13.7) -
+      # The acceptance criterion for 13.7, asserted where it can actually be observed.
+      #     13.6 shipped policies that were completely inert because the service
+      #     connected as a superuser, and the only external symptom was a log line. A
+      #     deploy that reverts APP_DATABASE_URL to the owner passes every other check
+      #     in this file and every test in the suite — the isolation just silently stops
+      #     being enforced by the database. So the log line is the assertion.
+      - name: Row-level security is in force for billing and worker
+        run: |
+          for svc in billing worker; do
+            logs=$(docker compose logs "$svc")
+            if echo "$logs" | grep -q 'rls_inert'; then
+              echo "FAIL: $svc reports rls_inert — it is connected as a superuser and"
+              echo "      migration 0006's policies do not apply to it."
+              echo "$logs" | grep 'rls_inert'
+              exit 1
+            fi
+            echo "$logs" | grep -q 'rls_enforced' \
+              || { echo "FAIL: $svc never reported rls_enforced"; echo "$logs" | tail -30; exit 1; }
+            echo "$svc: rls_enforced"
+          done
+
       # --- Regression: billing healthcheck must not be a false negative ------
       - name: Billing container reports healthy
         run: |

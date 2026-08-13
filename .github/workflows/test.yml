@@ -1,5 +1,5 @@
 # test.yml — run the full test suite on every push and PR
-# All 296 tests hit a real PostgreSQL 16 container — zero mocks.
+# Every test hits a real PostgreSQL 16 container — zero mocks.
 
 name: Tests
 
@@ -39,9 +39,28 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run test suite
+      # The schema used to come from _bootstrap()'s CREATE TABLE IF NOT EXISTS, so the
+      #     suite ran without ever applying a migration. That stopped being enough at
+      #     0006: the row-level security policies and the billing_app role exist ONLY in
+      #     the migration, and _bootstrap does not create either. Without this step the
+      #     RLS sections cannot connect as the restricted role — the exact tests whose
+      #     whole purpose is to prove isolation does not depend on the application
+      #     remembering it. Running alembic here also means CI exercises the schema
+      #     production actually gets, rather than a parallel one maintained by hand.
+      - name: Apply migrations
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/billing
+        run: alembic upgrade head
+
+      - name: Run test suite
+        env:
+          # Owner: _bootstrap, fresh_conn and the truncations between sections.
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/billing
+          # The restricted role, as the service would connect. A15 and A16 use it to
+          #     prove the policies bite and that every application query site carries a
+          #     scope. The password is 0006's bootstrap placeholder — correct here,
+          #     rotated in any real deployment (see .env.example).
+          APP_DATABASE_URL: postgresql://billing_app:billing_app@localhost:5432/billing
           STRIPE_WEBHOOK_SECRET: whsec_ci_test_secret_not_for_production
           BILLING_API_KEY: ci_test_api_key_not_for_production
           WORKER_LOG_ONLY: "true"

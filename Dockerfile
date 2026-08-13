@@ -51,7 +51,7 @@ COPY --from=builder /install /usr/local
 #     worker:   worker.py (python worker.py)
 #     migrate:  alembic.ini + alembic/ (alembic upgrade head)
 #     All three services build from this single image — every file must be present.
-COPY ledger.py worker.py alembic.ini ./
+COPY ledger.py worker.py provision.py alembic.ini ./
 COPY alembic/ alembic/
 
 # Grant ownership of /app to the billing user BEFORE switching to it.
