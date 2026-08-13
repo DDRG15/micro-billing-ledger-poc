@@ -67,16 +67,46 @@ an availability property rather than a confidentiality one: a shared queue drain
 order lets a tenant with a large backlog own every batch, making a noisy tenant an outage
 for the quiet ones.
 
+**The database enforces isolation, not only the queries.** Every `SELECT` and `INSERT`
+used to carry its own `org_id` predicate, which holds exactly as long as nobody forgets
+one — and on 2026-08-11 somebody did: the batch path built its DLQ rows without `org_id`
+in two branches, so one tenant's raw payload became readable by another and the same
+Stripe event was POSTED under two tenants. No linter, type checker or constraint could
+have caught it, because the guarantee was a habit.
+
+`ledger`, `outbox` and `dlq` now carry row-level security policies with `USING` **and**
+`WITH CHECK` — reading and writing both — and the service connects as `billing_app`, a
+role created `NOSUPERUSER NOBYPASSRLS` holding DML on those three tables and `SELECT` on
+the org registry. The role is the part that matters: a superuser bypasses RLS entirely,
+`ENABLE` and `FORCE` included, so an earlier attempt that shipped only the policies
+enforced nothing while appearing complete. Unset scope means *no rows*, not *all rows*;
+treating "unset" as "unrestricted" would reproduce the original failure exactly. Work
+that legitimately crosses tenants — the outbox drain, the DLQ retry claim, retention
+pruning — opts in through one named token, so `grep ALL_ORGS` lists everything that
+leaves a tenant.
+
+The process states which of the two worlds it came up in, at startup, every boot:
+`rls_enforced` with the connected role, or `rls_inert` at CRITICAL. Check it after any
+deploy that touches `APP_DATABASE_URL`:
+
+```bash
+docker compose logs billing | grep -E "rls_enforced|rls_inert"
+```
+
+**What RLS here does not do.** It scopes what a session may see; it does not decide who
+may open one. Anyone holding the `billing_app` credential reads every tenant by asking
+for `ALL_ORGS` — so that password is a real secret, and migration 0006 creates it with a
+placeholder published in this repository. Rotate it before the database is reachable
+from anywhere; the service warns at startup for as long as it is unrotated. The owner
+credential still bypasses RLS by design, because migrations need DDL — it belongs to the
+migration step and to no process serving traffic.
+
 **Not attempted, within tenancy.** There is no admin credential, so no operator-wide view
-across tenants exists. Isolation is enforced in application queries rather than PostgreSQL
-row-level security, so a future query that omits its `org_id` predicate would not be caught
-by the database. No row-level security in PostgreSQL — isolation is enforced in
-application queries, which means a future query that forgets its `org_id` predicate would
-not be caught by the database. Treat the tenancy here as demonstrated, not finished. No authentication beyond a single shared API key — no user accounts, no
-roles, no rotation. No audit log of who read operational data. No encryption at rest
-beyond whatever PostgreSQL is configured to provide. No GDPR/LGPD erasure path; the
-ledger is deliberately append-only and resolving that conflict needs a retention policy
-decided first, not code.
+across tenants exists. No authentication beyond a single shared API key per tenant — no
+user accounts, no roles, no rotation flow. No audit log of who read operational data. No
+encryption at rest beyond whatever PostgreSQL is configured to provide. No GDPR/LGPD
+erasure path; the ledger is deliberately append-only and resolving that conflict needs a
+retention policy decided first, not code.
 
 **Dev defaults are dev defaults.** `.env.example` ships working placeholder values so
 the stack starts on a clean clone. Every one marked `*** CHANGE ***` must be replaced

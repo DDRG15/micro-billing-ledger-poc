@@ -8,7 +8,7 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 296 / 296 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 332 / 332 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** 4,699 TPS batch · 152 TPS over HTTP at 16 concurrent clients (p50 96ms) · 28 TPS per-event · all reproducible via `python benchmark.py`
 
 ---
@@ -47,16 +47,24 @@ python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. Run the full test suite — 296 tests, live PostgreSQL, no mocks
+# 4. Apply migrations. Required before the suite: the row-level security policies
+#    and the restricted `billing_app` role exist only in migration 0006, and the
+#    tests that prove isolation connect as that role.
+alembic upgrade head
+
+# 5. Run the full test suite — 332 tests, live PostgreSQL, no mocks
 python test_ledger.py
 
-# 5. Start the full stack (postgres + billing + worker + caddy)
+# 6. Start the full stack (postgres + migrate + billing + worker + caddy)
 docker compose up
+# Confirm the database is enforcing tenant isolation, not just declaring it:
+docker compose logs billing | grep -E "rls_enforced|rls_inert"
 
-# — OR — run the API standalone without the full stack
+# — OR — run the API standalone without the full stack. It connects as the owner
+#   unless APP_DATABASE_URL points at billing_app, and says so at startup.
 uvicorn ledger:app --port 8000
 
-# 6. Teardown — stop containers and remove volumes
+# 7. Teardown — stop containers and remove volumes
 docker compose down          # keeps pgdata volume (data survives)
 docker compose down -v       # wipes pgdata volume (full clean slate)
 ```
@@ -191,6 +199,17 @@ The `dispatched=1` update happens in the **same `BEGIN…COMMIT`** as the dispat
 **Stripe HMAC-SHA256 Signature Verification** — Every inbound webhook is authenticated via `stripe.Webhook.construct_event()` using the endpoint's signing secret. Unsigned or tampered requests return HTTP 400 before touching the database. Verification stays on even when `STRIPE_WEBHOOK_SECRET` is left at its placeholder: an endpoint that accepts unsigned requests whenever it is misconfigured fails silently, which is worse than rejecting everything.
 
 **API Key Authentication** — `/ledger/summary`, `/dlq/entries`, `/dlq/{id}/retry` and `/metrics` require an `X-Api-Key` header validated against the `BILLING_API_KEY` environment variable. Missing or invalid keys return HTTP 401. An empty `BILLING_API_KEY` disables the check entirely for local development, and the application logs a warning at startup when that happens — a fail-open default is defensible, a silent one is not.
+
+**Row-Level Security** — Tenant isolation is enforced by PostgreSQL, not only by the queries. `ledger`, `outbox` and `dlq` carry default-deny policies with `USING` **and** `WITH CHECK`, so a query that forgets its `org_id` predicate returns nothing rather than everything, and an `INSERT` naming another tenant is refused by the database. The service connects as `billing_app` — `NOSUPERUSER NOBYPASSRLS`, DML on those three tables, `SELECT` on the org registry, and nothing else — while the owner credential stays with the migration step, which is the only thing that needs DDL.
+
+The role is the part that matters, and it is the part that is easy to get wrong. A first attempt shipped the policies alone: they applied cleanly, appeared in `pg_policies`, and enforced nothing, because the application connected as a superuser and a superuser bypasses RLS regardless of `ENABLE` or `FORCE`. The full test suite passed — which was the alarm, not the result, since default-deny should have broken half the system. So the process now says out loud, at every boot, which of the two worlds it is in:
+
+```bash
+docker compose logs billing | grep -E "rls_enforced|rls_inert"
+# rls_enforced  db_user=billing_app  superuser=false  policies=3
+```
+
+`rls_inert` is not a warning about a future risk; it is the statement that isolation has gone back to depending on every query remembering its own predicate. `.github/workflows/stack.yml` fails the build if either container reports it.
 
 **These are engineering controls, not a compliance program.** They address request authenticity and access to operational data. They are not an ISMS, there is no audit trail of who read operational data, no formal risk assessment, and no external audit. See [SECURITY.md](SECURITY.md) for what this project deliberately does not attempt.
 
@@ -486,7 +505,7 @@ scrape_configs:
 ## Test Coverage
 
 ```
-296 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+332 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -514,13 +533,23 @@ A6 / A7    Ops surface   — secret *_FILE sources, fingerprints, unreadable-fil
 A8         Config        — rate-limit defaults pinned so "configurable" stays unchanged
 A4 / A5    Terminal state — 'resolved' survives _increment_retry; dlq_depth counts backlog,
                             dlq_total counts history; both gauges agree with /ledger/summary
+A15 / A16  Row-level security — connected as the RESTRICTED role, because running these
+                            as the owner would prove nothing: unset scope sees zero rows,
+                            a query that FORGETS its org_id predicate still cannot cross
+                            tenants, a cross-tenant INSERT is refused by WITH CHECK. A16
+                            then drives the real endpoints, core functions and worker
+                            drain over that connection — every application query site
+                            has to carry a scope for any of it to answer at all
+A17        Deploy-time rows — a rotated STRIPE_WEBHOOK_SECRET still reaches the default
+                            tenant's registry row, other tenants stay untouched, and the
+                            role that serves traffic cannot rewrite the registry
 A0         Amount extract — per-event-type field priority; unknown amount → DLQ, never $0
 A1 / A2    DLQ integrity  — retry appends no rows; 'resolved' terminal (409); 'exhausted' replayable
 A3         Claim recovery — stale claim reclaimed, live claim not stolen, batch not aborted
 M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), prune_dlq retention
 ```
 
-**Mutation-verified.** A passing suite proves nothing until you watch it fail. Thirteen deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, letting `dlq_depth` count resolved rows again, reverting the pool to `minconn=1`, and quietly changing a rate-limit default — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch.
+**Mutation-verified.** A passing suite proves nothing until you watch it fail. Fifteen deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, letting `dlq_depth` count resolved rows again, reverting the pool to `minconn=1`, quietly changing a rate-limit default, and making each `_tx` accept its tenant scope and silently never apply it — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch. The two scope mutants reproduced the state 13.6 shipped in: policies present, nothing enforced — the API's raised `new row violates row-level security policy`, the worker's silently drained zero rows.
 
 **Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
 
@@ -552,14 +581,15 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Outbox worker | **HIGH** | Done | Standalone Docker service — `SELECT FOR UPDATE SKIP LOCKED`, exponential backoff, SIGTERM-safe. |
 | DLQ retry budget | **HIGH** | Done | `retry_count`/`max_retries`/`next_retry_at` columns, exponential backoff, `POST /dlq/{id}/retry`, and a worker retry loop are implemented. Only `TRANSIENT` entries auto-retry; nothing in the live ingest path classifies an event as `TRANSIENT` yet (single-event DB failures return 503 so Stripe retries). The mechanism is provisioned for a future non-Stripe / async source with no upstream retrier. |
 | DLQ retention | **MEDIUM** | Done | `prune_dlq()` deletes `DUPLICATE` rows older than 90 days; the worker runs it at most once per hour. Without retention, Stripe's at-least-once redelivery grows the `dlq` table without bound. |
-| Schema migrations | **HIGH** | Done | Alembic migrations in `alembic/versions/` manage the production schema; the `migrate` service runs `alembic upgrade head` before the API starts. `_bootstrap()` mirrors the DDL with `IF NOT EXISTS` guards so CI runs against the same schema. |
+| Schema migrations | **HIGH** | Done | Alembic migrations in `alembic/versions/` manage the production schema; the `migrate` service runs `alembic upgrade head`, then `provision.py`, before the API starts. CI applies the migrations too — `_bootstrap()` mirrors the tables with `IF NOT EXISTS` guards but creates neither the RLS policies nor the `billing_app` role, so a suite running without alembic could not have tested either. The API no longer calls `_bootstrap()` when it runs as the restricted role: it has no DDL rights, and shipping owner credentials to the container that serves traffic would undo the point of the role. |
 | Per-event-type amount extraction | **MEDIUM** | Done | A failed invoice carries `amount_paid=0` with the real figure in `amount_due`, so reading `amount_paid` for every type dead-lettered every `invoice.payment_failed` — the events dunning runs on. `_AMOUNT_FIELDS_BY_TYPE` now maps each type to its field priority. An event with no amount field at all still routes to the DLQ: an unknown amount recorded as $0 reconciles cleanly and is therefore invisible. |
 | Structured JSON logging | **MEDIUM** | Done | `LOG_FORMAT=json` emits one JSON object per line; `transaction_id`, `outcome`, `duration_ms`, `path` and `status` are top-level fields. API and worker share the formatter so an event can be correlated from ingest to dispatch. |
 | Prometheus `/metrics` | **MEDIUM** | Done | `webhook_events_total{outcome}`, `http_requests_total`, `http_request_duration_seconds`, `dlq_depth` (backlog), `dlq_total` (audit count), `outbox_pending`. Key-protected, labelled by route template. |
 | Currency normalization | **LOW** | Done | Lowercased at the entry boundary by a `mode="before"` validator, so `USD` is accepted and stored as `usd` rather than dead-lettered. `LedgerEntry` still rejects un-normalized input as a second layer. |
 | Dependency pins | **MEDIUM** | Done | `psycopg2-binary==2.9.9` had no cp313 wheel, so the documented "Python 3.12+" prerequisite could not be followed. Bumped to 2.9.12; supported range stated explicitly. |
 | CI blind spot | **HIGH** | Done | No workflow built the image or started compose, which is why the three runtime findings above survived four audit cycles with green badges. `stack.yml` now builds, boots, and attacks the stack. |
-| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the tenant is derived from the API key rather than a header; ops queries scoped; per-tenant ingest verified with that tenant's own signing secret; the worker delivers to each tenant's `downstream_url` and drains round-robin so one tenant's backlog cannot starve another. Remaining: no admin credential, and no row-level security — see [SECURITY.md](SECURITY.md). |
+| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the tenant is derived from the API key rather than a header; ops queries scoped; per-tenant ingest verified with that tenant's own signing secret; the worker delivers to each tenant's `downstream_url` and drains round-robin so one tenant's backlog cannot starve another. Remaining: no admin credential — see [SECURITY.md](SECURITY.md). |
+| Row-level security | **HIGH** | Done | Isolation was a convention every query had to keep, and on 2026-08-11 the batch path forgot it in two branches — one tenant's payload readable by another, one Stripe event POSTED under two tenants. `ledger`, `outbox` and `dlq` now carry default-deny policies with `USING` and `WITH CHECK`, and the service connects as `billing_app` (`NOSUPERUSER NOBYPASSRLS`). The role is the part that matters: a superuser bypasses RLS regardless of `ENABLE` or `FORCE`, so policies alone enforce nothing. The process logs `rls_enforced` or `rls_inert` at every boot, and CI fails the build on `rls_inert`. |
 | GDPR / LGPD erasure | — | Not attempted | Conflicts directly with the append-only ledger this system is built around. Resolving that needs a documented retention and pseudonymization policy first, not code. |
 | PgBouncer + Kubernetes | — | Not attempted | Deployment topology, not application behavior. The `--workers 1` / `maxconn=20` note above is the prerequisite to settle first. |
 
