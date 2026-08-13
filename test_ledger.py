@@ -2159,6 +2159,110 @@ bt_conn.close()
 
 
 # =============================================================================
+# A15: ROW-LEVEL SECURITY — ISOLATION THE DATABASE ENFORCES (Phase 13.6)
+# Every other tenancy test proves the application remembers its org_id predicate.
+#     This one proves the guarantee survives forgetting it. A first attempt at this
+#     shipped policies that were completely inert — the app connects as a SUPERUSER,
+#     which bypasses RLS regardless of ENABLE or FORCE, and the whole suite passed.
+#     So these tests connect as the RESTRICTED role on purpose; running them as the
+#     owner would prove nothing.
+# =============================================================================
+print("\n── A15: row-level security enforced by PostgreSQL ──────────────────────")
+
+import psycopg2 as _pg  # noqa: E402
+
+_APP_DSN = os.environ.get(
+    "APP_DATABASE_URL", "postgres://billing_app:billing_app@localhost:5432/billing")
+
+rls_owner = fresh_conn()
+_rls_ready = _q1(rls_owner,
+                 "SELECT COUNT(*) FROM pg_policies WHERE tablename='ledger'") == 1
+chk("migration 0006 created the tenant_isolation policy", _rls_ready,
+    "policy missing — did alembic upgrade head run?")
+
+if _rls_ready:
+    with rls_owner.cursor() as c:
+        c.execute("BEGIN")
+        for _t in ("rls_a", "rls_b"):
+            c.execute("INSERT INTO org (org_id,name,stripe_webhook_secret) VALUES (%s,%s,'w') "
+                      "ON CONFLICT (org_id) DO NOTHING", (_t, _t))
+            c.execute("INSERT INTO ledger (org_id,transaction_id,event_type,customer_id,"
+                      "amount_cents,currency,status,idempotency_key,payload) "
+                      "VALUES (%s,%s,'invoice.paid','cus_x',100,'usd','POSTED','k','{}')",
+                      (_t, f"evt_{_t}"))
+        c.execute("COMMIT")
+
+    _app = _pg.connect(_APP_DSN)
+    try:
+        with _app.cursor() as c:
+            c.execute("SELECT usesuper FROM pg_user WHERE usename = current_user")
+            _is_super = c.fetchone()[0]
+        # If this fails, everything below is decorative — a superuser bypasses RLS.
+        chk("the application role is NOT a superuser", _is_super is False,
+            "a superuser bypasses RLS entirely; the policies would be inert")
+
+        def _scoped(sql, scope=None):
+            c = _app.cursor()
+            c.execute("BEGIN")
+            if scope is not None:
+                c.execute("SET LOCAL app.org_id = %s", (scope,))
+            c.execute(sql)
+            rows = c.fetchall()
+            c.execute("ROLLBACK")
+            c.close()
+            return rows
+
+        chk("no scope set → no rows (default deny)",
+            _scoped("SELECT org_id FROM ledger") == [], "unset must not mean unrestricted")
+        chk("scoped to a tenant → only that tenant",
+            _scoped("SELECT org_id FROM ledger", "rls_a") == [("rls_a",)])
+        chk("ALL_ORGS sees every tenant",
+            sorted(r[0] for r in _scoped("SELECT org_id FROM ledger", L.ALL_ORGS))
+            == ["rls_a", "rls_b"])
+
+        # THE test. The query does not mention org_id at all — exactly the mistake
+        #     process_stripe_event_batch made — and the other tenant is still invisible.
+        chk("a query that FORGETS its org_id predicate still cannot see another tenant",
+            _scoped("SELECT org_id, transaction_id FROM ledger", "rls_a")
+            == [("rls_a", "evt_rls_a")],
+            "RLS is not enforcing — this is the whole point of Phase 13.6")
+
+        # WITH CHECK: reading is only half of it. USING alone would still permit
+        #     inserting a row that belongs to somebody else.
+        c = _app.cursor()
+        c.execute("BEGIN")
+        c.execute("SET LOCAL app.org_id = 'rls_a'")
+        _refused = False
+        try:
+            c.execute("INSERT INTO ledger (org_id,transaction_id,event_type,customer_id,"
+                      "amount_cents,currency,status,idempotency_key,payload) "
+                      "VALUES ('rls_b','evt_forged','invoice.paid','cus_x',1,'usd',"
+                      "'POSTED','k','{}')")
+        except _pg.Error:
+            _refused = True
+        finally:
+            c.execute("ROLLBACK")
+            c.close()
+        chk("writing another tenant's row is refused by WITH CHECK", _refused,
+            "USING without WITH CHECK would let this through")
+
+        # The DLQ is where the 2026-08-11 leak actually landed, so assert it too.
+        chk("dlq is covered by a policy",
+            _q1(rls_owner, "SELECT COUNT(*) FROM pg_policies WHERE tablename='dlq'") == 1)
+        chk("outbox is covered by a policy",
+            _q1(rls_owner, "SELECT COUNT(*) FROM pg_policies WHERE tablename='outbox'") == 1)
+    finally:
+        _app.close()
+
+with rls_owner.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+    c.execute("DELETE FROM org WHERE org_id <> 'default'")
+    c.execute("COMMIT")
+rls_owner.close()
+
+
+# =============================================================================
 # A7: CONNECTION POOL RETAINS ITS CONNECTIONS
 # psycopg2 returns a connection to the idle pool only while len(self._pool) < minconn;
 #     every other release calls conn.close(). With minconn=1 the pool retained exactly

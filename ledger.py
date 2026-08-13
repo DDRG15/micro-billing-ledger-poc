@@ -156,6 +156,11 @@ from prometheus_client import (  # noqa: E402
 #     that never creates a second org behaves exactly as it did before Phase 13.
 DEFAULT_ORG_ID: str = "default"
 
+# Opt-in token for work that is legitimately cross-tenant: the outbox drain, the DLQ
+#     retry claim, retention pruning. Spelled out so `grep ALL_ORGS` lists every place
+#     that steps outside a single tenant.
+ALL_ORGS: str = "*"
+
 
 class EventType(str, Enum):
     """
@@ -833,7 +838,8 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
 
 
 @contextmanager
-def _tx(conn: "psycopg2.extensions.connection") -> Generator["psycopg2.extensions.cursor", None, None]:
+def _tx(conn: "psycopg2.extensions.connection",
+        org_scope: Optional[str] = None) -> Generator["psycopg2.extensions.cursor", None, None]:
     """
     Explicit transaction context manager for PostgreSQL. Issues BEGIN, yields
     a cursor for the caller's statements, then COMMIT on success or ROLLBACK
@@ -841,9 +847,19 @@ def _tx(conn: "psycopg2.extensions.connection") -> Generator["psycopg2.extension
     explicit BEGIN to group multiple statements into one atomic transaction.
     This is what makes the transactional outbox atomic: the ledger INSERT and
     the outbox INSERT both succeed or both roll back — no half-written state.
+
+    org_scope establishes the row-level security context for this transaction
+    (migration 0006). Pass a tenant to read and write only that tenant's rows; pass
+    ALL_ORGS for genuinely cross-tenant jobs.
+
+    SET LOCAL, never SET. The setting dies with the transaction. A plain SET would
+    outlive it and leak one request's tenant into whatever borrows the same pooled
+    connection next — a cross-tenant read caused by the mechanism meant to prevent one.
     """
     cur = conn.cursor()
     cur.execute("BEGIN")
+    if org_scope is not None:
+        cur.execute("SET LOCAL app.org_id = %s", (org_scope,))
     try:
         yield cur
         cur.execute("COMMIT")
@@ -1653,7 +1669,49 @@ def _any_org_keys() -> bool:
         _pool.putconn(_c)
 
 
+def _rls_status() -> dict:
+    """Report whether row-level security is actually in force for THIS connection.
+
+    A policy that exists but does not apply is the worst of both worlds: the repository
+    documents a guarantee, the manual org_id predicates start to look redundant, and
+    nothing enforces anything. That is not hypothetical — the first attempt at migration
+    0006 shipped exactly that state and the full suite passed, because a SUPERUSER
+    bypasses RLS regardless of ENABLE or FORCE.
+
+    So the process states, out loud and at startup, which of the two worlds it is in.
+    """
+    _c = _pool.getconn()
+    try:
+        with _c.cursor() as cur:
+            cur.execute("SELECT current_user, "
+                        "(SELECT usesuper FROM pg_user WHERE usename = current_user)")
+            user, is_super = cur.fetchone()
+            cur.execute("SELECT COUNT(*) FROM pg_policies "
+                        "WHERE tablename IN ('ledger','outbox','dlq')")
+            policies = cur.fetchone()[0]
+    except Exception:  # noqa: BLE001 — a pre-0006 database has no policies to report
+        return {"db_user": "unknown", "policies": 0, "enforced": False}
+    finally:
+        _pool.putconn(_c)
+    return {"db_user": user, "superuser": bool(is_super),
+            "policies": policies, "enforced": bool(policies) and not is_super}
+
+
 _ANY_ORG_KEYS: bool = _any_org_keys()
+
+_RLS = _rls_status()
+if _RLS["policies"] and not _RLS["enforced"]:
+    _log.critical(
+        "row-level security policies exist but DO NOT APPLY — connected as %r, which is "
+        "a superuser and bypasses RLS. Tenant isolation currently depends entirely on "
+        "every query carrying its own org_id predicate. Connect as a non-superuser role "
+        "(migration 0006 creates billing_app) to make the database enforce it.",
+        _RLS.get("db_user"),
+        extra={"event": "rls_inert", **_RLS},
+    )
+elif _RLS["enforced"]:
+    _log.info("row-level security in force as %s", _RLS.get("db_user"),
+              extra={"event": "rls_enforced", **_RLS})
 _log.info(
     "tenancy mode=%s", "multi-tenant" if _ANY_ORG_KEYS else "single-org",
     extra={"event": "tenancy_mode", "multi_tenant": _ANY_ORG_KEYS,
