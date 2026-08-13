@@ -101,6 +101,22 @@ from anywhere; the service warns at startup for as long as it is unrotated. The 
 credential still bypasses RLS by design, because migrations need DDL — it belongs to the
 migration step and to no process serving traffic.
 
+**And it governs rows, not what the process does with them afterwards.** An audit of the
+work above found a cross-tenant leak that row-level security could not have caught: the
+`/metrics` queue gauges are process-wide Prometheus objects, so a tenant's own scrape
+could render another tenant's `dlq_depth` if the two overlapped. The database answered
+correctly every time — the crossing happened one layer up, in shared process state.
+Fixed by making set-and-render atomic, and covered by a test that forces the interleave.
+It is worth stating plainly because the failure mode generalises: a database-enforced
+boundary says nothing about what happens after the rows are read.
+
+Two limits remain on that endpoint, both deliberate. `webhook_events_total` and
+`http_requests_total` are still aggregate across tenants — whether `/metrics` is an
+operator endpoint or a tenant one is a modelling decision, not a patch. And `rls_inert`
+is a log line and a CI gate, not an alert: a deployment that quietly drops
+`APP_DATABASE_URL` reverts isolation to the application's own predicates, and nothing
+pages anyone. Grep for it after any deploy that touches database configuration.
+
 **Not attempted, within tenancy.** There is no admin credential, so no operator-wide view
 across tenants exists. No authentication beyond a single shared API key per tenant — no
 user accounts, no roles, no rotation flow. No audit log of who read operational data. No
