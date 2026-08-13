@@ -75,6 +75,9 @@ documentos/
 
 # Local-only notes — personal working documents that stay on this machine.
 #     Kept as explicit names too, because these also exist at the repository root.
+#     HANDOFF.md carries internal working rules, a list of past mistakes and pointers
+#     to the private documentos/ tree — none of which belongs in a public repository.
+HANDOFF.md
 BUG_REPORT.md
 ROADMAP.md
 TONE_ANALYSIS.md
