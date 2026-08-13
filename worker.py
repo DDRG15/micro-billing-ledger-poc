@@ -13,7 +13,9 @@ it starts automatically next to the billing container.
 
 ENV VARS
 --------
-DATABASE_URL        (required) — same connection string as the billing service
+APP_DATABASE_URL    (required in a deployment) — the restricted role (billing_app);
+                    falls back to DATABASE_URL, which leaves RLS inert
+DATABASE_URL        the owner connection; migrations only
 DOWNSTREAM_URL      (optional) — if set, HTTP POST each event payload here
 WORKER_BATCH_SIZE   (default: 100) — rows read per poll cycle
 WORKER_POLL_INTERVAL (default: 5)  — seconds to sleep when queue is empty
@@ -48,6 +50,11 @@ DATABASE_URL: str = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/billing",
 )
+# The worker connects as the restricted role for the same reason the API does — see the
+#     APP_DATABASE_URL block in ledger.py. Resolved through ledger so both processes
+#     cannot disagree about which DSN "the application" means; a worker still connected
+#     as the owner would bypass RLS on exactly the paths that touch every tenant.
+APP_DATABASE_URL: str = _ledger.APP_DATABASE_URL
 DOWNSTREAM_URL: str = os.environ.get("DOWNSTREAM_URL", "")
 WORKER_BATCH_SIZE: int = int(os.environ.get("WORKER_BATCH_SIZE", "100"))
 WORKER_POLL_INTERVAL: float = float(os.environ.get("WORKER_POLL_INTERVAL", "5"))
@@ -95,7 +102,7 @@ signal.signal(signal.SIGINT, _handle_sigterm)
 
 def _connect() -> psycopg2.extensions.connection:
     """Open a single persistent connection (autocommit=True, like ledger.py)."""
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(APP_DATABASE_URL)
     conn.autocommit = True
     return conn
 
@@ -103,10 +110,19 @@ def _connect() -> psycopg2.extensions.connection:
 @contextmanager
 def _tx(
     conn: psycopg2.extensions.connection,
+    org_scope: str,
 ) -> Generator[psycopg2.extensions.cursor, None, None]:
-    """Explicit BEGIN/COMMIT transaction (mirrors ledger.py's _tx helper)."""
+    """Explicit BEGIN/COMMIT transaction (mirrors ledger.py's _tx helper).
+
+    org_scope is required here for the same reason it is there: the worker holds ONE
+    long-lived connection, so a scope established per session rather than per transaction
+    would make cross-tenant access the ambient default for the life of the process — on
+    the paths that replay other tenants' payloads into the ledger. SET LOCAL confines it
+    to the statement group that actually needs it.
+    """
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("BEGIN")
+    cur.execute("SET LOCAL app.org_id = %s", (org_scope,))
     try:
         yield cur
         cur.execute("COMMIT")
@@ -201,7 +217,10 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
     The join to org resolves each tenant's downstream_url in the same query, so
         dispatching does not issue a lookup per row.
     """
-    with _tx(conn) as cur:
+    # ALL_ORGS: draining is cross-tenant by definition — the fairness ranking below only
+    #     means anything if the query can see every tenant's rows. The join to `org` is
+    #     unaffected either way; migration 0006 puts no policy on the registry.
+    with _tx(conn, _ledger.ALL_ORGS) as cur:
         cur.execute(
             """
             WITH capped AS (

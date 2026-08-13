@@ -1522,10 +1522,10 @@ with claim_conn.cursor() as c:
 _real_increment = L._increment_retry
 _STRANDED = "evt_claim_1"
 
-def _flaky_increment(c, dlq_id_, txid):
+def _flaky_increment(c, dlq_id_, txid, org_scope):
     if txid == _STRANDED:
         raise RuntimeError("simulated connection drop mid-recovery")
-    return _real_increment(c, dlq_id_, txid)
+    return _real_increment(c, dlq_id_, txid, org_scope)
 
 L._increment_retry = _flaky_increment
 try:
@@ -1587,7 +1587,7 @@ with term2_conn.cursor() as c:
     _tid = c.fetchone()[0]
     c.execute("COMMIT")
 
-L._increment_retry(term2_conn, _tid, "evt_terminal_guard")
+L._increment_retry(term2_conn, _tid, "evt_terminal_guard", L.DEFAULT_ORG_ID)
 _st, _rc = _qall(term2_conn, "SELECT status, retry_count FROM dlq WHERE id=%s", (_tid,))[0]
 chk("resolved entry survives _increment_retry", _st == "resolved", f"got {_st!r}")
 chk("resolved entry's retry_count is untouched", _rc == 1, f"got {_rc}")
@@ -1601,7 +1601,7 @@ with term2_conn.cursor() as c:
     )
     _oid = c.fetchone()[0]
     c.execute("COMMIT")
-L._increment_retry(term2_conn, _oid, "evt_terminal_open")
+L._increment_retry(term2_conn, _oid, "evt_terminal_open", L.DEFAULT_ORG_ID)
 _st2, _rc2 = _qall(term2_conn, "SELECT status, retry_count FROM dlq WHERE id=%s", (_oid,))[0]
 chk("non-resolved entry still increments", _rc2 == 1 and _st2 == "pending", f"got {_st2!r}/{_rc2}")
 term2_conn.close()
@@ -2260,6 +2260,135 @@ with rls_owner.cursor() as c:
     c.execute("DELETE FROM org WHERE org_id <> 'default'")
     c.execute("COMMIT")
 rls_owner.close()
+
+
+# =============================================================================
+# A16: THE APPLICATION'S OWN PATHS RUN UNDER ENFORCED RLS (Phase 13.7)
+# A15 proved the policies bite, using hand-written SQL. That says nothing about whether
+#     the APPLICATION establishes a scope at each of its own query sites, and 13.6 shipped
+#     with it establishing one at none of them: the service connected as `postgres` and
+#     every policy was inert.
+#
+#     Under default-deny a forgotten scope is not a leak — it is a service that sees
+#     nothing and cannot write. So these tests drive the real endpoints, the real core
+#     functions and the real worker drain over a billing_app connection. There is no
+#     partial credit here and that is the point: any one of the sites losing its scope
+#     turns some assertion below into zero rows or a policy violation.
+# =============================================================================
+print("\n── A16: the service's own paths under enforced RLS ─────────────────────")
+
+app_owner = fresh_conn()          # provisioning and cleanup need rights billing_app lacks
+_KEY_P, _KEY_Q = "key_rls_p_secret_value", "key_rls_q_secret_value"
+with app_owner.cursor() as c:
+    c.execute("BEGIN")
+    for _o, _k in (("rlsapp_p", _KEY_P), ("rlsapp_q", _KEY_Q)):
+        c.execute(
+            "INSERT INTO org (org_id, name, api_key_sha256, stripe_webhook_secret) "
+            "VALUES (%s,%s,%s,'whsec_test') ON CONFLICT (org_id) DO UPDATE "
+            "SET api_key_sha256 = EXCLUDED.api_key_sha256",
+            (_o, _o, hashlib.sha256(_k.encode()).hexdigest()),
+        )
+    c.execute("COMMIT")
+
+app_conn = None
+try:
+    app_conn = _pg.connect(_APP_DSN)
+    app_conn.autocommit = True    # _tx issues an explicit BEGIN, as on every connection
+except _pg.Error as _exc:         # noqa: BLE001
+    chk("the service can connect as the restricted role", False, str(_exc))
+
+if app_conn is not None:
+    original_pool_app = L._pool
+    original_any_app  = L._ANY_ORG_KEYS
+    L._pool = _MockPool(app_conn)
+    L._ANY_ORG_KEYS = True
+    app_client = TestClient(L.app)
+    try:
+        # The startup self-check, run against the connection the service would actually
+        #     use. This is the acceptance criterion for the whole phase: with the pool on
+        #     billing_app it must report enforced, which is the difference between the
+        #     rls_enforced and rls_inert log lines.
+        _status = L._rls_status()
+        chk("_rls_status reports enforced on an application connection",
+            _status["enforced"] is True, str(_status))
+        chk("_rls_status names the restricted role", _status["db_user"] == "billing_app",
+            str(_status.get("db_user")))
+
+        # ── the write path ────────────────────────────────────────────────────
+        # An unscoped INSERT under default-deny raises "new row violates row-level
+        #     security policy" rather than returning a bad answer, so these outcomes
+        #     are only reachable if _tx carried the tenant.
+        _wp = L.process_stripe_event(app_conn, fake_event(eid="evt_rls_p1", amount=1000),
+                                     org_id="rlsapp_p")
+        chk("process_stripe_event writes under RLS", _wp["outcome"] == "POSTED", str(_wp))
+        L.process_stripe_event(app_conn, fake_event(eid="evt_rls_p2", amount=2000),
+                               org_id="rlsapp_p")
+        L.process_stripe_event(app_conn, fake_event(eid="evt_rls_q1", amount=9000),
+                               org_id="rlsapp_q")
+        # A replay of p1 — routes to P's DLQ, exercising _write_dlq's entry.org_id scope.
+        _wd = L.process_stripe_event(app_conn, fake_event(eid="evt_rls_p1", amount=1000),
+                                     org_id="rlsapp_p")
+        chk("the DLQ append path writes under RLS", _wd["outcome"] == "DLQ_DUPLICATE", str(_wd))
+
+        # The batch path is where the 2026-08-11 wrong-tenant write happened. Its INVALID
+        #     branch builds a DLQ row directly, so it gets asserted rather than assumed.
+        _batch = L.process_stripe_event_batch(
+            app_conn,
+            [fake_event(eid="evt_rls_q2", amount=500), {"id": "evt_rls_bad", "type": "nope"}],
+            org_id="rlsapp_q",
+        )
+        chk("the batch path writes under RLS",
+            [r["outcome"] for r in _batch] == ["POSTED", "DLQ_INVALID"],
+            str([r["outcome"] for r in _batch]))
+
+        # ── the read paths, through the real endpoints ────────────────────────
+        _hP, _hQ = {"X-Api-Key": _KEY_P}, {"X-Api-Key": _KEY_Q}
+        _sp = app_client.get("/ledger/summary", headers=_hP).json()
+        _sq = app_client.get("/ledger/summary", headers=_hQ).json()
+        chk("/ledger/summary answers under RLS and is scoped to P",
+            sum(_sp["ledger"].values()) == 2, str(_sp))
+        chk("/ledger/summary is scoped to Q", sum(_sq["ledger"].values()) == 2, str(_sq))
+        chk("P's DLQ row is visible to P",  _sp["dlq_total"] == 1, str(_sp))
+        chk("Q's DLQ row is visible to Q",  _sq["dlq_total"] == 1, str(_sq))
+        chk("outbox counts survive the scope change",
+            _sp["outbox_pending"] == 2 and _sq["outbox_pending"] == 2,
+            f"P={_sp['outbox_pending']} Q={_sq['outbox_pending']}")
+
+        _ep = app_client.get("/dlq/entries", headers=_hP).json()["entries"]
+        _eq = app_client.get("/dlq/entries", headers=_hQ).json()["entries"]
+        chk("/dlq/entries answers under RLS, one row each",
+            len(_ep) == 1 and len(_eq) == 1, f"P={len(_ep)} Q={len(_eq)}")
+        chk("/metrics answers under RLS",
+            app_client.get("/metrics", headers=_hP).status_code == 200)
+
+        # ── the write endpoint, and the cross-tenant refusal ──────────────────
+        chk("Q cannot retry P's DLQ entry",
+            app_client.post(f"/dlq/{_ep[0]['id']}/retry", headers=_hQ).status_code == 404)
+        chk("P can retry its own entry",
+            app_client.post(f"/dlq/{_ep[0]['id']}/retry", headers=_hP).status_code == 200)
+
+        # ── the cross-tenant jobs: ALL_ORGS has to work from this role too ────
+        chk("prune_dlq runs under RLS as the application role",
+            L.prune_dlq(app_conn, retention_days=90) == 0)
+        chk("retry_dlq_batch runs under RLS as the application role",
+            L.retry_dlq_batch(app_conn) == 0)
+
+        # The worker holds its own connection and drains every tenant in one query.
+        #     Scoped to a single org this returns fewer rows than were enqueued.
+        _drained = W.drain_batch(app_conn)
+        chk("the worker drains every tenant under RLS", _drained == 4, f"drained {_drained}")
+        chk("nothing is left undispatched",
+            _q1(app_owner, "SELECT COUNT(*) FROM outbox WHERE dispatched=0") == 0)
+    finally:
+        L._pool, L._ANY_ORG_KEYS = original_pool_app, original_any_app
+        app_conn.close()
+
+with app_owner.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+    c.execute("DELETE FROM org WHERE org_id <> 'default'")
+    c.execute("COMMIT")
+app_owner.close()
 
 
 # =============================================================================

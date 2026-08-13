@@ -560,6 +560,29 @@ DATABASE_URL: str = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/billing"
 )
 
+# The DSN the SERVICE runs its traffic on. DATABASE_URL stays the owner connection and
+#     is used for one thing only: DDL (alembic, and _bootstrap on a local run).
+#
+#     Splitting them is what puts row-level security in force. Migration 0006 created
+#     the policies and proved they bite, but the application was still connecting as
+#     `postgres` — a SUPERUSER, which bypasses RLS entirely regardless of ENABLE or
+#     FORCE. Policies that exist and do not apply are worse than no policies: the repo
+#     documents a guarantee the database does not provide, and the manual org_id
+#     predicates that are the only real defence start to look redundant.
+#
+#     Defaults to DATABASE_URL so a fresh clone and the test suite keep working with no
+#     new configuration. A deployment points it at billing_app, and the startup log says
+#     which of the two worlds the process actually came up in (rls_enforced / rls_inert).
+APP_DATABASE_URL: str = os.environ.get("APP_DATABASE_URL", "").strip() or DATABASE_URL
+
+# Password migration 0006 assigns to billing_app at creation. A migration cannot carry a
+#     secret, so it bootstraps with a known value and the deployment rotates it. Same
+#     failure shape as the Stripe placeholder below — a deploy that skips the rotation
+#     runs on a credential published in this repository — so it gets the same treatment:
+#     loud at startup, not silent at runtime.
+_PLACEHOLDER_APP_DB_PASSWORD = "billing_app"
+
+
 def _read_secret(name: str, default: str = "") -> str:
     """Resolve a secret from `<NAME>_FILE` if set, otherwise from `<NAME>`.
 
@@ -839,7 +862,7 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
 
 @contextmanager
 def _tx(conn: "psycopg2.extensions.connection",
-        org_scope: Optional[str] = None) -> Generator["psycopg2.extensions.cursor", None, None]:
+        org_scope: str) -> Generator["psycopg2.extensions.cursor", None, None]:
     """
     Explicit transaction context manager for PostgreSQL. Issues BEGIN, yields
     a cursor for the caller's statements, then COMMIT on success or ROLLBACK
@@ -850,16 +873,23 @@ def _tx(conn: "psycopg2.extensions.connection",
 
     org_scope establishes the row-level security context for this transaction
     (migration 0006). Pass a tenant to read and write only that tenant's rows; pass
-    ALL_ORGS for genuinely cross-tenant jobs.
+    ALL_ORGS for genuinely cross-tenant jobs. It has no default ON PURPOSE. A default
+    would make "scope omitted" indistinguishable from "scope considered and chosen",
+    which is the shape of the mistake this whole mechanism exists to catch — the
+    2026-08-11 batch bug was a forgotten org_id, not a wrong one. Required means the
+    omission is visible at the call site instead of at runtime.
 
     SET LOCAL, never SET. The setting dies with the transaction. A plain SET would
     outlive it and leak one request's tenant into whatever borrows the same pooled
     connection next — a cross-tenant read caused by the mechanism meant to prevent one.
+
+    Reads go through here too, and not only because SET LOCAL needs a transaction to
+    be local to: a multi-query report wrapped in one _tx returns one snapshot instead
+    of three readings taken at three different instants.
     """
     cur = conn.cursor()
     cur.execute("BEGIN")
-    if org_scope is not None:
-        cur.execute("SET LOCAL app.org_id = %s", (org_scope,))
+    cur.execute("SET LOCAL app.org_id = %s", (org_scope,))
     try:
         yield cur
         cur.execute("COMMIT")
@@ -1002,7 +1032,7 @@ def process_stripe_event(
     #     rowcount=1 = new event, committed to both ledger and outbox.
     #     rowcount=0 = duplicate, ON CONFLICT fired, nothing written.
     try:
-        with _tx(conn) as cur:
+        with _tx(conn, org_id) as cur:
             cur.execute(
                 """
                 INSERT INTO ledger
@@ -1071,7 +1101,11 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
     This is the "zero data loss" guarantee: if the DB can't save it, the log can.
     """
     try:
-        with _tx(conn) as cur:
+        # entry.org_id, not a caller-supplied scope: the row being written is the only
+        #     authority on which tenant it belongs to. Under RLS a mismatch between the
+        #     two is refused by WITH CHECK rather than silently written to the wrong
+        #     tenant, which is precisely what the batch path did on 2026-08-11.
+        with _tx(conn, entry.org_id) as cur:
             cur.execute(
                 "INSERT INTO dlq (org_id, transaction_id, reason, raw_payload, received_at,"
                 " status, retry_count, max_retries, next_retry_at)"
@@ -1144,7 +1178,11 @@ def retry_dlq_batch(
     a second worker reclaims a row that is still being worked on; the ledger PK still prevents
     double-counting, so the cost is duplicated effort, not duplicated money.
     """
-    with _tx(conn) as cur:
+    # ALL_ORGS: the claim is the one genuinely cross-tenant step here. A worker drains
+    #     every tenant's backlog, so scoping this to one org would leave the rest
+    #     unclaimed forever. Everything the loop does WITH a claimed row is scoped back
+    #     down to that row's own tenant below.
+    with _tx(conn, ALL_ORGS) as cur:
         cur.execute(
             """
             UPDATE dlq SET status = 'retrying', claimed_at = NOW()
@@ -1188,14 +1226,18 @@ def retry_dlq_batch(
             result = process_stripe_event(conn, payload, from_retry=True, org_id=row_org_id)
             outcome = result.get("outcome", "")
             if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
-                with _tx(conn) as cur:
+                # row_org_id, not ALL_ORGS. The claim above had to see every tenant;
+                #     resolving one row does not, and narrowing back means a bug that
+                #     resolved the wrong row updates zero rows instead of somebody
+                #     else's entry.
+                with _tx(conn, row_org_id) as cur:
                     cur.execute(
                         "UPDATE dlq SET status='resolved', claimed_at=NULL WHERE id=%s",
                         (dlq_id,),
                     )
                 _log.info("dlq_retry resolved id=%s transaction_id=%s", dlq_id, transaction_id)
             else:
-                _increment_retry(conn, dlq_id, transaction_id)
+                _increment_retry(conn, dlq_id, transaction_id, row_org_id)
         except Exception as exc:
             _log.error("dlq_retry error id=%s error=%r", dlq_id, exc)
             # The recovery UPDATE can fail for the same reason the retry did — the database
@@ -1203,7 +1245,7 @@ def retry_dlq_batch(
             #     every remaining claimed row of the batch stuck in 'retrying'. Contain it
             #     per row so one bad row cannot abort the rest of the batch.
             try:
-                _increment_retry(conn, dlq_id, transaction_id)
+                _increment_retry(conn, dlq_id, transaction_id, row_org_id)
             except Exception as inner_exc:
                 _log.critical(
                     "dlq_retry recovery failed id=%s transaction_id=%s error=%r — "
@@ -1219,8 +1261,14 @@ def _increment_retry(
     conn: "psycopg2.extensions.connection",
     dlq_id: int,
     transaction_id: str,
+    org_scope: str,
 ) -> None:
     """Atomically increment retry_count and set status/next_retry_at in one UPDATE.
+
+    org_scope is the tenant that owns dlq_id. It is a parameter rather than ALL_ORGS
+    because both callers already know it — retry_dlq_batch reads it back from the claim,
+    the manual endpoint derives it from the API key — and a function that writes to a
+    single row by id has no reason to hold a cross-tenant scope while it does so.
 
     Single statement eliminates the TOCTOU race: the old SELECT + UPDATE pattern
     let two concurrent callers both read retry_count=N and both write N+1 instead of N+2.
@@ -1236,7 +1284,7 @@ def _increment_retry(
     intervention. An operator would then investigate an event that was never broken.
     A no-op returns row=None, the same path already used for "row not found".
     """
-    with _tx(conn) as cur:
+    with _tx(conn, org_scope) as cur:
         cur.execute(
             """
             UPDATE dlq
@@ -1296,7 +1344,10 @@ def prune_dlq(
     The worker calls this at most once per hour (see worker.run_loop). It is a single
     idempotent DELETE and can also be run standalone or from cron / pg_cron.
     """
-    with _tx(conn) as cur:
+    # ALL_ORGS: retention applies to every tenant. Scoped to one org this DELETE would
+    #     silently stop pruning the moment a second tenant existed, and the table it is
+    #     supposed to bound would grow without one.
+    with _tx(conn, ALL_ORGS) as cur:
         cur.execute(
             "DELETE FROM dlq "
             "WHERE reason = %s "
@@ -1412,7 +1463,7 @@ def process_stripe_event_batch(
     #     downstream. Wrapping all three tables in one BEGIN…COMMIT closes that gap
     #     completely: the outbox is only non-empty if the corresponding ledger rows exist.
     try:
-        with _tx(conn) as cur:
+        with _tx(conn, org_id) as cur:
             inserted_ids: set[str] = set()
             if valid:
                 # execute_values sends rows in page_size-row SQL statements.
@@ -1625,8 +1676,22 @@ async def _observability(request: Request, call_next):
 
 # Ensure all three tables and their indexes exist before the pool opens connections.
 #     The bootstrap connection is closed immediately — it is not reused.
-_bootstrap_conn = _bootstrap()
-_bootstrap_conn.close()
+#
+#     Skipped when the service runs as the restricted role. _bootstrap issues DDL, which
+#     billing_app deliberately cannot do; running it would fail on the first CREATE. More
+#     to the point, a deployment that separates the two DSNs should not ship owner
+#     credentials to the application container at all — a process that cannot authenticate
+#     as the owner cannot drop a table or bypass RLS even if its own credentials leak.
+#     The schema is alembic's job there (the `migrate` service), which is already a
+#     completion gate for the billing service in docker-compose.yml.
+if APP_DATABASE_URL == DATABASE_URL:
+    _bootstrap_conn = _bootstrap()
+    _bootstrap_conn.close()
+else:
+    _log.info(
+        "skipping bootstrap DDL — running as the application role; schema is alembic's",
+        extra={"event": "bootstrap_skipped"},
+    )
 
 # Thread-safe connection pool for the FastAPI route handlers.
 #     minconn=1 — always keep one connection warm to avoid cold-start latency on first request.
@@ -1643,9 +1708,11 @@ _bootstrap_conn.close()
 #     spent inside the process, not in the network. After the change: 61 TPS at 4 and
 #     143 TPS at 16, p50 under 100ms throughout.
 #     Size to the PostgreSQL max_connections budget: every worker process holds this many.
+#     APP_DATABASE_URL, not DATABASE_URL: every connection that serves traffic runs as the
+#     restricted role, which is what makes the row-level security policies apply at all.
 DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
 _pool: ThreadedConnectionPool = ThreadedConnectionPool(
-    minconn=DB_POOL_SIZE, maxconn=DB_POOL_SIZE, dsn=DATABASE_URL
+    minconn=DB_POOL_SIZE, maxconn=DB_POOL_SIZE, dsn=APP_DATABASE_URL
 )
 
 
@@ -1657,6 +1724,11 @@ def _any_org_keys() -> bool:
     org is provisioned at deploy time, and a query on every call would put the auth
     check on the hot path. Restart after provisioning the first tenant — the startup
     log line says which mode the process came up in.
+
+    No org_scope, and not by omission: migration 0006 puts policies on ledger, outbox and
+    dlq only. The registry is the map FROM a credential TO a tenant, so a session would
+    have to already know which tenant it is to read it — the scope would have to come from
+    the answer. billing_app holds SELECT and nothing else on this table.
     """
     _c = _pool.getconn()
     try:
@@ -1679,6 +1751,8 @@ def _rls_status() -> dict:
     bypasses RLS regardless of ENABLE or FORCE.
 
     So the process states, out loud and at startup, which of the two worlds it is in.
+
+    Reads pg_user and pg_policies, never a tenant table, so it needs no scope of its own.
     """
     _c = _pool.getconn()
     try:
@@ -1699,7 +1773,32 @@ def _rls_status() -> dict:
 
 _ANY_ORG_KEYS: bool = _any_org_keys()
 
+
+def _dsn_password(dsn: str) -> str:
+    """The password embedded in a libpq URI, or '' if there is none to read.
+
+    A malformed DSN is not this function's problem — psycopg2 will have failed to
+    connect long before anyone asks. Returning '' means "nothing to warn about".
+    """
+    from urllib.parse import urlsplit
+    try:
+        return urlsplit(dsn).password or ""
+    except ValueError:
+        return ""
+
+
 _RLS = _rls_status()
+if _dsn_password(APP_DATABASE_URL) == _PLACEHOLDER_APP_DB_PASSWORD:
+    _log.warning(
+        "APP_DATABASE_URL still carries the bootstrap password migration 0006 assigns to "
+        "%s. That value is published in this repository's migration file, so anyone who "
+        "can reach PostgreSQL can authenticate as the application role and read every "
+        "tenant's rows — RLS scopes what a session may see, it does not decide who may "
+        "open one. Rotate it before this database is reachable from a network: "
+        "ALTER ROLE %s PASSWORD '<openssl rand -hex 32>', then update APP_DATABASE_URL.",
+        _PLACEHOLDER_APP_DB_PASSWORD, _PLACEHOLDER_APP_DB_PASSWORD,
+        extra={"event": "app_db_password_is_placeholder"},
+    )
 if _RLS["policies"] and not _RLS["enforced"]:
     _log.critical(
         "row-level security policies exist but DO NOT APPLY — connected as %r, which is "
@@ -1724,6 +1823,9 @@ def _lookup_org_by_key(conn: "psycopg2.extensions.connection", api_key: str) -> 
 
     Compares SHA-256 digests: the registry never stores the key itself, so a database
     dump does not hand over working credentials.
+
+    Unscoped for the reason given in _any_org_keys: `org` carries no RLS policy, and this
+    lookup is what establishes the scope every other query then runs under.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -1742,6 +1844,10 @@ def _org_webhook_secret(conn: "psycopg2.extensions.connection", org_id: str) -> 
     the old value until the entry expires — and the whole point of resolving the secret
     per tenant is that the signature is the proof of which tenant sent the event. Correct
     first; benchmark.py exists to say whether the lookup is worth optimising.
+
+    Unscoped: `org` carries no RLS policy (see _any_org_keys). The org_id here comes from
+    the URL and is an untrusted routing hint until the signature checks out — which is
+    exactly what this read exists to make possible.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -1903,26 +2009,31 @@ def ledger_summary(request: Request, org_id: str = Depends(_require_api_key)) ->
     """
     conn = _pool.getconn()
     try:
-        # GROUP BY status gives {POSTED: N, VOID: N, PENDING: N} in one query.
-        with conn.cursor() as cur:
+        # One transaction for all three reads, not three autocommit statements. Two
+        #     reasons, and both are load-bearing. RLS: SET LOCAL is local to a
+        #     transaction, so a read outside one carries no scope and default-deny
+        #     returns nothing. Consistency: the three numbers now come from a single
+        #     snapshot, where before the worker could drain the outbox between the
+        #     second query and the third and produce a summary describing no instant
+        #     that ever existed.
+        with _tx(conn, org_id) as cur:
+            # GROUP BY status gives {POSTED: N, VOID: N, PENDING: N} in one query.
             cur.execute("SELECT status, COUNT(*) FROM ledger WHERE org_id=%s GROUP BY status",
                         (org_id,))
             counts = {row[0]: row[1] for row in cur.fetchall()}
 
-        # Two questions, two numbers. dlq_depth answers "how much still needs
-        #     attention" - what an operator reads to judge ingestion health - so it
-        #     excludes resolved rows. Counting every row ever written made it grow
-        #     monotonically with historical traffic and never come back down, because
-        #     prune_dlq only ages out DUPLICATE rows: a resolved INVALID or TRANSIENT
-        #     entry inflated "queue depth" forever. dlq_total keeps the audit count.
-        with conn.cursor() as cur:
+            # Two questions, two numbers. dlq_depth answers "how much still needs
+            #     attention" - what an operator reads to judge ingestion health - so it
+            #     excludes resolved rows. Counting every row ever written made it grow
+            #     monotonically with historical traffic and never come back down, because
+            #     prune_dlq only ages out DUPLICATE rows: a resolved INVALID or TRANSIENT
+            #     entry inflated "queue depth" forever. dlq_total keeps the audit count.
             cur.execute(
                 "SELECT COUNT(*) FILTER (WHERE status IN ('pending','retrying','exhausted')), "
                 "       COUNT(*) FROM dlq WHERE org_id=%s", (org_id,)
             )
             dlq_depth, dlq_total = cur.fetchone()
 
-        with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0 AND org_id=%s", (org_id,))
             outbox_pending = cur.fetchone()[0]
     finally:
@@ -1959,7 +2070,7 @@ def metrics(request: Request, org_id: str = Depends(_require_api_key)) -> Respon
     """
     conn = _pool.getconn()
     try:
-        with conn.cursor() as cur:
+        with _tx(conn, org_id) as cur:
             cur.execute(
                 "SELECT COUNT(*) FILTER (WHERE status IN ('pending','retrying','exhausted')), "
                 "       COUNT(*) FROM dlq WHERE org_id=%s", (org_id,)
@@ -1967,7 +2078,6 @@ def metrics(request: Request, org_id: str = Depends(_require_api_key)) -> Respon
             _actionable, _total = cur.fetchone()
             _DLQ_DEPTH.set(_actionable)
             _DLQ_TOTAL.set(_total)
-        with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0 AND org_id=%s", (org_id,))
             _OUTBOX_PENDING.set(cur.fetchone()[0])
     finally:
@@ -1993,7 +2103,7 @@ def dlq_entries(request: Request, limit: int = 50,
 
     conn = _pool.getconn()
     try:
-        with conn.cursor() as cur:
+        with _tx(conn, org_id) as cur:
             cur.execute(
                 "SELECT id, transaction_id, reason, raw_payload, received_at "
                 "FROM dlq WHERE org_id=%s ORDER BY id DESC LIMIT %s",
@@ -2039,7 +2149,7 @@ def dlq_retry(request: Request, dlq_id: int,
     """
     conn = _pool.getconn()
     try:
-        with conn.cursor() as cur:
+        with _tx(conn, org_id) as cur:
             cur.execute(
                 # org_id in the WHERE clause, not checked after the fetch. A tenant must
                 #     not be able to learn that another tenant's dlq id exists, and a
@@ -2067,14 +2177,14 @@ def dlq_retry(request: Request, dlq_id: int,
         outcome = result.get("outcome", "")
 
         if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
-            with _tx(conn) as cur:
+            with _tx(conn, org_id) as cur:
                 cur.execute(
                     "UPDATE dlq SET status='resolved', claimed_at=NULL WHERE id=%s",
                     (dlq_id,),
                 )
             _log.info("dlq manual retry resolved id=%s transaction_id=%s", dlq_id, transaction_id)
         else:
-            _increment_retry(conn, dlq_id, transaction_id)
+            _increment_retry(conn, dlq_id, transaction_id, org_id)
 
         return JSONResponse(content={
             "dlq_id":         dlq_id,
