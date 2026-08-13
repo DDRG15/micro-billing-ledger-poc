@@ -2463,6 +2463,115 @@ prov_conn.close()
 
 
 # =============================================================================
+# A18: /metrics DOES NOT SERVE ONE TENANT'S NUMBERS TO ANOTHER
+# The SQL behind /metrics is correctly scoped by org_id and always was. The leak was one
+#     line later: dlq_depth, dlq_total and outbox_pending are PROCESS-WIDE Gauge objects,
+#     and generate_latest() renders whatever they hold at render time rather than what
+#     the current request computed. Two tenants scraping at once interleave, and a tenant
+#     asking for its own figures is served somebody else's — operational data about
+#     another tenant, through an endpoint whose own docstring calls it scoped.
+#
+#     Row-level security cannot reach this: the database answered correctly every time.
+#     A9/A10 asserted the scoping of the query, and A16 asserted only that /metrics
+#     returns 200 — which is why it survived both.
+#
+# This section also exercises the REAL ThreadedConnectionPool. Every other TestClient in
+#     this suite substitutes _MockPool, so the pool the application actually constructs at
+#     import — and its connection settings — had no coverage at all.
+# =============================================================================
+print("\n── A18: /metrics is not a cross-tenant read ────────────────────────────")
+
+chk("the real pool hands out autocommit connections",
+    L._pool.getconn().autocommit is True,
+    "_tx issues a literal BEGIN and documents that it relies on autocommit; without it "
+    "psycopg2 opens an implicit transaction first and PostgreSQL warns on every request")
+
+met_owner = fresh_conn()
+_KEY_M, _KEY_N = "key_metrics_m_value", "key_metrics_n_value"
+_DEPTH_M, _DEPTH_N = 2, 9
+with met_owner.cursor() as c:
+    c.execute("BEGIN")
+    for _o, _k, _n in (("met_m", _KEY_M, _DEPTH_M), ("met_n", _KEY_N, _DEPTH_N)):
+        c.execute("INSERT INTO org (org_id,name,api_key_sha256,stripe_webhook_secret) "
+                  "VALUES (%s,%s,%s,'whsec_test') ON CONFLICT (org_id) DO UPDATE "
+                  "SET api_key_sha256 = EXCLUDED.api_key_sha256",
+                  (_o, _o, hashlib.sha256(_k.encode()).hexdigest()))
+        for _i in range(_n):
+            c.execute("INSERT INTO dlq (org_id,transaction_id,reason,raw_payload,status,"
+                      "retry_count,max_retries) VALUES (%s,%s,'INVALID','{}','pending',0,0)",
+                      (_o, f"evt_met_{_o}_{_i}"))
+    c.execute("COMMIT")
+
+original_any_met = L._ANY_ORG_KEYS
+L._ANY_ORG_KEYS = True
+met_client = TestClient(L.app)      # NO _MockPool — this drives the real pool on purpose
+
+
+def _depth_line(text: str) -> str:
+    for _line in text.splitlines():
+        if _line.startswith("dlq_depth "):
+            return _line.split()[1]
+    return "absent"
+
+
+try:
+    _rm = met_client.get("/metrics", headers={"X-Api-Key": _KEY_M}).text
+    _rn = met_client.get("/metrics", headers={"X-Api-Key": _KEY_N}).text
+    chk("sequential scrapes report each tenant's own depth",
+        _depth_line(_rm) == f"{float(_DEPTH_M)}" and _depth_line(_rn) == f"{float(_DEPTH_N)}",
+        f"M={_depth_line(_rm)} N={_depth_line(_rn)}")
+
+    # Force the interleave deterministically: park the FIRST scrape between reading its
+    #     own numbers and rendering, then let the other tenant's scrape complete. Keyed on
+    #     call order rather than thread name — FastAPI dispatches sync handlers to an
+    #     anyio worker, so a thread-name check silently never fires and the test passes
+    #     while proving nothing.
+    _real_gen = L.generate_latest
+    _gate_in, _gate_out = threading.Event(), threading.Event()
+    _first = {"pending": True}
+
+    def _gen_parked(*args, **kwargs):
+        if _first["pending"]:
+            _first["pending"] = False
+            _gate_in.set()
+            _gate_out.wait(15)
+        return _real_gen(*args, **kwargs)
+
+    L.generate_latest = _gen_parked
+    _out = {}
+
+    def _scrape_m():
+        _out["M"] = met_client.get("/metrics", headers={"X-Api-Key": _KEY_M}).text
+
+    _tm = threading.Thread(target=_scrape_m)
+    _tm.start()
+    _fired = _gate_in.wait(15)
+    if _fired:
+        _out["N"] = met_client.get("/metrics", headers={"X-Api-Key": _KEY_N}).text
+    _gate_out.set()
+    _tm.join(20)
+    L.generate_latest = _real_gen
+
+    chk("the interleave actually happened (else this section proves nothing)", _fired,
+        "generate_latest was never intercepted")
+    chk("a concurrent scrape does not overwrite the caller's dlq_depth",
+        _depth_line(_out.get("M", "")) == f"{float(_DEPTH_M)}",
+        f"tenant M (depth {_DEPTH_M}) was served {_depth_line(_out.get('M', ''))} — "
+        f"tenant N's depth is {_DEPTH_N}")
+    chk("the other tenant still sees its own depth",
+        _depth_line(_out.get("N", "")) == f"{float(_DEPTH_N)}",
+        f"got {_depth_line(_out.get('N', ''))}")
+finally:
+    L._ANY_ORG_KEYS = original_any_met
+    with met_owner.cursor() as c:
+        c.execute("BEGIN")
+        c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
+        c.execute("DELETE FROM org WHERE org_id <> 'default'")
+        c.execute("COMMIT")
+    met_owner.close()
+
+
+# =============================================================================
 # A7: CONNECTION POOL RETAINS ITS CONNECTIONS
 # psycopg2 returns a connection to the idle pool only while len(self._pool) < minconn;
 #     every other release calls conn.close(). With minconn=1 the pool retained exactly

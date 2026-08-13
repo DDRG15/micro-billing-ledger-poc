@@ -39,6 +39,7 @@ import logging        # Structured log output to file and stderr
 from logging.handlers import RotatingFileHandler  # Rotating file handler — caps log file size to prevent disk fill
 import os             # DATABASE_URL, STRIPE_WEBHOOK_SECRET, BILLING_API_KEY env var lookup
 import time           # perf_counter for benchmark timing
+import threading      # serialises the /metrics set-then-render pair (see metrics())
 import stripe         # Stripe SDK for HMAC-SHA256 webhook signature verification
 import psycopg2       # PostgreSQL driver — production-grade relational storage
 from datetime import datetime, timezone  # Timezone-aware timestamps for TIMESTAMPTZ columns — financial audit trail requires tz
@@ -1640,6 +1641,11 @@ _SECRETS_INFO = Info("billing_secrets", "Fingerprint and source of the secrets i
 _SECRETS_INFO.info(_SECRET_FINGERPRINTS)
 _OUTBOX_PENDING = Gauge("outbox_pending", "Outbox rows not yet dispatched downstream")
 
+# The three gauges above hold PER-TENANT values in process-wide objects, so writing them
+#     and rendering them has to be one indivisible step. Without this, two tenants
+#     scraping at once could each be served the other's queue depth. See metrics().
+_METRICS_RENDER_LOCK = threading.Lock()
+
 
 @app.middleware("http")
 async def _observability(request: Request, call_next):
@@ -1710,8 +1716,39 @@ else:
 #     Size to the PostgreSQL max_connections budget: every worker process holds this many.
 #     APP_DATABASE_URL, not DATABASE_URL: every connection that serves traffic runs as the
 #     restricted role, which is what makes the row-level security policies apply at all.
+class _AutocommitPool(ThreadedConnectionPool):
+    """A ThreadedConnectionPool whose connections run with autocommit=True.
+
+    _tx() opens its transactions with a literal BEGIN and states in its own docstring
+    that it does so "because the connection runs with autocommit=True". That was true of
+    _bootstrap() and of worker._connect(), and false of every connection this pool has
+    ever handed out: psycopg2 defaults autocommit to False, so the driver opened an
+    implicit transaction on the first statement and _tx's BEGIN landed inside one that
+    was already running. PostgreSQL answers that with
+
+        WARNING:  there is already a transaction in progress
+
+    on every request that reads before it writes — the webhook path does exactly that,
+    resolving the tenant's signing secret before processing the event. Nothing was
+    corrupted, because psycopg2's putconn rolls a connection back before re-pooling and
+    SET LOCAL still applies to the transaction that is open. But the transaction started
+    earlier than the code believes, so it spanned the org lookup and the HMAC
+    verification, and the warning stream shares the log channel the RLS acceptance check
+    greps — a genuine rls_inert CRITICAL is harder to see buried in it.
+
+    ThreadedConnectionPool offers no hook for connection setup, so this overrides the one
+    method that creates a raw connection. It runs for every connection the pool opens,
+    including replacements, which a one-off loop over the initial connections would miss.
+    """
+
+    def _connect(self, key=None):
+        conn = super()._connect(key)
+        conn.autocommit = True
+        return conn
+
+
 DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
-_pool: ThreadedConnectionPool = ThreadedConnectionPool(
+_pool: ThreadedConnectionPool = _AutocommitPool(
     minconn=DB_POOL_SIZE, maxconn=DB_POOL_SIZE, dsn=APP_DATABASE_URL
 )
 
@@ -2076,14 +2113,39 @@ def metrics(request: Request, org_id: str = Depends(_require_api_key)) -> Respon
                 "       COUNT(*) FROM dlq WHERE org_id=%s", (org_id,)
             )
             _actionable, _total = cur.fetchone()
-            _DLQ_DEPTH.set(_actionable)
-            _DLQ_TOTAL.set(_total)
             cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0 AND org_id=%s", (org_id,))
-            _OUTBOX_PENDING.set(cur.fetchone()[0])
+            _pending = cur.fetchone()[0]
     finally:
         _pool.putconn(conn)
 
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    # The three queue gauges are per-tenant values living in PROCESS-WIDE objects, and
+    #     generate_latest() renders whatever they hold at render time — not what this
+    #     request computed. Setting them and rendering as two unsynchronised steps let a
+    #     second tenant's scrape land in between, so a tenant asking for its own numbers
+    #     got somebody else's: reproduced with tenants of depth 2 and 9, where the first
+    #     was served 9. The SQL was correctly scoped the whole time; the leak was one
+    #     line later, in shared process state that row-level security cannot reach.
+    #
+    #     The lock makes set-then-render atomic with respect to other requests, which is
+    #     the whole of the defect. It is held across no I/O — the database work is done
+    #     above and the render is pure CPU over in-memory counters — and /metrics is
+    #     rate-limited to RATE_LIMIT_METRICS, so serialising it costs nothing measurable.
+    #
+    #     Labelling the gauges by org_id would NOT fix this. generate_latest() emits every
+    #     series in the registry, so each tenant would then read every other tenant's
+    #     depth from its own response — the same leak, made deterministic.
+    #
+    #     What this does not address: the process-wide counters (webhook_events_total,
+    #     http_requests_total) are still aggregate across tenants. That is a modelling
+    #     question — whether /metrics is an operator endpoint or a tenant one — and it
+    #     belongs with the admin credential, not to a lock.
+    with _METRICS_RENDER_LOCK:
+        _DLQ_DEPTH.set(_actionable)
+        _DLQ_TOTAL.set(_total)
+        _OUTBOX_PENDING.set(_pending)
+        body = generate_latest()
+
+    return Response(content=body, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/dlq/entries")
