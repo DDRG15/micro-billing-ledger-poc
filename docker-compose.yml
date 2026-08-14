@@ -163,6 +163,22 @@ services:
       WORKER_LOG_ONLY:     "${WORKER_LOG_ONLY:-true}"
       WORKER_BATCH_SIZE:   "${WORKER_BATCH_SIZE:-100}"
       WORKER_POLL_INTERVAL: "${WORKER_POLL_INTERVAL:-5}"
+      # Pinned to 1, and NOT taken from .env like the billing service takes it.
+      #     worker.py imports ledger.py, which builds its pool at import — so the worker
+      #     opened DB_POOL_SIZE connections it never uses, on top of the single one
+      #     _connect() gives it. Measured on a fresh stack: billing_app held 41 of the
+      #     100 available (20 billing + 20 inherited + 1 real). Four worker replicas,
+      #     which the round-robin drain exists to make possible, would ask for 104 and
+      #     the ingest path would be the one refused.
+      #
+      #     The pool is not removed because the worker needs it: ledger.py's import-time
+      #     self-checks run through it, and they are what make the worker log
+      #     rls_enforced — which stack.yml asserts per service. One connection is enough
+      #     for a check that runs once at startup.
+      #
+      #     minconn == maxconn still holds at 1. The pathology that rule exists for is
+      #     minconn < maxconn under concurrency; nothing here is concurrent.
+      DB_POOL_SIZE:        "1"
       # Same format as the billing service — correlating an event from ingest to
       #     dispatch needs both sides emitting the same shape on transaction_id.
       LOG_FORMAT:          ${LOG_FORMAT:-json}
