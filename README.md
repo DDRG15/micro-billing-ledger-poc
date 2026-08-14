@@ -9,7 +9,7 @@
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
 **Tests:** 337 / 337 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
-**Throughput:** 4,699 TPS batch · 152 TPS over HTTP at 16 concurrent clients (p50 96ms) · 28 TPS per-event · all reproducible via `python benchmark.py`
+**Throughput:** 4,143 TPS batch · 112 TPS over HTTP at 16 concurrent clients (p50 112ms) · 24 TPS per-event · all reproducible via `python benchmark.py`, measured against the restricted role the service actually deploys as
 
 ---
 
@@ -284,30 +284,55 @@ Measured on Windows 10 · Docker Desktop · Python 3.13.7 · PostgreSQL 16 in a 
 
 | Path | Events | Time | Throughput | Latency |
 |---|---|---|---|---|
-| Single-event (`process_stripe_event`) | 5,000 | 179.1s | **28 TPS** | — |
-| Batch (`process_stripe_event_batch`) | 5,000 | 1.06s | **4,699 TPS** | — |
-| HTTP end-to-end (`POST /webhook/stripe`) | 1,500 | 9.88s | **152 TPS** | p50 96ms · p95 170ms · p99 208ms |
+| Single-event (`process_stripe_event`) | 5,000 | 204.6s | **24 TPS** | — |
+| Batch (`process_stripe_event_batch`) | 5,000 | 1.21s | **4,143 TPS** | — |
+| HTTP end-to-end (`POST /webhook/stripe`) | 1,500 | 13.3s | **112 TPS** | p50 112ms · p95 194ms · p99 2,152ms |
+
+The p99 is not a typo and is not smoothed away. It reproduces on every run while p95 stays
+under 200ms, so a small number of requests take roughly twenty times the median. It is
+recorded rather than trimmed because an unexplained tail is a finding, not a blemish —
+naming it is what makes it someone's next piece of work.
+
+**These figures are lower than the ones this table carried before, and row-level security
+is not the reason.** The obvious suspicion, once the service started connecting as a
+non-superuser, was that the RLS predicates and the extra `SET LOCAL` per transaction had
+cost this. Measured rather than assumed, on the same machine minutes apart:
+
+| Path | RLS inert (owner) | RLS enforced (`billing_app`) |
+|---|---|---|
+| Single-event | 21 TPS | 24 TPS |
+| Batch | 3,335 TPS | 4,018 TPS |
+
+Enforced came out *faster*, which only means the difference is smaller than the run-to-run
+noise on this machine — three repeat runs spanned 2,863–3,788 TPS on the batch path alone.
+The honest conclusion is that tenant isolation costs nothing measurable here, and that the
+older figures came from a differently loaded machine rather than a faster codebase. They
+were replaced instead of explained away, because a number nobody can reproduce is a claim.
 
 ### Why single-event is bounded by round trips, not CPU
 
 ```
-Per event: BEGIN + INSERT ledger + INSERT outbox + COMMIT = 4 synchronous round trips
-5,000 events × 4 round trips ≈ 179 seconds → 28 TPS
+Per event: BEGIN + SET LOCAL + INSERT ledger + INSERT outbox + COMMIT
+5,000 events × ~5 synchronous round trips ≈ 205 seconds → 24 TPS
 ```
 
 The bottleneck is not CPU, not Pydantic, not the constraint check — it is the count of
 synchronous round trips to PostgreSQL, each ending in a WAL fsync.
 
-### Why batch is 168× faster
+### Why batch is 169× faster
 
 ```
-5,000 events → 12 round trips total:
+5,000 events → 13 round trips total:
   1  BEGIN
+  1  SET LOCAL app.org_id          (the tenant scope, once per transaction)
   5  bulk ledger INSERTs  (execute_values, page_size=1000, RETURNING transaction_id)
   5  bulk outbox INSERTs  (execute_values, page_size=1000)
   1  COMMIT
-= 1.06 seconds elapsed → 4,699 TPS
+= 1.21 seconds elapsed → 4,143 TPS
 ```
+
+The scope costs one round trip for the whole batch and one per single event, which is why
+it is invisible in the batch figure and lost in the noise in the single-event one.
 
 `execute_values` collapses N INSERT statements into `ceil(N / page_size)` multi-row
 statements. PostgreSQL does the same total work; the application makes far fewer network
@@ -334,6 +359,11 @@ caller. Setting `minconn == maxconn` fixed it:
 | 4 | 1 TPS | **61 TPS** |
 | 8 | 1 TPS | **106 TPS** |
 | 16 | did not finish | **143 TPS** |
+
+That table is the record of one fix on the day it was made, kept because the *shape* is
+the point — flat-to-collapsing versus scaling with clients. The absolute numbers are not
+current: the same machine now measures 112 TPS at 16 concurrent. Re-run `benchmark.py`
+for figures to rely on rather than reading either column as today's performance.
 
 Two diagnoses were wrong before that one was right. First suspect was the rate limiter's
 in-memory storage, which does an O(n) list prepend under a lock — disproved by re-running

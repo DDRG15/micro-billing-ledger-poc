@@ -18,7 +18,8 @@
 #     this manifest; it arrives through FastAPI's pin range, which is exactly how a
 #     transitive advisory goes unnoticed.
 #     0.115.14 requires starlette>=0.40.0 and is the last patch of the same minor
-#     line, so the upgrade carries no API change. Verified: 213/213.
+#     line, so the upgrade carries no API change. Verified green at the time (213/213);
+#     the suite is 337/337 today.
 fastapi==0.115.14
 
 # uvicorn[standard] 0.30.6 — ASGI server that runs the FastAPI app.

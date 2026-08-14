@@ -80,26 +80,51 @@ def _reset(conn) -> None:
         cur.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
 
 
-def bench_single(conn, n: int) -> dict:
+def _work_connection():
+    """The connection the measured paths run on — the same role the service uses.
+
+    This matters to the number. Since Phase 13.7 the service connects as `billing_app`,
+    a non-superuser, so every transaction it opens also issues SET LOCAL app.org_id and
+    every statement is filtered through the row-level security policies on ledger, outbox
+    and dlq. Measuring on the owner connection instead skips both: a superuser bypasses
+    RLS entirely, so the figure would describe a configuration nobody deploys and would
+    be optimistic by exactly the amount the isolation costs.
+
+    Falls back to the owner DSN when APP_DATABASE_URL is unset, which is also what the
+    application does — and the banner says which one was used, so the output is never
+    ambiguous about what it measured.
+    """
+    import psycopg2
+    conn = psycopg2.connect(L.APP_DATABASE_URL)
+    conn.autocommit = True          # _tx opens transactions with a literal BEGIN
+    return conn
+
+
+def bench_single(work, owner, n: int) -> dict:
+    """Measured on `work`; reset and verified on `owner`.
+
+    The count cannot come from `work`: under default-deny, a COUNT with no scope
+    established sees zero rows and would report that nothing was written.
+    """
     events = [fake_event(i) for i in range(n)]
-    _reset(conn)
+    _reset(owner)
     start = time.perf_counter()
     for event in events:
-        L.process_stripe_event(conn, event)
+        L.process_stripe_event(work, event)
     elapsed = time.perf_counter() - start
-    with conn.cursor() as cur:
+    with owner.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM ledger")
         written = cur.fetchone()[0]
     return {"events": n, "elapsed": elapsed, "tps": n / elapsed, "written": written}
 
 
-def bench_batch(conn, n: int) -> dict:
+def bench_batch(work, owner, n: int) -> dict:
     events = [fake_event(i) for i in range(n)]
-    _reset(conn)
+    _reset(owner)
     start = time.perf_counter()
-    L.process_stripe_event_batch(conn, events)
+    L.process_stripe_event_batch(work, events)
     elapsed = time.perf_counter() - start
-    with conn.cursor() as cur:
+    with owner.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM ledger")
         written = cur.fetchone()[0]
     return {"events": n, "elapsed": elapsed, "tps": n / elapsed, "written": written}
@@ -178,15 +203,23 @@ def main() -> int:
     print(f"  events      {args.events:,} per DB path, {args.http_events:,} over HTTP")
     print("  Numbers are specific to this machine and this database. Re-run rather")
     print("  than quoting someone else's figures.")
+
+    conn = L._bootstrap()          # owner: DDL, TRUNCATE and the row counts
+    work = _work_connection()      # the role the service actually runs as
+    _rls = L._rls_status()
+    print(f"  db role     {_rls['db_user']}  "
+          f"({'RLS enforced' if _rls['enforced'] else 'RLS INERT — superuser bypasses it'})")
+    if not _rls["enforced"]:
+        print("              Set APP_DATABASE_URL to the billing_app DSN to measure the")
+        print("              configuration that is actually deployed. Without it these")
+        print("              figures omit the cost of tenant isolation.")
     print()
 
-    conn = L._bootstrap()
-
-    single = bench_single(conn, args.events)
+    single = bench_single(work, conn, args.events)
     print(f"  single-event  {single['elapsed']:7.2f}s  ->  {single['tps']:9,.0f} TPS   "
           f"({single['written']:,} rows)")
 
-    batch = bench_batch(conn, args.events)
+    batch = bench_batch(work, conn, args.events)
     print(f"  batch         {batch['elapsed']:7.2f}s  ->  {batch['tps']:9,.0f} TPS   "
           f"({batch['written']:,} rows)")
     print(f"                batch is {batch['tps'] / single['tps']:.0f}x the single-event path")
@@ -210,6 +243,7 @@ def main() -> int:
                   f"{ {k: v for k, v in http['codes'].items() if not isinstance(k, int)} }")
 
     _reset(conn)
+    work.close()
     conn.close()
 
     print()

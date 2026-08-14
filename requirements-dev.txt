@@ -4,11 +4,12 @@
 #     These tools are NOT needed to run the app or the test suite.
 #     They are for code quality checks during development.
 #
-# Usage:
-#   ruff check ledger.py            # lint
-#   ruff format ledger.py           # format
-#   mypy ledger.py                  # type check
-#   bandit -r ledger.py             # security scan
+# Usage — the module list matches .github/workflows/lint.yml, so a local run and CI
+#     disagree only when one of them is out of date:
+#   ruff check ledger.py worker.py provision.py send_test_webhook.py      # lint
+#   ruff format ledger.py                                                 # format
+#   mypy ledger.py                                                        # type check
+#   bandit -r ledger.py worker.py provision.py send_test_webhook.py -ll   # security scan
 
 # ruff — extremely fast Python linter and formatter (replaces flake8 + isort + pyupgrade).
 #     Detects unused imports, undefined names, style violations, and many more.
