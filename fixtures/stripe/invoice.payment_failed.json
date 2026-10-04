@@ -1,0 +1,168 @@
+{
+  "id": "evt_1N5FailSLkdIwHu7ixEvtFail5",
+  "object": "event",
+  "api_version": "2019-02-19",
+  "created": 1687000010,
+  "data": {
+    "object": {
+      "id": "in_1N5FailILkdIwHu7ixFailInv5",
+      "object": "invoice",
+      "account_country": "US",
+      "account_name": "Stripe Docs",
+      "account_tax_ids": null,
+      "amount_due": 1000,
+      "amount_paid": 0,
+      "amount_overpaid": 0,
+      "amount_remaining": 1000,
+      "amount_shipping": 0,
+      "application": null,
+      "attempt_count": 1,
+      "attempted": true,
+      "auto_advance": true,
+      "automatic_tax": {
+        "enabled": false,
+        "liability": null,
+        "status": null
+      },
+      "billing_reason": "subscription_cycle",
+      "collection_method": "charge_automatically",
+      "created": 1687000000,
+      "currency": "usd",
+      "custom_fields": null,
+      "customer": "cus_Ne0hBbeBbm55R8",
+      "customer_address": null,
+      "customer_email": "jennyrosen@example.com",
+      "customer_name": "Jenny Rosen",
+      "customer_phone": null,
+      "customer_shipping": null,
+      "customer_tax_exempt": "none",
+      "customer_tax_ids": [],
+      "confirmation_secret": null,
+      "default_payment_method": null,
+      "default_source": null,
+      "default_tax_rates": [],
+      "description": null,
+      "discounts": [],
+      "due_date": null,
+      "ending_balance": 0,
+      "footer": null,
+      "from_invoice": null,
+      "hosted_invoice_url": "https://invoice.stripe.com/i/acct_1Mo/test_in_1N5FailILkdIwHu7ixFailInv5",
+      "invoice_pdf": "https://invoice.stripe.com/i/acct_1Mo/test_in_1N5FailILkdIwHu7ixFailInv5/pdf",
+      "issuer": {
+        "type": "self"
+      },
+      "last_finalization_error": null,
+      "latest_revision": null,
+      "lines": {
+        "object": "list",
+        "data": [
+          {
+            "id": "il_1N5FailILkdIwHu7ixLine0005",
+            "object": "line_item",
+            "amount": 1000,
+            "currency": "usd",
+            "description": "1 x Monthly plan (at $10.00 / month)",
+            "discount_amounts": [],
+            "discountable": true,
+            "discounts": [],
+            "invoice": "in_1N5FailILkdIwHu7ixFailInv5",
+            "livemode": false,
+            "metadata": {},
+            "parent": {
+              "type": "subscription_item_details",
+              "invoice_item_details": null,
+              "subscription_item_details": {
+                "invoice_item": null,
+                "proration": false,
+                "proration_details": {
+                  "credited_items": null
+                },
+                "subscription": "sub_1N5FailSLkdIwHu7ixSubFail5",
+                "subscription_item": "si_Ne0hcbfCcn66S9"
+              }
+            },
+            "period": {
+              "start": 1687000000,
+              "end": 1689678400
+            },
+            "pretax_credit_amounts": [],
+            "pricing": {
+              "type": "price_details",
+              "price_details": {
+                "price": "price_1N5FailPLkdIwHu7ixPrIcE05",
+                "product": "prod_Na6dGcTsmU0I4R"
+              },
+              "unit_amount_decimal": "1000"
+            },
+            "quantity": 1,
+            "quantity_decimal": "1",
+            "subtotal": 1000,
+            "taxes": []
+          }
+        ],
+        "has_more": false,
+        "total_count": 1,
+        "url": "/v1/invoices/in_1N5FailILkdIwHu7ixFailInv5/lines"
+      },
+      "payments": {
+        "object": "list",
+        "data": [],
+        "has_more": false,
+        "total_count": 0,
+        "url": "/v1/invoice_payments"
+      },
+      "livemode": false,
+      "metadata": {},
+      "next_payment_attempt": 1687259200,
+      "number": "A1B2C3D4-0005",
+      "on_behalf_of": null,
+      "parent": {
+        "type": "subscription_details",
+        "quote_details": null,
+        "subscription_details": {
+          "metadata": {},
+          "subscription": "sub_1N5FailSLkdIwHu7ixSubFail5",
+          "subscription_proration_date": null
+        }
+      },
+      "payment_settings": {
+        "default_mandate": null,
+        "payment_method_options": null,
+        "payment_method_types": null
+      },
+      "period_end": 1687000000,
+      "period_start": 1684321600,
+      "post_payment_credit_notes_amount": 0,
+      "pre_payment_credit_notes_amount": 0,
+      "receipt_number": null,
+      "shipping_cost": null,
+      "shipping_details": null,
+      "starting_balance": 0,
+      "statement_descriptor": null,
+      "status": "open",
+      "status_transitions": {
+        "finalized_at": 1687000000,
+        "marked_uncollectible_at": null,
+        "paid_at": null,
+        "voided_at": null
+      },
+      "subtotal": 1000,
+      "subtotal_excluding_tax": 1000,
+      "test_clock": null,
+      "total": 1000,
+      "total_discount_amounts": [],
+      "total_excluding_tax": 1000,
+      "total_taxes": [],
+      "transfer_data": null,
+      "webhooks_delivered_at": 1687000000
+    }
+  },
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": {
+    "id": null,
+    "idempotency_key": null
+  },
+  "type": "invoice.payment_failed"
+}

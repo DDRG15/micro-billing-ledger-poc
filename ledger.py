@@ -177,30 +177,43 @@ class EventType(str, Enum):
     SUB_UPDATED    = "customer.subscription.updated"   # Subscription plan changed
 
 
-# Which field carries the billable figure, per event type, most specific first.
+# Subscription events record that an account changed state; they do not record money.
+#     Stripe's Subscription object has no top-level amount field at all — prices live in
+#     items.data[].price — so requiring one sent every real customer.subscription.* event
+#     to the DLQ, where each one inflated the dlq_depth operators read as ingestion
+#     health. Deriving an amount from the items would be worse: it posts a list price as
+#     revenue on top of the invoice.paid that actually collects it, and it is wrong for
+#     trials, metered and tiered prices, coupons and proration. So these events are
+#     ledgered with NO amount (amount_cents NULL, status LIFECYCLE) and still reach the
+#     outbox, because downstream systems act on plan changes and cancellations. The
+#     database enforces the same split (migration 0007, ledger_amount_matches_kind).
+_LIFECYCLE_TYPES: frozenset = frozenset({
+    EventType.SUB_CREATED, EventType.SUB_DELETED, EventType.SUB_UPDATED,
+})
+
+
+# Which field carries the billable figure, per invoice event type, most specific first.
 #     Stripe does not use one field for every event: a paid invoice reports
 #     amount_paid, a failed one reports amount_paid=0 with the real figure in
-#     amount_due, and subscription lifecycle events often carry neither.
-#     Reading amount_paid for every type made each invoice.payment_failed look
-#     like a $0 invoice, so check_invoice_amount_nonzero rejected it and a real
+#     amount_due. Reading amount_paid for every type made each invoice.payment_failed
+#     look like a $0 invoice, so check_invoice_amount_nonzero rejected it and a real
 #     failed payment — the kind of event dunning depends on — landed in the DLQ.
-#     An event type whose fields are all absent still routes to the DLQ, which is
-#     the intended outcome: an unknown amount must never be recorded as $0.
+#     An invoice whose fields are all absent still routes to the DLQ, which is the
+#     intended outcome: an unknown amount must never be recorded as $0. Subscription
+#     types have no entry: no amount is read for them at all (_LIFECYCLE_TYPES).
 _AMOUNT_FIELDS_BY_TYPE: dict = {
     EventType.INVOICE_PAID:   ("amount_paid", "amount", "amount_due"),
     EventType.INVOICE_FAILED: ("amount_due", "amount_paid", "amount"),
-    EventType.SUB_CREATED:    ("amount", "amount_paid", "amount_due"),
-    EventType.SUB_DELETED:    ("amount", "amount_paid", "amount_due"),
-    EventType.SUB_UPDATED:    ("amount", "amount_paid", "amount_due"),
 }
 _AMOUNT_FIELDS_DEFAULT = ("amount_paid", "amount", "amount_due")
 
 
 class StripeObject(BaseModel):
     """
-    Represents the `data.object` payload inside a Stripe webhook. Contains the
-    actual billing details: who paid, how much, in what currency. Three validation
-    layers run here: Field constraints, then a cross-field validator for amounts.
+    Represents the `data.object` payload inside a Stripe webhook: an Invoice or a
+    Subscription, depending on the event. Field constraints run here. Whether an
+    amount must be present depends on the event type, which this model cannot see,
+    so that rule lives on StripeEvent (check_amount_present).
     """
 
     # Stripe customer IDs look like "cus_ABC123". min_length=4 catches empty
@@ -210,8 +223,9 @@ class StripeObject(BaseModel):
         description="Stripe customer ID (e.g., 'cus_ABC123')"
     )
 
-    # Stripe puts the paid amount here on invoice.paid events. Optional because
-    #     subscription lifecycle events don't always carry payment amounts.
+    # Stripe puts the paid amount here on invoice.paid events. Optional because which
+    #     field carries the amount depends on the event type, and a Subscription object
+    #     carries none of them.
     amount_paid: Optional[int] = Field(
         default=None,
         ge=0,
@@ -262,23 +276,6 @@ class StripeObject(BaseModel):
         """
         return v.lower() if isinstance(v, str) else v
 
-    @model_validator(mode='after')
-    def check_amount_present(self):
-        """
-        Ensures at least one amount field is present and non-null. Field(ge=0)
-        handles non-negative enforcement — this validator handles the
-        "either/or" logic that a single Field constraint cannot express.
-        Subscription events may have amount=0 (lifecycle, no money moved).
-        Invoice events with amount=0 are caught by check_invoice_amount_nonzero
-        in StripeEvent — a different layer for a different rule.
-        """
-        if self.amount_paid is None and self.amount is None and self.amount_due is None:
-            # No amount field at all. This is a data quality failure.
-            raise ValueError(
-                "One of amount_paid, amount_due or amount must be provided and non-null"
-            )
-        return self
-
     def get_amount(self, field_priority: tuple = ("amount_paid", "amount", "amount_due")) -> Optional[int]:
         """
         Returns the effective billing amount in cents, reading the candidate fields
@@ -289,9 +286,9 @@ class StripeObject(BaseModel):
         StripeEvent.get_billing_amount(), which selects the order that matches how
         Stripe populates that particular event.
 
-        Returns None only if every candidate is None — check_amount_present prevents
-        that when the model is constructed via StripeEvent, but direct StripeObject()
-        construction bypasses that validator, so Optional[int] is the honest type.
+        Returns None only if every candidate is None. StripeEvent.check_amount_present
+        rules that out for invoice events; a bare StripeObject() has no event type to
+        apply it with, so Optional[int] is the honest type.
         """
         for name in field_priority:
             value = getattr(self, name, None)
@@ -370,13 +367,31 @@ class StripeEvent(BaseModel):
         return self
 
     @model_validator(mode='after')
+    def check_amount_present(self):
+        """
+        Cross-field rule: an invoice event must carry an amount; a subscription event
+        is not asked for one.
+
+        This used to live on StripeObject, which cannot see the event type, so it
+        demanded an amount from every object — and a Stripe Subscription has none.
+        Every real customer.subscription.* event failed here and went to the DLQ.
+        For invoice events the rule is unchanged: no amount field at all is a data
+        quality failure, never a $0 row.
+        """
+        if self.type not in _LIFECYCLE_TYPES and self.get_billing_amount() is None:
+            raise ValueError(
+                "One of amount_paid, amount_due or amount must be provided and non-null"
+            )
+        return self
+
+    @model_validator(mode='after')
     def check_invoice_amount_nonzero(self):
         """
         Cross-field rule: invoice events must carry a non-zero amount.
             - invoice.paid with $0 = no revenue received. Data quality failure.
             - invoice.payment_failed with $0 = nothing to retry. Data quality failure.
-            - Subscription events (created/deleted/updated) are EXEMPT — they are
-              lifecycle events, not payment events. $0 is valid for them.
+            - Subscription events are exempt: they carry no amount at all
+              (see _LIFECYCLE_TYPES).
         Field(ge=0) cannot express this — it allows zero for all types.
         This validator runs after Field checks, so it has access to self.type.
         """
@@ -411,27 +426,37 @@ class StripeEvent(BaseModel):
         The billable amount in cents, read from whichever field this event type
         actually populates (see _AMOUNT_FIELDS_BY_TYPE).
 
-        Returns None when the event carries no amount field at all. Callers must
-        route that to the DLQ rather than defaulting it: a missing amount is an
-        unknown amount, and recording an unknown amount as $0 turns a data-quality
+        Returns None for a subscription event, always: it records a state change, not
+        money, and is ledgered with no amount (see _LIFECYCLE_TYPES). That holds even
+        when the object happens to carry an `amount` field — reading it would post a
+        figure nothing collected.
+
+        For an invoice event, None means the event carries no amount field at all.
+        Callers must route that to the DLQ rather than defaulting it: a missing amount
+        is an unknown amount, and recording an unknown amount as $0 turns a data-quality
         problem into a silent revenue loss that reconciles cleanly and is therefore
-        invisible. check_amount_present already rejects that case at validation time,
-        so this returning None means someone built the model directly.
+        invisible. check_amount_present already rejects that case at validation time.
         """
+        if self.type in _LIFECYCLE_TYPES:
+            return None
         priority = _AMOUNT_FIELDS_BY_TYPE.get(self.type, _AMOUNT_FIELDS_DEFAULT)
         return self.data.object.get_amount(priority)
 
 
 class LedgerStatus(str, Enum):
     """
-    The three valid accounting states for a ledger row. Using an enum instead
+    The states a ledger row can carry. Using an enum instead
     of raw strings prevents typos like "POSETD" from silently entering the DB.
     The _STATUS_MAP below uses EventType keys and LedgerStatus values — both
     are enums, so mypy can verify the mapping is complete.
     """
-    POSTED  = "POSTED"    # Revenue confirmed — invoice.paid, subscription.created
-    PENDING = "PENDING"   # Awaiting resolution — subscription.updated
-    VOID    = "VOID"      # Reversed or failed — invoice.payment_failed, subscription.deleted
+    POSTED    = "POSTED"     # Revenue confirmed — invoice.paid
+    VOID      = "VOID"       # Payment failed — invoice.payment_failed
+    LIFECYCLE = "LIFECYCLE"  # Account state changed, no money moved — customer.subscription.*
+    # No event type maps to PENDING since Cycle 6 (it was subscription.updated). Kept
+    #     because rows written before then carry it, and an enum that cannot name a
+    #     stored value turns a historical row into a validation error.
+    PENDING   = "PENDING"
 
 
 class DLQReason(str, Enum):
@@ -520,9 +545,9 @@ class LedgerEntry(BaseModel):
     transaction_id:  str          = Field(min_length=1)           # Stripe event ID — PK
     event_type:      EventType                                     # Validated enum — not a raw string
     customer_id:     str          = Field(min_length=4)            # cus_ prefix validated upstream in StripeEvent
-    amount_cents:    int          = Field(ge=0)                    # Non-negative integer cents
+    amount_cents:    Optional[int] = Field(default=None, ge=0)     # Integer cents; None for a lifecycle row
     currency:        str          = Field(pattern=r"^[a-z]{3}$")  # ISO 4217 lowercase
-    status:          LedgerStatus                                  # POSTED / PENDING / VOID
+    status:          LedgerStatus                                  # POSTED / VOID / LIFECYCLE
     idempotency_key: str          = Field(min_length=1)            # Network safety reference
     payload:         str                                           # Full JSON string — the outbox uses this for replay
     created_at:      datetime                                      # Timezone-aware ingestion timestamp (TIMESTAMPTZ)
@@ -834,15 +859,18 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
                 transaction_id  TEXT    NOT NULL,
                 event_type      TEXT    NOT NULL,
                 customer_id     TEXT    NOT NULL,
-                amount_cents    BIGINT  NOT NULL,
+                amount_cents    BIGINT,
                 currency        TEXT    NOT NULL DEFAULT 'usd',
                 status          TEXT    NOT NULL,
                 idempotency_key TEXT    NOT NULL,
                 payload         TEXT    NOT NULL CHECK (length(payload) < 50000),
                 created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT ledger_amount_matches_kind
+                    CHECK ((amount_cents IS NULL) = (event_type LIKE 'customer.subscription.%')),
                 PRIMARY KEY (org_id, transaction_id)
             )
         """)
+        # amount_cents NULL exactly for subscription rows (migration 0007, _LIFECYCLE_TYPES).
         # amount_cents BIGINT: PostgreSQL INTEGER max = 2,147,483,647 (~$21M). BIGINT
         #     handles up to ~$92 trillion — required for B2B enterprise subscription amounts.
         #     payload CHECK: prevents malicious payloads from causing unbounded table growth.
@@ -996,12 +1024,20 @@ def _tx(conn: "psycopg2.extensions.connection",
 #     has a corresponding status — a missing entry is a type error, not a
 #     silent KeyError at runtime.
 _STATUS_MAP: dict[EventType, LedgerStatus] = {
-    EventType.INVOICE_PAID:   LedgerStatus.POSTED,   # Revenue confirmed
-    EventType.INVOICE_FAILED: LedgerStatus.VOID,     # Revenue reversed
-    EventType.SUB_CREATED:    LedgerStatus.POSTED,   # Account activated
-    EventType.SUB_DELETED:    LedgerStatus.VOID,     # Account deactivated
-    EventType.SUB_UPDATED:    LedgerStatus.PENDING,  # Change in progress
+    EventType.INVOICE_PAID:   LedgerStatus.POSTED,     # Revenue confirmed
+    EventType.INVOICE_FAILED: LedgerStatus.VOID,       # Payment failed, recorded at amount_due
+    EventType.SUB_CREATED:    LedgerStatus.LIFECYCLE,  # No money — see _LIFECYCLE_TYPES
+    EventType.SUB_DELETED:    LedgerStatus.LIFECYCLE,
+    EventType.SUB_UPDATED:    LedgerStatus.LIFECYCLE,
 }
+
+# Outcomes that settle a DLQ entry on replay: the event is in the ledger now, because
+#     this replay wrote it or because an earlier delivery already had. Derived from
+#     LedgerStatus, not listed. The two retry paths each kept a literal tuple, so adding
+#     LIFECYCLE to the status map alone would have let a replayed subscription event
+#     reach the ledger while its DLQ entry went on retrying — the ledger and the DLQ
+#     each telling a different story about the same event.
+_RESOLVING_OUTCOMES: frozenset = frozenset({s.value for s in LedgerStatus} | {"DLQ_DUPLICATE"})
 
 
 def process_stripe_event(
@@ -1031,9 +1067,9 @@ def process_stripe_event(
 
     Returns a result dict with keys: outcome, transaction_id, reason.
     Possible outcomes:
-      POSTED     — new event, payment confirmed, written to ledger
-      VOID       — new event, payment failed or subscription cancelled
-      PENDING    — new event, subscription updated (awaiting resolution)
+      POSTED     — new invoice.paid, written to the ledger with its amount
+      VOID       — new invoice.payment_failed, written at its amount_due
+      LIFECYCLE  — new customer.subscription.*, written with no amount
       DLQ_INVALID    — Pydantic validation failed; event in DLQ
       DLQ_DUPLICATE  — already processed; idempotency guard fired; event in DLQ
     Neither outcome writes a new DLQ row when from_retry is True.
@@ -1307,7 +1343,7 @@ def retry_dlq_batch(
             #     asserting a side effect that never happened for its owner.
             result = process_stripe_event(conn, payload, from_retry=True, org_id=row_org_id)
             outcome = result.get("outcome", "")
-            if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
+            if outcome in _RESOLVING_OUTCOMES:
                 # row_org_id, not ALL_ORGS. The claim above had to see every tenant;
                 #     resolving one row does not, and narrowing back means a bug that
                 #     resolved the wrong row updates zero rows instead of somebody
@@ -2200,7 +2236,7 @@ def ledger_summary(request: Request, org_id: str = Depends(_require_api_key)) ->
         #     second query and the third and produce a summary describing no instant
         #     that ever existed.
         with _tx(conn, org_id) as cur:
-            # GROUP BY status gives {POSTED: N, VOID: N, PENDING: N} in one query.
+            # GROUP BY status gives {POSTED: N, VOID: N, LIFECYCLE: N} in one query.
             cur.execute("SELECT status, COUNT(*) FROM ledger WHERE org_id=%s GROUP BY status",
                         (org_id,))
             counts = {row[0]: row[1] for row in cur.fetchall()}
@@ -2384,7 +2420,7 @@ def dlq_retry(request: Request, dlq_id: int,
         result = process_stripe_event(conn, payload, from_retry=True, org_id=org_id)
         outcome = result.get("outcome", "")
 
-        if outcome in ("POSTED", "VOID", "PENDING", "DLQ_DUPLICATE"):
+        if outcome in _RESOLVING_OUTCOMES:
             with _tx(conn, org_id) as cur:
                 cur.execute(
                     "UPDATE dlq SET status='resolved', claimed_at=NULL WHERE id=%s",

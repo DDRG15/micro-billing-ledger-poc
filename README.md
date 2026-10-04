@@ -263,8 +263,9 @@ Layer 1 — Pydantic type coercion
   StripeObject.currency         pattern=r"^[a-z]{3}$" → rejects uppercase, 2-char, non-ISO codes
   StripeObject.amount_paid      ge=0 → rejects negative amounts at the Field level
 
-Layer 2 — StripeObject @model_validator
-  check_amount_present          either amount_paid OR amount must be non-null
+Layer 2 — StripeEvent.check_amount_present (needs the event type)
+  invoice.*                     one of amount_paid / amount_due / amount must be non-null
+  customer.subscription.*       no amount is read — Stripe's Subscription object has none
 
 Layer 3 — StripeEvent @model_validator (cross-field)
   resolve_idempotency_key       request.idempotency_key, else the event id — also when Stripe
@@ -274,7 +275,7 @@ Layer 3 — StripeEvent @model_validator (cross-field)
   check_customer_id_format      customer must start with 'cus_' (structural Stripe API rule)
 
 Layer 4 — Business logic
-  _STATUS_MAP[event_type]       POSTED / VOID / PENDING per event type (type-safe dict)
+  _STATUS_MAP[event_type]       POSTED / VOID / LIFECYCLE per event type (type-safe dict)
   INSERT ... ON CONFLICT        DB-level idempotency guard — the serialization point
 
 Layer 5 — DLQ routing
@@ -430,12 +431,14 @@ CREATE TABLE ledger (
     transaction_id  TEXT        NOT NULL,
     event_type      TEXT        NOT NULL,
     customer_id     TEXT        NOT NULL,
-    amount_cents    BIGINT      NOT NULL,
+    amount_cents    BIGINT,                 -- NULL exactly for customer.subscription.*
     currency        TEXT        NOT NULL DEFAULT 'usd',
-    status          TEXT        NOT NULL,   -- POSTED | VOID | PENDING
+    status          TEXT        NOT NULL,   -- POSTED | VOID | LIFECYCLE (PENDING: pre-Cycle-6 rows)
     idempotency_key TEXT        NOT NULL,
     payload         TEXT        NOT NULL CHECK (length(payload) < 50000),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ledger_amount_matches_kind   -- migration 0007, NOT VALID: new rows only
+        CHECK ((amount_cents IS NULL) = (event_type LIKE 'customer.subscription.%')),
     PRIMARY KEY (org_id, transaction_id)
 );
 
@@ -492,9 +495,24 @@ CREATE INDEX IF NOT EXISTS idx_org_api_key ON org(api_key_sha256) WHERE api_key_
 
 | Status | Event types | Meaning |
 |---|---|---|
-| `POSTED` | `invoice.paid`, `customer.subscription.created` | Revenue confirmed |
-| `VOID` | `invoice.payment_failed`, `customer.subscription.deleted` | Reversed or failed |
-| `PENDING` | `customer.subscription.updated` | Awaiting resolution |
+| `POSTED` | `invoice.paid` | Revenue confirmed, recorded at `amount_paid` |
+| `VOID` | `invoice.payment_failed` | Payment failed, recorded at `amount_due` |
+| `LIFECYCLE` | `customer.subscription.created` · `.updated` · `.deleted` | Account state changed; no money moved. `amount_cents` is NULL, and the row is forwarded downstream like any other |
+| `PENDING` | none since Cycle 6 | Was `customer.subscription.updated`; kept so rows written before stay valid |
+
+**Subscription events carry no amount, on purpose.** Stripe's Subscription object has no
+top-level amount field — prices live in `items.data[].price` — and the ledger used to
+demand one from every event, so every real `customer.subscription.*` event was
+dead-lettered as `INVALID` and counted in `dlq_depth`. Computing an amount from the items
+would be worse: it posts a list price as revenue next to the `invoice.paid` that actually
+collects it, and the figure is wrong for trials, metered and tiered prices, coupons and
+proration. The money is on the invoice rows; a subscription row records that an account
+changed state, which is what downstream systems act on. The database enforces the split
+(`ledger_amount_matches_kind`), and `SUM(amount_cents)` skips the NULLs.
+
+Upgrading a deployment that ran before this change: its DLQ holds those subscription
+events as `INVALID` entries. Replay them with `POST /dlq/{id}/retry`; each settles as
+`LIFECYCLE` on the first attempt.
 
 ---
 

@@ -372,9 +372,9 @@ conn3 = fresh_conn()
 expected = {
     "invoice.paid":                   "POSTED",
     "invoice.payment_failed":         "VOID",
-    "customer.subscription.created":  "POSTED",
-    "customer.subscription.deleted":  "VOID",
-    "customer.subscription.updated":  "PENDING",
+    "customer.subscription.created":  "LIFECYCLE",
+    "customer.subscription.deleted":  "LIFECYCLE",
+    "customer.subscription.updated":  "LIFECYCLE",
 }
 for i, (etype, expected_status) in enumerate(expected.items()):
     ev = fake_event(eid=f"evt_{i:04d}", etype=etype)
@@ -543,6 +543,7 @@ print("\n── Phase 2: LedgerStatus enum coverage ─────────�
 chk("LedgerStatus.POSTED value",                L.LedgerStatus.POSTED.value == "POSTED")
 chk("LedgerStatus.PENDING value",               L.LedgerStatus.PENDING.value == "PENDING")
 chk("LedgerStatus.VOID value",                  L.LedgerStatus.VOID.value == "VOID")
+chk("LedgerStatus.LIFECYCLE value",             L.LedgerStatus.LIFECYCLE.value == "LIFECYCLE")
 
 conn6 = fresh_conn()
 ev_failed = fake_event(eid="evt_failed_001", etype="invoice.payment_failed")
@@ -552,8 +553,8 @@ chk("invoice.payment_failed → VOID",
 
 ev_sub_updated = fake_event(eid="evt_sub_upd", etype="customer.subscription.updated")
 r = L.process_stripe_event(conn6, ev_sub_updated)
-chk("subscription.updated → PENDING",
-    r["outcome"] == "PENDING", f"got {r['outcome']}")
+chk("subscription.updated → LIFECYCLE",
+    r["outcome"] == "LIFECYCLE", f"got {r['outcome']}")
 
 
 # =============================================================================
@@ -586,8 +587,8 @@ ev_sub_zero = {
     "data": {"object": {"customer": "cus_sub001", "amount_paid": 0, "currency": "usd"}},
 }
 r = L.process_stripe_event(conn7, ev_sub_zero)
-chk("subscription.created with amount=0 → POSTED (lifecycle event, not payment)",
-    r["outcome"] == "POSTED", f"got {r['outcome']}")
+chk("subscription.created carrying amount_paid=0 → LIFECYCLE (no amount is read)",
+    r["outcome"] == "LIFECYCLE", f"got {r['outcome']}")
 
 ev_valid_invoice = fake_event(eid="evt_valid_paid", etype="invoice.paid", amount=4900)
 r = L.process_stripe_event(conn7, ev_valid_invoice)
@@ -1394,14 +1395,17 @@ ev_zero_due = {
 chk("failed invoice with amount_due=0 → DLQ_INVALID",
     L.process_stripe_event(amt_conn, ev_zero_due)["outcome"] == "DLQ_INVALID")
 
-# Subscription lifecycle events carry no money and may legitimately be zero.
+# Subscription lifecycle events carry no money. A stray amount field is not read.
 ev_sub_life = {
     "id": "evt_amt_sub",
     "type": "customer.subscription.updated",
     "data": {"object": {"customer": "cus_amt05", "amount": 0, "currency": "usd"}},
 }
-chk("subscription lifecycle event with amount=0 still accepted",
-    L.process_stripe_event(amt_conn, ev_sub_life)["outcome"] == "PENDING")
+chk("subscription lifecycle event with a stray amount=0 → LIFECYCLE",
+    L.process_stripe_event(amt_conn, ev_sub_life)["outcome"] == "LIFECYCLE")
+chk("…and is stored with no amount, not $0",
+    _q1(amt_conn, "SELECT amount_cents IS NULL FROM ledger "
+                  "WHERE transaction_id='evt_amt_sub'") is True)
 amt_conn.close()
 
 
@@ -3033,6 +3037,186 @@ finally:
     for _k, _v in _saved_c63.items():
         setattr(L, _k, _v)
     c63_conn.close()
+
+
+# =============================================================================
+# C6-4: real Stripe subscription events are ledgered with no amount (item 5d)
+#     A Stripe Subscription object has no top-level amount — prices live in
+#     items.data[].price. The fixtures above invented one, so the suite stayed green
+#     while every real customer.subscription.* event failed validation and landed in the
+#     DLQ. The events below are Stripe's documented objects (fixtures/stripe/), sent as
+#     raw bytes, signed, the way Stripe delivers them.
+# =============================================================================
+print("\n── C6-4: subscription events are lifecycle rows, not money ─────────────")
+
+import psycopg2.errors  # noqa: E402
+
+_FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "stripe")
+_SUB_TYPES = ("customer.subscription.created", "customer.subscription.updated",
+              "customer.subscription.deleted")
+
+
+def _fixture(event_type: str, new_id: str = "") -> dict:
+    """A Stripe fixture as a dict; new_id gives it a fresh event id for a second use."""
+    with open(os.path.join(_FIXTURE_DIR, event_type + ".json"), "rb") as _f:
+        _ev = json.loads(_f.read())
+    if new_id:
+        _ev["id"] = new_id
+    return _ev
+
+
+def _amount_status(conn, eid: str, org: str = L.DEFAULT_ORG_ID):
+    with conn.cursor() as _c:
+        _c.execute("SELECT amount_cents, status FROM ledger WHERE org_id=%s AND transaction_id=%s",
+                   (org, eid))
+        return _c.fetchone()
+
+
+c64_conn = fresh_conn()
+
+try:
+    # The premise, checked rather than assumed: the fixtures carry no top-level amount.
+    for _t in _SUB_TYPES:
+        _keys = set(_fixture(_t)["data"]["object"])
+        chk(f"{_t} fixture has no top-level amount field, as Stripe sends it",
+            not ({"amount", "amount_paid", "amount_due", "total"} & _keys),
+            str(sorted({"amount", "amount_paid", "amount_due", "total"} & _keys)))
+
+    _dlq_before = _q1(c64_conn, "SELECT COUNT(*) FROM dlq")
+    for _t in _SUB_TYPES:
+        _ev = _fixture(_t)
+        _r = L.process_stripe_event(c64_conn, _ev)
+        chk(f"{_t} → LIFECYCLE (every real one was DLQ_INVALID)",
+            _r["outcome"] == "LIFECYCLE", str(_r))
+        chk(f"{_t} is stored with amount_cents NULL, never 0",
+            _amount_status(c64_conn, _ev["id"]) == (None, "LIFECYCLE"),
+            str(_amount_status(c64_conn, _ev["id"])))
+        chk(f"{_t} still reaches the outbox (downstream acts on plan changes)",
+            _q1(c64_conn, "SELECT COUNT(*) FROM outbox WHERE transaction_id=%s",
+                (_ev["id"],)) == 1)
+    chk("no DLQ row for any of them — dlq_depth is no longer inflated",
+        _q1(c64_conn, "SELECT COUNT(*) FROM dlq") == _dlq_before)
+
+    # Invoices, from the same documented shapes, keep their money.
+    _paid = _fixture("invoice.paid")
+    chk("real invoice.paid → POSTED", L.process_stripe_event(c64_conn, _paid)["outcome"] == "POSTED")
+    chk("…at amount_paid", _amount_status(c64_conn, _paid["id"]) == (1000, "POSTED"),
+        str(_amount_status(c64_conn, _paid["id"])))
+    _failed = _fixture("invoice.payment_failed")
+    chk("real invoice.payment_failed → VOID",
+        L.process_stripe_event(c64_conn, _failed)["outcome"] == "VOID")
+    chk("…at amount_due, not amount_paid=0",
+        _amount_status(c64_conn, _failed["id"]) == (1000, "VOID"),
+        str(_amount_status(c64_conn, _failed["id"])))
+
+    # An amount field on a subscription object is never read. Posting it would put a
+    #     figure in the ledger that no invoice collected.
+    _stray = _fixture("customer.subscription.updated", "evt_c64_stray_amount")
+    _stray["data"]["object"]["amount"] = 4900
+    chk("subscription event with a stray amount → LIFECYCLE",
+        L.process_stripe_event(c64_conn, _stray)["outcome"] == "LIFECYCLE")
+    chk("…and the stray 4900 is not stored",
+        _amount_status(c64_conn, "evt_c64_stray_amount") == (None, "LIFECYCLE"),
+        str(_amount_status(c64_conn, "evt_c64_stray_amount")))
+
+    # An invoice with no amount is still dead-lettered: the exemption is for
+    #     subscriptions only, not a general relaxation.
+    _no_amt = _fixture("invoice.paid", "evt_c64_invoice_no_amount")
+    for _k in ("amount_paid", "amount_due", "amount"):
+        _no_amt["data"]["object"].pop(_k, None)
+    chk("invoice with no amount field → DLQ_INVALID, still",
+        L.process_stripe_event(c64_conn, _no_amt)["outcome"] == "DLQ_INVALID")
+
+    # Batch path: same rule, one transaction.
+    _batch = [_fixture(_t, f"evt_c64_batch_{_i}") for _i, _t in enumerate(_SUB_TYPES)]
+    _batch.append(_fixture("invoice.paid", "evt_c64_batch_inv"))
+    _res = L.process_stripe_event_batch(c64_conn, _batch)
+    chk("batch: three subscriptions + one invoice → LIFECYCLE ×3, POSTED",
+        [_x["outcome"] for _x in _res] == ["LIFECYCLE", "LIFECYCLE", "LIFECYCLE", "POSTED"],
+        str([_x["outcome"] for _x in _res]))
+    chk("batch: subscription rows carry no amount",
+        _q1(c64_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id LIKE 'evt_c64_batch_%%' "
+                      "AND amount_cents IS NULL") == 3)
+
+    # The database holds the same line on its own (migration 0007), so a future code
+    #     path that forgets the rule fails loudly instead of writing a phantom amount.
+    chk("constraint ledger_amount_matches_kind exists",
+        _q1(c64_conn, "SELECT COUNT(*) FROM pg_constraint "
+                      "WHERE conname = 'ledger_amount_matches_kind'") == 1)
+    for _label, _etype, _amt in (
+        ("a subscription row WITH an amount", "customer.subscription.created", 500),
+        ("an invoice row WITHOUT an amount",  "invoice.paid", None),
+    ):
+        _rejected = False
+        try:
+            with c64_conn.cursor() as _c:
+                _c.execute(
+                    "INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, "
+                    "amount_cents, currency, status, idempotency_key, payload) "
+                    "VALUES ('default', %s, %s, 'cus_c64', %s, 'usd', 'POSTED', 'k', '{}')",
+                    (f"evt_c64_chk_{_etype}", _etype, _amt))
+        except psycopg2.errors.CheckViolation:
+            _rejected = True
+        chk(f"database rejects {_label}", _rejected)
+
+    # The backlog. Before this fix every real subscription event was dead-lettered, so a
+    #     deployment that takes it holds DLQ entries an operator will replay. A replay
+    #     that writes the ledger row must also settle the entry; the two retry paths kept
+    #     their own literal list of settling outcomes, and LIFECYCLE was in neither.
+    def _seed_dlq(eid: str, max_retries: int) -> int:
+        with c64_conn.cursor() as _c:
+            _c.execute(
+                "INSERT INTO dlq (org_id, transaction_id, reason, raw_payload, received_at, "
+                "status, retry_count, max_retries) "
+                "VALUES ('default', %s, 'INVALID', %s, NOW(), 'pending', 0, %s) RETURNING id",
+                (eid, json.dumps(_fixture("customer.subscription.created", eid)), max_retries))
+            return _c.fetchone()[0]
+
+    _bid = _seed_dlq("evt_c64_backlog_batch", 3)
+    L.retry_dlq_batch(c64_conn)
+    chk("retry_dlq_batch: a pre-fix subscription entry is resolved on the first replay",
+        _q1(c64_conn, "SELECT status FROM dlq WHERE id=%s", (_bid,)) == "resolved",
+        str(_q1(c64_conn, "SELECT status, retry_count FROM dlq WHERE id=%s", (_bid,))))
+    chk("retry_dlq_batch: …and the event is in the ledger with no amount",
+        _amount_status(c64_conn, "evt_c64_backlog_batch") == (None, "LIFECYCLE"))
+
+    _mid = _seed_dlq("evt_c64_backlog_manual", 0)
+    original_pool_c64 = L._pool
+    L._pool = _MockPool(c64_conn)
+    try:
+        _c64_client = TestClient(L.app, raise_server_exceptions=False)
+        _r = _c64_client.post(f"/dlq/{_mid}/retry")
+        chk("POST /dlq/{id}/retry on a pre-fix subscription entry → LIFECYCLE",
+            _r.status_code == 200 and _r.json().get("outcome") == "LIFECYCLE",
+            f"{_r.status_code} {_r.text[:200]}")
+        chk("…and the entry is resolved, not left retrying against a written row",
+            _q1(c64_conn, "SELECT status FROM dlq WHERE id=%s", (_mid,)) == "resolved",
+            str(_q1(c64_conn, "SELECT status FROM dlq WHERE id=%s", (_mid,))))
+
+        # Through the signed HTTP path, raw bytes as Stripe sends them.
+        _SEC_C64 = "whsec_c64_signing_secret"
+        with c64_conn.cursor() as _c:
+            _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+                       ("c64", "c64", _SEC_C64))
+        for _t in _SUB_TYPES:
+            _body = json.dumps(_fixture(_t, f"evt_c64_http_{_t.rsplit('.', 1)[1]}"))
+            _ts = int(time.time())
+            _sig = __import__("hmac").new(_SEC_C64.encode(), f"{_ts}.{_body}".encode(),
+                                          hashlib.sha256).hexdigest()
+            _r = _c64_client.post("/webhook/stripe/c64", content=_body,
+                                  headers={"Content-Type": "application/json",
+                                           "Stripe-Signature": f"t={_ts},v1={_sig}"})
+            chk(f"signed {_t} over HTTP → 200 LIFECYCLE",
+                _r.status_code == 200 and _r.json().get("outcome") == "LIFECYCLE",
+                f"{_r.status_code} {_r.text[:200]}")
+
+        _sum = _c64_client.get("/ledger/summary").json()
+        chk("/ledger/summary counts LIFECYCLE rows as their own status",
+            _sum.get("ledger", {}).get("LIFECYCLE", 0) >= 3, str(_sum.get("ledger")))
+    finally:
+        L._pool = original_pool_c64
+finally:
+    c64_conn.close()
 
 
 # =============================================================================
