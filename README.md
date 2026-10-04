@@ -39,20 +39,28 @@ cp .env.example .env
 # starts without this file. Copy it anyway: it is where you change the values
 # marked *** CHANGE *** before anything is reachable from a network.
 
-# 2. Start PostgreSQL
-docker compose up -d postgres
+# 2. Start PostgreSQL and create the database the test suite runs on. The suite
+#    TRUNCATEs every tenant table, so it refuses (exit code 2) any database whose
+#    name does not end in _test or _bench — including `billing`, the one compose
+#    creates for the stack.
+docker compose up -d --wait postgres
+docker compose exec postgres createdb -U postgres billing_test
 
 # 3. Install Python dependencies
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. Apply migrations. Required before the suite: the row-level security policies
-#    and the restricted `billing_app` role exist only in migration 0006, and the
-#    tests that prove isolation connect as that role.
-alembic upgrade head
+# 4. Apply migrations to the test database. Required before the suite: the
+#    row-level security policies and the restricted `billing_app` role exist only in
+#    migration 0006, and the tests that prove isolation connect as that role.
+#    Set DATABASE_URL inline, not with export: an exported DATABASE_URL also reaches
+#    `docker compose up` and points the migrate container at localhost.
+#    (PowerShell: $env:DATABASE_URL="..."; alembic upgrade head; Remove-Item Env:DATABASE_URL)
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/billing_test alembic upgrade head
 
-# 5. Run the full test suite — 337 tests, live PostgreSQL, no mocks
+# 5. Run the full test suite — live PostgreSQL. With no DATABASE_URL set it uses
+#    billing_test on localhost:5432.
 python test_ledger.py
 
 # 6. Start the full stack (postgres + migrate + billing + worker + caddy)
@@ -275,6 +283,12 @@ Layer 5 — DLQ routing
 
 Every number below comes from `python benchmark.py`, which is in the repository. Run it
 yourself; do not quote these figures for your own hardware.
+
+The benchmark TRUNCATEs the ledger before every mode, so like the test suite it refuses
+any database whose name does not end in `_test` or `_bench`. Its default is
+`billing_bench`; create and migrate it the same way as `billing_test` in the Quick Start.
+In `--url` mode, start the server on that same database, or the reset lands on one
+database and the load on another.
 
 ```
 python benchmark.py --events 5000 --http-events 1500 --concurrency 16

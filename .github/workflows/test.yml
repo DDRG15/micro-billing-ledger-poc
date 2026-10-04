@@ -19,7 +19,11 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: billing
+          # A _test database, not `billing`: the suite TRUNCATEs every tenant table, so
+          #     disposable_db.py refuses any database whose name does not end in _test or
+          #     _bench. CI's database is throwaway either way; the name keeps the one
+          #     command the README documents identical here and on a laptop.
+          POSTGRES_DB: billing_test
         ports:
           - 5432:5432
         options: >-
@@ -49,18 +53,18 @@ jobs:
       #     production actually gets, rather than a parallel one maintained by hand.
       - name: Apply migrations
         env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/billing
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/billing_test
         run: alembic upgrade head
 
       - name: Run test suite
         env:
           # Owner: _bootstrap, fresh_conn and the truncations between sections.
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/billing
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/billing_test
           # The restricted role, as the service would connect. A15 and A16 use it to
           #     prove the policies bite and that every application query site carries a
           #     scope. The password is 0006's bootstrap placeholder — correct here,
           #     rotated in any real deployment (see .env.example).
-          APP_DATABASE_URL: postgresql://billing_app:billing_app@localhost:5432/billing
+          APP_DATABASE_URL: postgresql://billing_app:billing_app@localhost:5432/billing_test
           STRIPE_WEBHOOK_SECRET: whsec_ci_test_secret_not_for_production
           BILLING_API_KEY: ci_test_api_key_not_for_production
           WORKER_LOG_ONLY: "true"

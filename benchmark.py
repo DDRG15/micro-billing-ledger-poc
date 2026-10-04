@@ -51,7 +51,14 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-os.environ.setdefault("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/billing")
+import disposable_db  # noqa: E402
+
+# Every mode below TRUNCATEs ledger, outbox and dlq first — including --url, which resets
+#     the database at DATABASE_URL before driving the server. Refuse anything not declared
+#     disposable before ledger opens its pool. In --url mode, start the server on the same
+#     _bench database, or the reset lands on one database and the load on another.
+disposable_db.require_disposable_database(
+    "postgresql://postgres:postgres@localhost:5432/billing_bench")
 
 import ledger as L  # noqa: E402  — after DATABASE_URL, which it reads at import
 

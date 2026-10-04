@@ -30,6 +30,14 @@ from unittest.mock import patch
 #     This must happen before any print() call — so it's at the top of the file.
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
+# Refuse any database that is not disposable — before the TRUNCATE in
+#     _reset_org_registry below, and before `import ledger` opens its pool. The default
+#     used to be `billing`, the database `docker compose up` creates, so the documented
+#     way to run this file erased the local ledger. See disposable_db.py.
+import disposable_db  # noqa: E402
+_TEST_DSN = disposable_db.require_disposable_database(
+    "postgresql://postgres:postgres@localhost:5432/billing_test")
+
 # Import the ledger module directly — all tests call its functions and use
 #     its models. This is the module under test.
 # Reset the org registry BEFORE importing ledger. ledger computes _ANY_ORG_KEYS once at
@@ -40,10 +48,8 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 #     not a test suite.
 def _reset_org_registry() -> None:
     import psycopg2 as _pg
-    _dsn = __import__("os").environ.get(
-        "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/billing")
     try:
-        _c = _pg.connect(_dsn)
+        _c = _pg.connect(_TEST_DSN)
         _c.autocommit = True
         with _c.cursor() as _cur:
             _cur.execute("SELECT to_regclass('org')")
@@ -2171,8 +2177,14 @@ print("\n── A15: row-level security enforced by PostgreSQL ─────�
 
 import psycopg2 as _pg  # noqa: E402
 
-_APP_DSN = os.environ.get(
-    "APP_DATABASE_URL", "postgres://billing_app:billing_app@localhost:5432/billing")
+# Default: the restricted role on the SAME disposable database the owner connection was
+#     checked against. This used to hardcode .../billing, so a local run with only
+#     DATABASE_URL set wrote A15's rows into the real database as billing_app.
+from urllib.parse import urlsplit as _urlsplit  # noqa: E402
+_owner = _urlsplit(_TEST_DSN)
+_APP_DSN = os.environ.get("APP_DATABASE_URL", "").strip() or (
+    f"postgresql://billing_app:billing_app@{_owner.hostname or 'localhost'}:"
+    f"{_owner.port or 5432}{_owner.path}")
 
 rls_owner = fresh_conn()
 _rls_ready = _q1(rls_owner,
@@ -2756,6 +2768,63 @@ finally:
     L.BILLING_API_KEY = ""
     L._pool = original_pool_am
     auth_metrics_conn.close()
+
+
+# =============================================================================
+# C6-1: the suite and the benchmark refuse a database that is not disposable
+#     Both TRUNCATE ledger, outbox and dlq, and both used to default to `billing` — the
+#     database `docker compose up` creates — so following the README erased it. The
+#     scripts are run for real here, in a subprocess, against an address nothing listens
+#     on. A refusal exits 2. If the guard ever stops firing, the child instead crashes on
+#     connect and exits 1, so a missing guard cannot pass these checks by accident.
+# =============================================================================
+print("\n── C6-1: destructive tooling refuses a database that is not disposable ──")
+
+import subprocess  # noqa: E402
+
+chk("plain `billing` is not disposable",
+    disposable_db.refusal("postgresql://u:p@localhost:5432/billing") != "")
+chk("billing_test is disposable",
+    disposable_db.refusal("postgresql://u:p@localhost:5432/billing_test") == "")
+chk("billing_bench is disposable",
+    disposable_db.refusal("postgres://u:p@db:5432/billing_bench") == "")
+chk("a dbname= parameter cannot route a disposable-looking URI to a real database",
+    disposable_db.refusal("postgresql://u:p@localhost/billing_test?dbname=billing") != "")
+chk("a URI that names no database is refused",
+    disposable_db.refusal("postgresql://u:p@localhost:5432") != "")
+chk("a key=value DSN is refused rather than half-parsed",
+    disposable_db.refusal("host=localhost dbname=billing_test") != "")
+chk("the refusal never echoes the password",
+    "s3cret" not in disposable_db.refusal("postgresql://u:s3cret@localhost/billing"))
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_live_dsn  = "postgresql://nobody:s3cret@127.0.0.1:1/billing"        # port 1: nothing listens
+_throwaway = "postgresql://nobody:s3cret@127.0.0.1:1/billing_test"
+
+
+def _run_script(script: str, **env: str) -> "subprocess.CompletedProcess":
+    return subprocess.run(
+        [sys.executable, os.path.join(_here, script)],
+        env={**os.environ, "PYTHONIOENCODING": "utf-8", **env},
+        capture_output=True, text=True, encoding="utf-8", timeout=120, cwd=_here)
+
+
+for _script in ("test_ledger.py", "benchmark.py"):
+    _p = _run_script(_script, DATABASE_URL=_live_dsn, APP_DATABASE_URL="")
+    chk(f"{_script} refuses DATABASE_URL=.../billing with exit 2",
+        _p.returncode == disposable_db.GUARD_EXIT_CODE,
+        f"exit {_p.returncode}: {_p.stderr[-300:]}")
+    chk(f"{_script} names the database it refused",
+        "'billing'" in _p.stderr, _p.stderr[-300:])
+    chk(f"{_script} never prints the DSN's password",
+        "s3cret" not in _p.stderr + _p.stdout)
+
+# The restricted-role connection writes rows too, so it is checked on its own: an
+#     environment with the owner DSN fixed and APP_DATABASE_URL forgotten must still stop.
+_p = _run_script("test_ledger.py", DATABASE_URL=_throwaway, APP_DATABASE_URL=_live_dsn)
+chk("APP_DATABASE_URL on a real database is refused even when DATABASE_URL is disposable",
+    _p.returncode == disposable_db.GUARD_EXIT_CODE and "APP_DATABASE_URL" in _p.stderr,
+    f"exit {_p.returncode}: {_p.stderr[-300:]}")
 
 
 # =============================================================================
