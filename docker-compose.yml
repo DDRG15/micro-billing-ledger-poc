@@ -123,6 +123,16 @@ services:
       RATE_LIMIT_METRICS:      "${RATE_LIMIT_METRICS:-60/minute}"
       BILLING_API_KEY_FILE:      "${BILLING_API_KEY_FILE:-}"
       STRIPE_WEBHOOK_SECRET_FILE: "${STRIPE_WEBHOOK_SECRET_FILE:-}"
+      # The two declarations that let this process serve traffic on the demo values
+      #     above (ledger.py, _enforce_no_demo_credentials). Both are required: dev
+      #     declared, AND the public ingress bound to loopback. INGRESS_BIND_ADDR is the
+      #     same variable caddy's ports read below, so publishing the ingress beyond this
+      #     machine revokes dev mode in the same edit — the service then refuses to start
+      #     until every demo credential is replaced.
+      #     BILLING_ENV defaults to dev HERE so a fresh clone still starts with no .env.
+      #     Outside compose it defaults to unset, which is strict.
+      BILLING_ENV:             "${BILLING_ENV:-dev}"
+      INGRESS_BIND_ADDR:       "${INGRESS_BIND_ADDR:-127.0.0.1}"
     ports:
       # Exposed on localhost only for local development and tests.
       #     In production, traffic reaches billing through Caddy (port 443).
@@ -226,8 +236,13 @@ services:
       #     restart: unless-stopped then crash-loops it forever.
       CADDY_DOMAIN: "${CADDY_DOMAIN:-localhost}"
     ports:
-      - "80:80"
-      - "443:443"
+      # Loopback by default. These used to publish on 0.0.0.0 while every credential
+      #     above defaulted to a value printed in this repository, so the zero-setup path
+      #     and the internet-facing path were the same path. To serve a real domain, set
+      #     INGRESS_BIND_ADDR=0.0.0.0 in .env — the billing service reads the same
+      #     variable and refuses to start until the demo credentials are replaced.
+      - "${INGRESS_BIND_ADDR:-127.0.0.1}:80:80"
+      - "${INGRESS_BIND_ADDR:-127.0.0.1}:443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

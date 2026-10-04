@@ -30,6 +30,10 @@ RATE LIMITING
 
         RATE_LIMIT_WEBHOOK=100000/minute uvicorn ledger:app --port 8000
 
+    On the demo credentials the service refuses to start unless the run is declared
+    dev (BILLING_ENV=dev, see .env.example), and it must run on the same _bench
+    database this script resets.
+
     The script detects a 429 and tells you, rather than reporting a throughput number
     that is really just the limit.
 

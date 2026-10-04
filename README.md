@@ -69,8 +69,11 @@ docker compose up
 docker compose logs billing | grep -E "rls_enforced|rls_inert"
 
 # — OR — run the API standalone without the full stack. It connects as the owner
-#   unless APP_DATABASE_URL points at billing_app, and says so at startup.
-uvicorn ledger:app --port 8000
+#   unless APP_DATABASE_URL points at billing_app, and says so at startup. On the
+#   demo credentials it refuses to start unless the run is declared dev; the check
+#   reads INGRESS_BIND_ADDR (default 127.0.0.1), not uvicorn's --host, so keep
+#   uvicorn on its default loopback bind when you declare dev.
+BILLING_ENV=dev uvicorn ledger:app --port 8000
 
 # 7. Teardown — stop containers and remove volumes
 docker compose down          # keeps pgdata volume (data survives)

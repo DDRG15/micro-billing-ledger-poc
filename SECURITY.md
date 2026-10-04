@@ -124,11 +124,31 @@ encryption at rest beyond whatever PostgreSQL is configured to provide. No GDPR/
 erasure path; the ledger is deliberately append-only and resolving that conflict needs a
 retention policy decided first, not code.
 
-**Dev defaults are dev defaults.** `.env.example` ships working placeholder values so
-the stack starts on a clean clone. Every one marked `*** CHANGE ***` must be replaced
-before anything is reachable from a network. `BILLING_API_KEY` left empty disables
-authentication on the operational endpoints entirely; the application logs a warning at
-startup when that happens, and that warning is not decorative.
+**Dev defaults are dev defaults, and the service enforces it.** `.env.example` ships
+working placeholder values so the stack starts on a clean clone. Every one of them is a
+working credential to anyone who has read this repository: the placeholder signing secret
+verifies signatures, so anyone can forge webhooks into the default tenant; the default
+API key opens the operational endpoints; migration 0006's `billing_app` password opens
+the database.
+
+The billing service therefore refuses to start while it would serve traffic on any of
+them — a placeholder, empty or non-`whsec_` signing secret (in the environment or on any
+active org row), the default API key, an API key under 32 characters, no API key at all,
+or the `billing_app` bootstrap password — unless two declarations both hold:
+
+- `BILLING_ENV=dev` — the operator declared a development run. Unset means strict.
+- `INGRESS_BIND_ADDR` is a loopback address — docker-compose publishes Caddy's ports on
+  this address, and passes the same value to the service. Publishing the ingress beyond
+  the machine revokes dev mode in the same edit.
+
+docker-compose defaults `BILLING_ENV` to `dev` and the ingress to `127.0.0.1`, so a fresh
+clone starts and nothing beyond the machine can reach it. The refusal names each
+offending setting, never its value (`docker compose logs billing | grep demo_credentials`).
+
+Known limit: the check reads `INGRESS_BIND_ADDR`, not the address uvicorn itself binds.
+Run outside compose, `BILLING_ENV=dev uvicorn ledger:app --host 0.0.0.0` passes it and
+serves the demo credentials to the network. Declaring dev is a statement the operator
+makes; the service cannot see every way a port can be published.
 
 ## Secrets and rotation
 

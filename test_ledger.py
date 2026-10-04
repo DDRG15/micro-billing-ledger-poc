@@ -2913,6 +2913,129 @@ finally:
 
 
 # =============================================================================
+# C6-3: demo credentials cannot serve traffic outside a declared, loopback-only dev run
+#     Every default in docker-compose.yml was a working credential — the placeholder
+#     signing secret VERIFIED signatures (the code comment claimed it rejected them), the
+#     default API key opened the ops endpoints — and the same file published Caddy on
+#     0.0.0.0. The rules are tested one at a time through the pure function, then the
+#     whole decision end to end through the application lifespan, which is where uvicorn
+#     runs it before accepting a connection.
+# =============================================================================
+print("\n── C6-3: demo credentials refused outside a loopback dev run ───────────")
+
+_STRONG_SECRET = "whsec_" + "a" * 32
+_STRONG_KEY    = "k" * 40
+_STRONG_DSN    = "postgresql://billing_app:" + "p" * 32 + "@db:5432/billing"
+
+
+def _problems(**over):
+    args = dict(webhook_secret=_STRONG_SECRET, api_key=_STRONG_KEY, app_dsn=_STRONG_DSN,
+                any_org_keys=False, placeholder_orgs=[])
+    args.update(over)
+    return L._demo_credential_problems(**args)
+
+
+chk("loopback: 127.0.0.1", L._is_loopback("127.0.0.1"))
+chk("loopback: ::1 and [::1]", L._is_loopback("::1") and L._is_loopback("[::1]"))
+chk("loopback: localhost", L._is_loopback("localhost"))
+chk("not loopback: 0.0.0.0", not L._is_loopback("0.0.0.0"))
+chk("not loopback: a LAN address", not L._is_loopback("192.168.1.20"))
+chk("not loopback: empty or a hostname", not L._is_loopback("") and not L._is_loopback("example.com"))
+
+chk("dev + loopback allows demo credentials", L._demo_credentials_allowed("dev", "127.0.0.1"))
+chk("unset BILLING_ENV does not", not L._demo_credentials_allowed("", "127.0.0.1"))
+chk("production does not", not L._demo_credentials_allowed("production", "127.0.0.1"))
+chk("dev with a published ingress does not", not L._demo_credentials_allowed("dev", "0.0.0.0"))
+
+chk("strong credentials raise nothing", _problems() == [], str(_problems()))
+chk("placeholder signing secret is a problem",
+    any("STRIPE_WEBHOOK_SECRET" in p for p in _problems(webhook_secret=L._PLACEHOLDER_SECRET)))
+chk("empty signing secret is a problem", _problems(webhook_secret="") != [])
+chk("a non-whsec_ signing secret is a problem", _problems(webhook_secret="x" * 40) != [])
+chk("placeholder left in the org registry is a problem, naming the org",
+    any("acme" in p for p in _problems(placeholder_orgs=["acme"])))
+chk("no API key anywhere is a problem", _problems(api_key="") != [])
+chk("no BILLING_API_KEY is fine once tenants hold keys",
+    _problems(api_key="", any_org_keys=True) == [])
+chk("the published default API key is a problem",
+    _problems(api_key="dev_key_change_in_production") != [])
+chk("a short API key is a problem", _problems(api_key="short") != [])
+chk("billing_app's bootstrap password is a problem",
+    _problems(app_dsn="postgresql://billing_app:billing_app@db/billing") != [])
+# The short key is a canary, not a word: a key of "short" matched "shorter than 32
+#     characters" in the reason itself, and the check failed on English, not on a leak.
+_CANARY_KEY = "Kq7_canary_9Zx"
+chk("no reason ever echoes a credential",
+    all(v not in " ".join(_problems(webhook_secret=L._PLACEHOLDER_SECRET, api_key=_CANARY_KEY))
+        for v in (L._PLACEHOLDER_SECRET, _CANARY_KEY)))
+
+# The registry read, against the real table. Inactive orgs are excluded: their secret
+#     cannot verify anything, because _org_webhook_secret refuses them first.
+c63_conn = fresh_conn()
+with c63_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("UPDATE org SET stripe_webhook_secret = %s WHERE org_id = 'default'",
+              (_STRONG_SECRET,))
+    c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret, active) VALUES "
+              "('c63_live', 'c63', %s, TRUE), ('c63_gone', 'c63', %s, FALSE), "
+              "('c63_ok', 'c63', %s, TRUE)",
+              (L._PLACEHOLDER_SECRET, L._PLACEHOLDER_SECRET, _STRONG_SECRET))
+    c.execute("COMMIT")
+chk("registry scan finds the active org on the placeholder, and only it",
+    L._orgs_with_placeholder_secret(c63_conn) == ["c63_live"],
+    str(L._orgs_with_placeholder_secret(c63_conn)))
+
+# End to end through the lifespan. `with TestClient(app)` runs startup exactly as
+#     uvicorn does; a raise there is uvicorn's "Application startup failed. Exiting."
+_saved_c63 = {k: getattr(L, k) for k in ("BILLING_ENV", "INGRESS_BIND_ADDR", "STRIPE_WEBHOOK_SECRET",
+                                         "BILLING_API_KEY", "APP_DATABASE_URL", "_ANY_ORG_KEYS", "_pool")}
+L._pool = _MockPool(c63_conn)
+
+
+def _starts() -> str:
+    """'started' if the app came up, else the refusal text."""
+    try:
+        with TestClient(L.app) as _c:
+            return "started" if _c.get("/health").status_code == 200 else "unhealthy"
+    except RuntimeError as exc:
+        return str(exc)
+
+
+try:
+    L.STRIPE_WEBHOOK_SECRET = L._PLACEHOLDER_SECRET
+    L.BILLING_API_KEY = "dev_key_change_in_production"
+    L.APP_DATABASE_URL = _STRONG_DSN
+    L._ANY_ORG_KEYS = False
+
+    L.BILLING_ENV, L.INGRESS_BIND_ADDR = "", "127.0.0.1"
+    _out = _starts()
+    chk("demo credentials with BILLING_ENV unset → refuses to start",
+        _out.startswith("refusing to start"), _out[:200])
+    chk("the refusal names what to fix", "STRIPE_WEBHOOK_SECRET" in _out and "c63_live" in _out,
+        _out[:300])
+
+    L.BILLING_ENV, L.INGRESS_BIND_ADDR = "dev", "0.0.0.0"
+    _out = _starts()
+    chk("demo credentials, dev, ingress published on 0.0.0.0 → refuses to start",
+        _out.startswith("refusing to start"), _out[:200])
+
+    L.BILLING_ENV, L.INGRESS_BIND_ADDR = "dev", "127.0.0.1"
+    chk("demo credentials, dev, loopback ingress → starts", _starts() == "started")
+
+    with c63_conn.cursor() as c:
+        c.execute("UPDATE org SET stripe_webhook_secret = %s WHERE org_id = 'c63_live'",
+                  (_STRONG_SECRET,))
+    L.STRIPE_WEBHOOK_SECRET, L.BILLING_API_KEY = _STRONG_SECRET, _STRONG_KEY
+    L.BILLING_ENV, L.INGRESS_BIND_ADDR = "", "0.0.0.0"
+    _out = _starts()
+    chk("real credentials, strict, published ingress → starts", _out == "started", _out[:200])
+finally:
+    for _k, _v in _saved_c63.items():
+        setattr(L, _k, _v)
+    c63_conn.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

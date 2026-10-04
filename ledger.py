@@ -34,6 +34,7 @@ Usage:
 import argparse       # CLI argument parsing for --silent/--events flags
 import hashlib        # SHA-256 fingerprints of live secrets and API-key lookups
 import hmac           # compare_digest for constant-time API key comparison
+import ipaddress      # is the public ingress bound to loopback? (_is_loopback)
 import json           # JSON serialization for raw payload archiving
 import logging        # Structured log output to file and stderr
 from logging.handlers import RotatingFileHandler  # Rotating file handler — caps log file size to prevent disk fill
@@ -45,7 +46,7 @@ import psycopg2       # PostgreSQL driver — production-grade relational storag
 from datetime import datetime, timezone  # Timezone-aware timestamps for TIMESTAMPTZ columns — financial audit trail requires tz
 from psycopg2.extras import execute_values  # Bulk INSERT — collapses N round trips to ceil(N/page_size)
 from psycopg2.pool import ThreadedConnectionPool  # Thread-safe connection pool — replaces single module-level connection
-from contextlib import contextmanager  # @contextmanager for _tx() BEGIN/COMMIT wrapper
+from contextlib import asynccontextmanager, contextmanager  # app lifespan; _tx() BEGIN/COMMIT wrapper
 from typing import Generator, Optional  # Type hints for static analysis
 from enum import Enum  # Enums for EventType, LedgerStatus, DLQReason — prevents raw string drift
 
@@ -640,22 +641,26 @@ def _secret_fingerprint(secret: str) -> str:
 # Stripe webhook signing secret — sourced from environment or a mounted file, never hardcoded.
 #     Get from: Stripe Dashboard → Developers → Webhooks → your endpoint → Signing secret
 #     Format: whsec_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-#     Without this set to a real value, stripe.Webhook.construct_event() will reject
-#     ALL incoming requests with 400. Set it before receiving live Stripe traffic.
 STRIPE_WEBHOOK_SECRET: str = _read_secret("STRIPE_WEBHOOK_SECRET", "whsec_YOUR_SECRET_HERE")
 
-# Guard against placeholder secret reaching production. The default value
-#     "whsec_YOUR_SECRET_HERE" is not a valid Stripe signing secret. If the env var
-#     was never set, every incoming webhook would pass signature verification because
-#     stripe.Webhook.construct_event() would compare against this literal string —
-#     silently accepting ALL unsigned requests. Fail hard at startup instead.
+# The default above is published in this repository, and it is a perfectly valid HMAC
+#     key: construct_event() verifies against whatever string it is handed. A process
+#     running on it does not reject webhooks — it ACCEPTS any webhook signed with this
+#     string, which anyone who has read this file can produce. Earlier versions of this
+#     comment said the opposite ("will reject ALL incoming requests", "fail hard at
+#     startup"), the warning repeated it, and the code only warned.
+#
+#     The warning below fires in every process that imports this module. The refusal to
+#     SERVE traffic on it lives in _enforce_no_demo_credentials(), which runs at
+#     application startup — see BILLING_ENV and INGRESS_BIND_ADDR below.
 _PLACEHOLDER_SECRET = "whsec_YOUR_SECRET_HERE"
 if STRIPE_WEBHOOK_SECRET == _PLACEHOLDER_SECRET:
     import warnings
     warnings.warn(
-        "STRIPE_WEBHOOK_SECRET is the placeholder value. "
-        "Set it to your real Stripe signing secret before receiving live traffic. "
-        "Webhook signature verification will reject all incoming requests until this is set.",
+        "STRIPE_WEBHOOK_SECRET is the placeholder published in this repository. Signatures "
+        "made with it VERIFY, so anyone can forge events into the default org. Development "
+        "only: unless BILLING_ENV=dev and the ingress is bound to loopback, the service "
+        "refuses to start on it.",
         stacklevel=1,
     )
 
@@ -675,6 +680,79 @@ if not BILLING_API_KEY:
         "are UNAUTHENTICATED. Dev mode only. Set a strong key (openssl rand -hex 32) "
         "before any network-reachable deployment."
     )
+
+# May this process serve traffic on credentials published in this repository?
+#
+#     Every default above is a working credential: the placeholder signing secret verifies
+#     signatures, `dev_key_change_in_production` opens the ops endpoints, and migration
+#     0006's `billing_app` password opens the database. docker-compose supplies them so a
+#     clone runs with no setup, and the same file used to publish Caddy on 0.0.0.0:80/443 —
+#     so the zero-setup path and the exposed path were the same path. The docs said to
+#     change them first. Nothing made anyone.
+#
+#     Two declarations, both required to allow it:
+#       BILLING_ENV=dev           the operator says this is a development run. Unset means
+#                                 NOT dev: a deployment that forgets to say what it is gets
+#                                 the strict behaviour, not the permissive one.
+#       INGRESS_BIND_ADDR         where docker-compose binds Caddy's host ports. Compose
+#                                 passes the same value here, so publishing the ingress
+#                                 beyond loopback revokes dev mode without a second edit.
+#     Anything else refuses to start — see _enforce_no_demo_credentials().
+BILLING_ENV: str = os.environ.get("BILLING_ENV", "").strip().lower()
+INGRESS_BIND_ADDR: str = os.environ.get("INGRESS_BIND_ADDR", "127.0.0.1").strip()
+
+# Values that ship as defaults in docker-compose.yml or .env.example. Length alone does
+#     not catch these: a published 40-character key is no more secret than a short one.
+_DEMO_API_KEYS = frozenset({"dev_key_change_in_production"})
+_MIN_API_KEY_LENGTH = 32  # openssl rand -hex 16 is the floor; the docs ask for -hex 32
+
+
+def _is_loopback(addr: str) -> bool:
+    """True if a bind address is reachable from this host only."""
+    addr = addr.strip().strip("[]").lower()
+    if addr == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return False  # empty, a hostname, garbage: none of them is provably local
+
+
+def _demo_credentials_allowed(env: str, bind_addr: str) -> bool:
+    """Dev mode needs BOTH a declared dev run and an ingress nothing else can reach."""
+    return env.strip().lower() == "dev" and _is_loopback(bind_addr)
+
+
+def _demo_credential_problems(webhook_secret: str, api_key: str, app_dsn: str,
+                              any_org_keys: bool, placeholder_orgs: list) -> list:
+    """Every credential this process would serve traffic with that is not a secret.
+
+    Pure: the caller supplies the values, so each rule is testable on its own. Returns
+    human-readable reasons, never the values themselves.
+    """
+    problems = []
+    if webhook_secret == _PLACEHOLDER_SECRET:
+        problems.append("STRIPE_WEBHOOK_SECRET is the placeholder published in this repository")
+    elif not webhook_secret.startswith("whsec_"):
+        # Empty included: HMAC with an empty key is as forgeable as a published one.
+        problems.append("STRIPE_WEBHOOK_SECRET is not a Stripe signing secret (whsec_...)")
+    if placeholder_orgs:
+        # The secret that verifies a webhook is the org registry's, not the env var's.
+        #     Migration 0004 seeds the default org with the placeholder and provision.py
+        #     overwrites it — so a deploy that migrates without provisioning still
+        #     verifies the legacy route against the published string.
+        problems.append("org registry still holds the placeholder signing secret for: "
+                        + ", ".join(placeholder_orgs))
+    if not api_key and not any_org_keys:
+        problems.append("no API key is configured anywhere, so /ledger/summary, /dlq/* "
+                        "and /metrics are unauthenticated")
+    elif api_key in _DEMO_API_KEYS:
+        problems.append("BILLING_API_KEY is the default published in this repository")
+    elif api_key and len(api_key) < _MIN_API_KEY_LENGTH:
+        problems.append(f"BILLING_API_KEY is shorter than {_MIN_API_KEY_LENGTH} characters")
+    if _dsn_password(app_dsn) == _PLACEHOLDER_APP_DB_PASSWORD:
+        problems.append("APP_DATABASE_URL uses the bootstrap password migration 0006 publishes")
+    return problems
 
 # Which secrets this process actually came up with. An operator can compare these against
 #     `sha256(value)` computed locally to confirm a rotation landed, without either value
@@ -1576,7 +1654,15 @@ def process_stripe_event_batch(
 #     lives in process_stripe_event() — framework-agnostic and independently testable.
 # ===========================================================================
 
-app = FastAPI(title="Micro-Billing-Ledger PoC", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Startup checks that must pass before the first request. Resolved at call time:
+    _enforce_no_demo_credentials needs the pool, which is built further down."""
+    _enforce_no_demo_credentials()
+    yield
+
+
+app = FastAPI(title="Micro-Billing-Ledger PoC", version="1.0.0", lifespan=_lifespan)
 
 # Rate limiter — keyed by client IP. Prevents a single caller from exhausting
 #     the connection pool (maxconn=20) or flooding the DLQ table.
@@ -1856,6 +1942,59 @@ _log.info(
     extra={"event": "tenancy_mode", "multi_tenant": _ANY_ORG_KEYS,
            "default_org": DEFAULT_ORG_ID},
 )
+
+
+def _orgs_with_placeholder_secret(conn: "psycopg2.extensions.connection") -> list:
+    """Active orgs whose signing secret is the published placeholder or empty.
+
+    Inactive orgs are left out on purpose: _org_webhook_secret() refuses them, so a
+    placeholder on one cannot verify anything. Unscoped for the same reason as
+    _any_org_keys — `org` carries no RLS policy and billing_app may read it.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT org_id FROM org WHERE active "
+            "AND (stripe_webhook_secret = %s OR stripe_webhook_secret = '') ORDER BY org_id",
+            (_PLACEHOLDER_SECRET,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def _enforce_no_demo_credentials() -> None:
+    """Refuse to serve traffic on published credentials, unless this is declared dev.
+
+    Runs from the application lifespan, not at import: worker.py and the test suite
+    import this module too, and neither serves HTTP — the worker has no use for an API
+    key, so refusing it one would stop the wrong process. uvicorn runs the lifespan
+    before it accepts a connection, and a raise here makes it exit ("Application startup
+    failed"), so an exposed deployment on demo values never answers a single request.
+    """
+    conn = _pool.getconn()
+    try:
+        placeholder_orgs = _orgs_with_placeholder_secret(conn)
+    finally:
+        _pool.putconn(conn)
+    problems = _demo_credential_problems(STRIPE_WEBHOOK_SECRET, BILLING_API_KEY,
+                                         APP_DATABASE_URL, _ANY_ORG_KEYS, placeholder_orgs)
+    if not problems:
+        return
+    if _demo_credentials_allowed(BILLING_ENV, INGRESS_BIND_ADDR):
+        _log.warning(
+            "running on demo credentials (BILLING_ENV=dev, ingress on %s): %s",
+            INGRESS_BIND_ADDR, "; ".join(problems),
+            extra={"event": "demo_credentials_in_use", "problems": problems},
+        )
+        return
+    _log.critical(
+        "refusing to serve traffic on demo credentials: %s", "; ".join(problems),
+        extra={"event": "demo_credentials_refused", "problems": problems,
+               "billing_env": BILLING_ENV or "unset", "ingress_bind_addr": INGRESS_BIND_ADDR},
+    )
+    raise RuntimeError(
+        "refusing to start: " + "; ".join(problems) + ". Set real secrets (see "
+        ".env.example), or declare a local run with BILLING_ENV=dev and INGRESS_BIND_ADDR "
+        "on a loopback address."
+    )
 
 
 def _lookup_org_by_key(conn: "psycopg2.extensions.connection", api_key: str) -> Optional[str]:
