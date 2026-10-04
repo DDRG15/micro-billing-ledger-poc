@@ -358,11 +358,14 @@ class StripeEvent(BaseModel):
         Stripe sometimes sends the key in request.idempotency_key; when absent,
         the event ID itself is the correct idempotency token.
         """
+        # `or`, not .get()'s default. Stripe sends the key PRESENT and null on every event
+        #     no API request caused — renewals, automatic retries, its own subscription
+        #     handling: "request": {"id": null, "idempotency_key": null}. .get(k, default)
+        #     falls back only when the key is absent, so it returned None, LedgerEntry
+        #     rejected that outside the ValidationError handler, and Stripe got a 500 for
+        #     exactly the recurring events a billing ledger exists to record.
         if self.idempotency_key is None:
-            if self.request is None:
-                self.idempotency_key = self.id
-            else:
-                self.idempotency_key = self.request.get("idempotency_key", self.id)
+            self.idempotency_key = (self.request or {}).get("idempotency_key") or self.id
         return self
 
     @model_validator(mode='after')
@@ -1948,7 +1951,11 @@ class StripeWebhookPayload(BaseModel):
     id:      str  = Field(..., description="Stripe event id")
     type:    str  = Field(..., description="Event type")
     data:    dict = Field(default_factory=dict)
-    request: dict = Field(default_factory=dict)
+    # Optional, because Stripe documents it as nullable. `dict` with a default only covers
+    #     an ABSENT key; an explicit null failed validation here, before the signature
+    #     check and before anything could reach the DLQ — a 422 Stripe retries for three
+    #     days and that no counter in this service records.
+    request: Optional[dict] = None
 
 
 def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str) -> JSONResponse:

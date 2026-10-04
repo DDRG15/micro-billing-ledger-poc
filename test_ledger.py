@@ -2828,6 +2828,91 @@ chk("APP_DATABASE_URL on a real database is refused even when DATABASE_URL is di
 
 
 # =============================================================================
+# C6-2: the request shapes Stripe sends for events no API call caused
+#     Stripe documents Event.request as nullable, and an automatic event — a renewal,
+#     a scheduled payment retry, Stripe's own subscription handling — arrives as
+#     "request": {"id": null, "idempotency_key": null}. The first shape was a 422 before
+#     the signature check; the second a 500 after it. Neither reached the ledger or the
+#     DLQ, and Stripe retried each one for three days. Signed for real, not patched: the
+#     500 came from a code path a stubbed construct_event would still reach, but the 422
+#     came from body parsing, and only a genuine request shows both.
+# =============================================================================
+print("\n── C6-2: automatic Stripe events (null request, null idempotency key) ──")
+
+c62_conn = fresh_conn()
+_SEC_C62 = "whsec_c62_signing_secret"
+with c62_conn.cursor() as c:
+    c.execute("BEGIN")
+    c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+              ("c62", "c62", _SEC_C62))
+    c.execute("COMMIT")
+
+original_pool_c62 = L._pool
+L._pool = _MockPool(c62_conn)
+# raise_server_exceptions=False: the failure this section guards against was an unhandled
+#     exception. The default client re-raises it into the test instead of returning the 500
+#     Stripe actually received, and the check would report a crash rather than a status.
+c62_client = TestClient(L.app, raise_server_exceptions=False)
+
+
+def _post_c62(event: dict):
+    _body, _hdrs = _signed(event, _SEC_C62)
+    return c62_client.post("/webhook/stripe/c62", content=_body, headers=_hdrs)
+
+
+def _stored_key(eid: str):
+    return _q1(c62_conn, "SELECT idempotency_key FROM ledger "
+                         "WHERE org_id = 'c62' AND transaction_id = %s", (eid,))
+
+
+try:
+    _ev_null_req = fake_event(eid="evt_c62_null_request", include_request=False)
+    _ev_null_req["request"] = None
+    _r = _post_c62(_ev_null_req)
+    chk("request: null → 200, not 422", _r.status_code == 200,
+        f"got {_r.status_code}: {_r.text[:200]}")
+    chk("request: null → POSTED",
+        _r.status_code == 200 and _r.json().get("outcome") == "POSTED", _r.text[:200])
+    chk("request: null → keyed by the event id",
+        _stored_key("evt_c62_null_request") == "evt_c62_null_request")
+
+    _ev_auto = fake_event(eid="evt_c62_automatic", include_request=False)
+    _ev_auto["request"] = {"id": None, "idempotency_key": None}
+    _r = _post_c62(_ev_auto)
+    chk("request.idempotency_key: null → 200, not 500", _r.status_code == 200,
+        f"got {_r.status_code}: {_r.text[:200]}")
+    chk("request.idempotency_key: null → POSTED",
+        _r.status_code == 200 and _r.json().get("outcome") == "POSTED", _r.text[:200])
+    chk("request.idempotency_key: null → keyed by the event id",
+        _stored_key("evt_c62_automatic") == "evt_c62_automatic")
+
+    # The fallback is for a MISSING key only. One Stripe did send is still the one stored.
+    _r = _post_c62(fake_event(eid="evt_c62_keyed"))
+    chk("a non-null idempotency key is still the one stored",
+        _r.status_code == 200 and _stored_key("evt_c62_keyed") == "idem_evt_c62_keyed",
+        f"got {_r.status_code}, stored {_stored_key('evt_c62_keyed')!r}")
+
+    # Redelivery of an automatic event is still a duplicate, not a second row. The
+    #     ledger key is the event id either way; this proves the new path did not loosen it.
+    _r = _post_c62(_ev_auto)
+    chk("redelivered automatic event → DLQ_DUPLICATE",
+        _r.status_code == 200 and _r.json().get("outcome") == "DLQ_DUPLICATE", _r.text[:200])
+    chk("redelivery left exactly one ledger row",
+        _q1(c62_conn, "SELECT COUNT(*) FROM ledger "
+                      "WHERE org_id = 'c62' AND transaction_id = 'evt_c62_automatic'") == 1)
+
+    # Function level, the path /dlq/{id}/retry replays through: same rule, no HTTP model.
+    _fn = L.process_stripe_event(
+        c62_conn, {**fake_event(eid="evt_c62_fn", include_request=False),
+                   "request": {"id": None, "idempotency_key": None}}, org_id="c62")
+    chk("process_stripe_event accepts a null idempotency key",
+        _fn.get("outcome") == "POSTED", str(_fn))
+finally:
+    L._pool = original_pool_c62
+    c62_conn.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
