@@ -8,7 +8,7 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 337 / 337 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 463 / 463 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
 **Throughput:** 4,143 TPS batch · 112 TPS over HTTP at 16 concurrent clients (p50 112ms) · 24 TPS per-event · all reproducible via `python benchmark.py`, measured against the restricted role the service actually deploys as
 
 ---
@@ -576,7 +576,7 @@ scrape_configs:
 ## Test Coverage
 
 ```
-337 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+463 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -622,11 +622,25 @@ A0         Amount extract — per-event-type field priority; unknown amount → 
 A1 / A2    DLQ integrity  — retry appends no rows; 'resolved' terminal (409); 'exhausted' replayable
 A3         Claim recovery — stale claim reclaimed, live claim not stolen, batch not aborted
 M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), prune_dlq retention
+C6-1       Disposable DB  — suite and benchmark refuse any database not named *_test / *_bench
+                            (exit 2, before connecting; dbname= overrides and key=value DSNs too)
+C6-2       Automatic events — request: null and idempotency_key: null → stored, keyed by event id
+C6-3       Demo credentials — refused at startup unless BILLING_ENV=dev AND a loopback ingress
+C6-4       Subscriptions  — Stripe's documented objects (fixtures/stripe/) ledgered as LIFECYCLE
+                            with no amount; DB constraint; pre-fix DLQ entries settle on replay
+C6-5       Full payload   — ledger, outbox and DLQ hold every field Stripe sent
+C6-6       DLQ outage     — invalid event whose DLQ write fails → 503 (real lock, no mocks)
+C6-7       Two workers    — a second replica drains while the first holds its batch
+C6-8       Refused rows   — an event the database refuses (> 50 000 chars) → DLQ, not 500
+C6-9       RLS truth      — superuser / BYPASSRLS / a table without RLS all read as inert;
+                            provision.py rotates billing_app from APP_DATABASE_URL
 ```
 
 **Mutation-verified.** A passing suite proves nothing until you watch it fail. Seventeen deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, letting `dlq_depth` count resolved rows again, reverting the pool to `minconn=1`, quietly changing a rate-limit default, making each `_tx` accept its tenant scope and silently never apply it, dropping the `/metrics` render lock, and dropping the pool's `autocommit` — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch. The two scope mutants reproduced the state row-level security shipped in before it was in force: policies present, nothing enforced — the API's raised `new row violates row-level security policy`, the worker's silently drained zero rows.
 
 Writing a mutation test is itself easy to get wrong in a way that looks like success. The first `/metrics` reproduction keyed its interleaving on a thread name, and FastAPI dispatches synchronous handlers to an anyio worker thread — so the instrumentation never fired, the leak never reproduced, and the run reported "no leak observed". A18 asserted that the interleave actually happened, because a concurrency test that silently stops being concurrent is worse than no test. Cycle 6 retired that check with the property it guarded: `/metrics` became operator-only, so no tenant reads those gauges any more.
+
+Cycle 6 added fourteen more, one or more per fix, and each reproduced the defect it guards against rather than failing somewhere else: the suite's guard skipped (exit 1 instead of 2), `request: dict` restored (422 back), the idempotency `.get` default restored (500 back), dev mode forced on (six refusal checks), five ways of undoing the subscription change — one of them caught by the database constraint alone — the four-field payload restored, a DLQ write result ignored (200 back), the candidate-step lock removed (second worker "got 0" back), the refused-row handler removed (500 back), and the BYPASSRLS check removed (`"enforced": true` for a role that bypasses every policy).
 
 **Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
 
