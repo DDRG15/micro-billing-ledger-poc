@@ -96,12 +96,18 @@ def chk(name: str, cond: bool, detail: str = "") -> None:
 
 def _q1(conn, sql: str, params: tuple = ()) -> object:
     """
-    Execute a query and return the first column of the first row.
-    Used for COUNT(*) and similar single-value reads.
+    Execute a query and return the first column of the first row, or None if there is
+    no row. Used for COUNT(*) and similar single-value reads.
+
+    None rather than an exception: a check whose row is missing must FAIL, not abort the
+    run. `fetchone()[0]` raised TypeError there, so one regression (mutating C6-2's
+    `request: Optional` made its row absent) killed the process mid-suite and every
+    section after it reported nothing.
     """
     with conn.cursor() as cur:
         cur.execute(sql, params)
-        return cur.fetchone()[0]
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 def _qall(conn, sql: str, params: tuple = ()) -> list:
