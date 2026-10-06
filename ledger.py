@@ -1095,7 +1095,14 @@ def process_stripe_event(
                 reason=DLQReason.INVALID,
                 raw_payload=event,
             )
-            _write_dlq(conn, dlq_entry)
+            if not _write_dlq(conn, dlq_entry):
+                # The DLQ row is the only place this event would exist: it failed
+                #     validation, so the ledger never saw it. Answering 200 tells Stripe to
+                #     stop delivering an event nothing recorded, and the log line
+                #     _write_dlq left lives in a container file nothing mounts. Raising
+                #     makes the handler answer 503, so Stripe redelivers once the database
+                #     is back.
+                raise RuntimeError(f"DLQ write failed for invalid event {transaction_id}")
         else:
             # A replay that still fails validation is worth surfacing, but as a log
             #     line rather than another row: the entry being retried already holds
@@ -1195,6 +1202,9 @@ def process_stripe_event(
                 reason=DLQReason.DUPLICATE,
                 raw_payload=event,
             )
+            # A lost DUPLICATE row costs an audit line, not an event: the ledger already
+            #     holds this one. So a failed write stays log-only and the answer stays 200 —
+            #     a 503 here would only make Stripe redeliver what is already recorded.
             _write_dlq(conn, dlq_entry)
         return {
             "outcome":        "DLQ_DUPLICATE",
@@ -1210,14 +1220,19 @@ def process_stripe_event(
     }
 
 
-def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
+def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> bool:
     """
-    Best-effort DLQ append. Deliberately never raises — the main processing
-    path must not die because the DLQ is unavailable. If the DB write fails
-    (disk full, locked, corrupt), the full raw payload is logged at ERROR level
-    to both stderr and billing_ledger.log. An operator can grep the log file
-    for "DLQ write failed", extract the raw_payload JSON, and replay manually.
-    This is the "zero data loss" guarantee: if the DB can't save it, the log can.
+    Append a DLQ row. Returns True if it was written, False if it was not. Never raises:
+    whether a lost DLQ row is fatal depends on what else holds the event, and only the
+    caller knows that.
+
+    On failure the full raw payload is logged at ERROR ("DLQ write failed"), to stderr
+    and billing_ledger.log. That log is a last resort, not a guarantee: in the compose
+    deployment the file lives inside the container and nothing mounts it, so recreating
+    the container deletes it. This function used to call itself the "zero data loss"
+    guarantee and return nothing, so an invalid event whose DLQ write failed still got
+    HTTP 200 — Stripe stopped delivering an event that existed only in that file.
+    process_stripe_event now turns False into a 503 for exactly that case.
     """
     try:
         # entry.org_id, not a caller-supplied scope: the row being written is the only
@@ -1231,6 +1246,7 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 entry.to_db(),
             )
+        return True
     except Exception as exc:
         # DO NOT re-raise. The hot path must not fail because the DLQ is down.
         #     Log at ERROR so monitoring alerts fire. Include full raw_payload so
@@ -1243,6 +1259,7 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> None:
             exc,
             json.dumps(entry.raw_payload),
         )
+        return False
 
 
 # Exponential backoff delays (seconds) for retry attempts 1, 2, 3+
@@ -2177,8 +2194,10 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
             #     not byte-for-byte (whitespace and escaping are re-rendered).
             result = process_stripe_event(conn, json.loads(raw_body), org_id=org_id)
         except RuntimeError as exc:
-            # A DB-level failure. 503 tells Stripe to back off and retry, which is correct
-            #     for a transient error; 200 would say "got it" when we did not.
+            # A DB-level failure — including a DLQ row that could not be written for an
+            #     invalid event (see process_stripe_event). 503 tells Stripe to retry,
+            #     which is correct for a transient error; 200 would say "got it" when
+            #     nothing kept it.
             _WEBHOOK_EVENTS.labels("DB_ERROR").inc()
             raise HTTPException(status_code=503, detail=str(exc))
     finally:

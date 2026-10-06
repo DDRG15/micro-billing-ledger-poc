@@ -520,7 +520,7 @@ events as `INVALID` entries. Replay them with `POST /dlq/{id}/retry`; each settl
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/webhook/stripe` | Ingest for the default tenant. Always 200 for valid JSON; 503 on DB failure (correct Stripe retry protocol). |
+| `POST` | `/webhook/stripe` | Ingest for the default tenant. 200 for valid JSON, including duplicates and invalid events once they are in the DLQ; 503 on DB failure, and for an invalid event whose DLQ row could not be written (correct Stripe retry protocol). |
 | `POST` | `/webhook/stripe/{org_id}` | Per-tenant ingest. Signature verified with that tenant's secret, so the path cannot be used to write into another tenant. Unknown org returns the same 400 as a bad signature — no enumeration. |
 | `GET` | `/health` | Liveness check |
 | `GET` | `/ledger/summary` | Row counts by status, DLQ depth, outbox pending count |
@@ -565,7 +565,7 @@ scrape_configs:
 
 ---
 
-**DLQ Operationalization** — `GET /dlq/entries` is the ops interface for triage. Every rejected event lands in the DLQ with its `raw_payload` holding every field Stripe sent — never corrected, never truncated (re-serialized, so not byte-for-byte). In fintech, a rejected payment event without a recoverable audit trail is a compliance gap, not a logging inconvenience. An operator retrieves entries, inspects the reason code, fixes the upstream issue, and replays the original payload.
+**DLQ Operationalization** — `GET /dlq/entries` is the ops interface for triage. Every rejected event lands in the DLQ with its `raw_payload` holding every field Stripe sent — never corrected, never truncated (re-serialized, so not byte-for-byte). If that DLQ write itself fails, the webhook answers 503 instead of 200, so Stripe redelivers an event nothing has recorded yet. In fintech, a rejected payment event without a recoverable audit trail is a compliance gap, not a logging inconvenience. An operator retrieves entries, inspects the reason code, fixes the upstream issue, and replays the original payload.
 
 ---
 

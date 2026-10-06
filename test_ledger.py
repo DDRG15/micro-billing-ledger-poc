@@ -3288,6 +3288,66 @@ finally:
 
 
 # =============================================================================
+# C6-6: an invalid event the DLQ could not record is not acknowledged (item 3)
+#     _write_dlq swallowed every error and process_stripe_event returned DLQ_INVALID
+#     anyway, so the webhook answered 200 and Stripe stopped delivering an event that
+#     existed only in a log file the container does not persist. The failure below is
+#     real, not mocked: a second session holds an exclusive lock on dlq, and the
+#     request's connection gives up after one second (statement_timeout).
+# =============================================================================
+print("\n── C6-6: a failed DLQ write turns 200 into 503 for an invalid event ───")
+
+c66_conn = fresh_conn()
+_SEC_C66 = "whsec_c66_signing_secret"
+with c66_conn.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+               ("c66", "c66", _SEC_C66))
+original_pool_c66 = L._pool
+L._pool = _MockPool(c66_conn)
+_locker = psycopg2.connect(_TEST_DSN)
+try:
+    _c66_client = TestClient(L.app, raise_server_exceptions=False)
+    _paid = _fixture("invoice.paid", "evt_c66_paid")
+    _bad = _fixture("invoice.paid", "evt_c66_invalid")
+    _bad["data"]["object"]["customer"] = "not_a_customer"
+
+    _r = _post_raw(_c66_client, "/webhook/stripe/c66", json.dumps(_paid), _SEC_C66)
+    chk("setup: first delivery of a valid event → POSTED",
+        _r.status_code == 200 and _r.json().get("outcome") == "POSTED", _r.text[:200])
+
+    with c66_conn.cursor() as _c:
+        _c.execute("SET statement_timeout = '1s'")
+    with _locker.cursor() as _lc:
+        _lc.execute("LOCK TABLE dlq IN ACCESS EXCLUSIVE MODE")   # held until rollback
+    try:
+        _r = _post_raw(_c66_client, "/webhook/stripe/c66", json.dumps(_bad), _SEC_C66)
+        chk("invalid event whose DLQ write failed → 503, not 200",
+            _r.status_code == 503, f"{_r.status_code} {_r.text[:200]}")
+        _r = _post_raw(_c66_client, "/webhook/stripe/c66", json.dumps(_paid), _SEC_C66)
+        chk("duplicate whose DLQ audit row failed → still 200 (the ledger holds the event)",
+            _r.status_code == 200 and _r.json().get("outcome") == "DLQ_DUPLICATE",
+            f"{_r.status_code} {_r.text[:200]}")
+    finally:
+        _locker.rollback()
+        with c66_conn.cursor() as _c:
+            _c.execute("SET statement_timeout = 0")
+
+    chk("nothing was recorded for the invalid event while the DLQ was down",
+        _q1(c66_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_c66_invalid'") == 0)
+    # Stripe redelivers after a 503. With the database back, the same delivery lands.
+    _r = _post_raw(_c66_client, "/webhook/stripe/c66", json.dumps(_bad), _SEC_C66)
+    chk("redelivery after recovery → 200 DLQ_INVALID",
+        _r.status_code == 200 and _r.json().get("outcome") == "DLQ_INVALID", _r.text[:200])
+    chk("…and the DLQ now holds the full event",
+        _stored_json(c66_conn, "SELECT raw_payload FROM dlq WHERE org_id='c66' "
+                               "AND transaction_id=%s", ("evt_c66_invalid",)) == _bad)
+finally:
+    L._pool = original_pool_c66
+    _locker.close()
+    c66_conn.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
