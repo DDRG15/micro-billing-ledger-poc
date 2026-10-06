@@ -2133,6 +2133,37 @@ def _require_api_key(x_api_key: str = Header(default="")) -> str:
     raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+def _require_operator_key(x_api_key: str = Header(default="")) -> None:
+    """FastAPI dependency for /metrics: the operator's key, never a tenant's.
+
+    /metrics renders process-wide state — webhook and HTTP counters summed over every
+    tenant, and billing_secrets_info, a fingerprint of the operator's own secrets — so
+    it cannot be scoped to a caller. It used to accept any key _require_api_key
+    accepted: every tenant read every other tenant's traffic volume and the operator's
+    secret fingerprints. The operator credential is BILLING_API_KEY. A tenant key gets
+    403 (authenticated, not authorised); no key, or a wrong one, gets 401.
+
+    Dev mode (no key configured anywhere) stays open, like every ops endpoint. A
+    deployment where tenants hold keys but BILLING_API_KEY is empty has no operator
+    credential, so /metrics answers 403 to everyone until one is set.
+    """
+    if not BILLING_API_KEY and not _ANY_ORG_KEYS:
+        return  # dev mode — the startup warning already says the endpoints are open
+    if not x_api_key:
+        raise HTTPException(status_code=401, detail="X-Api-Key header required")
+    if BILLING_API_KEY and hmac.compare_digest(x_api_key, BILLING_API_KEY):
+        return
+    if _ANY_ORG_KEYS:
+        conn = _pool.getconn()
+        try:
+            is_tenant = _lookup_org_by_key(conn, x_api_key) is not None
+        finally:
+            _pool.putconn(conn)
+        if is_tenant:
+            raise HTTPException(status_code=403, detail="/metrics requires the operator key")
+    raise HTTPException(status_code=401, detail="Invalid API key")
+
+
 class StripeWebhookPayload(BaseModel):
     """
     FastAPI request body model for the webhook endpoint. This is a minimal
@@ -2297,33 +2328,36 @@ def ledger_summary(request: Request, org_id: str = Depends(_require_api_key)) ->
 
 @app.get("/metrics")
 @_limiter.limit(RATE_LIMIT_METRICS)
-def metrics(request: Request, org_id: str = Depends(_require_api_key)) -> Response:
+def metrics(request: Request, _operator: None = Depends(_require_operator_key)) -> Response:
     """
-    Prometheus exposition endpoint.
+    Prometheus exposition endpoint, for the operator (see _require_operator_key).
 
-    Requires X-Api-Key for the same reason /ledger/summary does: it publishes
-    dlq_depth and outbox_pending, the same operational figures, and leaving one door
-    open while locking the other is not a security boundary. Point Prometheus at it
-    with an authorization header in the scrape config:
+    Point Prometheus at it with a custom header. `authorization:` does NOT work here:
+    Prometheus sends it as `Authorization: <type> <credentials>`, and this service
+    reads X-Api-Key, so the example this docstring used to give got a 401 on every
+    scrape. `http_headers` sends an arbitrary header:
 
         scrape_configs:
           - job_name: billing
-            authorization: {type: X-Api-Key, credentials_file: /etc/prom/billing.key}
+            http_headers:
+              X-Api-Key:
+                files: [/etc/prom/billing.key]
 
     The two queue gauges are read from the database on each scrape rather than kept
     in memory. The worker drains the outbox and prunes the DLQ from a different
     process, so any in-memory count would silently diverge from the tables it claims
     to describe — and a queue depth that is confidently wrong is worse than absent.
     """
+    # Operator-wide: every tenant's backlog. A per-tenant view is /ledger/summary.
     conn = _pool.getconn()
     try:
-        with _tx(conn, org_id) as cur:
+        with _tx(conn, ALL_ORGS) as cur:
             cur.execute(
                 "SELECT COUNT(*) FILTER (WHERE status IN ('pending','retrying','exhausted')), "
-                "       COUNT(*) FROM dlq WHERE org_id=%s", (org_id,)
+                "       COUNT(*) FROM dlq"
             )
             _actionable, _total = cur.fetchone()
-            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0 AND org_id=%s", (org_id,))
+            cur.execute("SELECT COUNT(*) FROM outbox WHERE dispatched=0")
             _pending = cur.fetchone()[0]
     finally:
         _pool.putconn(conn)
@@ -2345,10 +2379,10 @@ def metrics(request: Request, org_id: str = Depends(_require_api_key)) -> Respon
     #     series in the registry, so each tenant would then read every other tenant's
     #     depth from its own response — the same leak, made deterministic.
     #
-    #     What this does not address: the process-wide counters (webhook_events_total,
-    #     http_requests_total) are still aggregate across tenants. That is a modelling
-    #     question — whether /metrics is an operator endpoint or a tenant one — and it
-    #     belongs with the admin credential, not to a lock.
+    #     The modelling question this comment used to leave open — operator endpoint or
+    #     tenant one — is settled: operator (_require_operator_key). The gauges are now
+    #     operator-wide, so the race the lock prevents can no longer cross tenants; the
+    #     lock stays because two scrapes still share these process-wide objects.
     with _METRICS_RENDER_LOCK:
         _DLQ_DEPTH.set(_actionable)
         _DLQ_TOTAL.set(_total)

@@ -110,10 +110,12 @@ Fixed by making set-and-render atomic, and covered by a test that forces the int
 It is worth stating plainly because the failure mode generalises: a database-enforced
 boundary says nothing about what happens after the rows are read.
 
-Two limits remain on that endpoint, both deliberate. `webhook_events_total` and
-`http_requests_total` are still aggregate across tenants — whether `/metrics` is an
-operator endpoint or a tenant one is a modelling decision, not a patch. And `rls_inert`
-is a log line and a CI gate, not an alert: a deployment that quietly drops
+The modelling question that left open — operator endpoint or tenant one — is settled:
+`/metrics` answers only the operator key (`BILLING_API_KEY`); a tenant key gets 403. Its
+counters were always aggregate across tenants, and `billing_secrets_info` fingerprints the
+operator's secrets, so a tenant view would be a separate endpoint with its own
+registry, not a filter on this one. One limit remains, deliberately: `rls_inert` is a
+log line and a CI gate, not an alert: a deployment that quietly drops
 `APP_DATABASE_URL` reverts isolation to the application's own predicates, and nothing
 pages anyone. Grep for it after any deploy that touches database configuration.
 

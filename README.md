@@ -526,7 +526,7 @@ events as `INVALID` entries. Replay them with `POST /dlq/{id}/retry`; each settl
 | `GET` | `/ledger/summary` | Row counts by status, DLQ depth, outbox pending count |
 | `GET` | `/dlq/entries?limit=N` | Inspect DLQ, newest first. Default 50, capped at 1,000. |
 | `POST` | `/dlq/{id}/retry` | Replay one entry. `409` if already `resolved` — the ledger holds it, so there is nothing to replay. `exhausted` stays replayable. |
-| `GET` | `/metrics` | Prometheus exposition. Requires `X-Api-Key`. |
+| `GET` | `/metrics` | Prometheus exposition, operator only: `BILLING_API_KEY` → 200, a tenant key → 403. |
 
 ---
 
@@ -555,12 +555,16 @@ Secrets can also be supplied as files via `BILLING_API_KEY_FILE` and `STRIPE_WEB
 
 Publishing a hash is safe for a high-entropy secret and not for a guessable one; see [SECURITY.md](SECURITY.md).
 
-`/metrics` requires `X-Api-Key` because it publishes the same operational figures as `/ledger/summary`; locking one door and leaving the other open is not a boundary. Scrape config:
+`/metrics` is the operator's endpoint: it answers only `BILLING_API_KEY`. Its counters are summed over every tenant and `billing_secrets_info` fingerprints the operator's own secrets, so no tenant view of it exists — a tenant key gets `403`, no key or an unknown one `401`. The queue gauges cover every tenant; a tenant's own figures are `/ledger/summary`. With tenants holding keys and `BILLING_API_KEY` empty there is no operator credential, and `/metrics` answers `403` to everyone until one is set.
+
+The header is `X-Api-Key`, which Prometheus's `authorization:` block cannot send (it sends `Authorization: <type> <credentials>`, so the example this section used to show got `401` on every scrape). Use `http_headers` — check that your Prometheus version's configuration reference lists it:
 
 ```yaml
 scrape_configs:
   - job_name: billing
-    authorization: {type: X-Api-Key, credentials_file: /etc/prom/billing.key}
+    http_headers:
+      X-Api-Key:
+        files: [/etc/prom/billing.key]
 ```
 
 ---
@@ -610,10 +614,10 @@ A15 / A16  Row-level security — connected as the RESTRICTED role, because runn
 A17        Deploy-time rows — a rotated STRIPE_WEBHOOK_SECRET still reaches the default
                             tenant's registry row, other tenants stay untouched, and the
                             role that serves traffic cannot rewrite the registry
-A18        /metrics isolation — two tenants scraping concurrently each get their OWN
-                            queue depth. Drives the real connection pool rather than the
-                            test double, so the pool the application actually builds is
-                            covered at all
+A18        /metrics is operator-only — tenant keys get 403 and no exposition, the
+                            operator sees every tenant's backlog. Drives the real
+                            connection pool rather than the test double, so the pool the
+                            application actually builds is covered at all
 A0         Amount extract — per-event-type field priority; unknown amount → DLQ, never $0
 A1 / A2    DLQ integrity  — retry appends no rows; 'resolved' terminal (409); 'exhausted' replayable
 A3         Claim recovery — stale claim reclaimed, live claim not stolen, batch not aborted
@@ -622,7 +626,7 @@ M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), p
 
 **Mutation-verified.** A passing suite proves nothing until you watch it fail. Seventeen deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, letting `dlq_depth` count resolved rows again, reverting the pool to `minconn=1`, quietly changing a rate-limit default, making each `_tx` accept its tenant scope and silently never apply it, dropping the `/metrics` render lock, and dropping the pool's `autocommit` — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch. The two scope mutants reproduced the state row-level security shipped in before it was in force: policies present, nothing enforced — the API's raised `new row violates row-level security policy`, the worker's silently drained zero rows.
 
-Writing a mutation test is itself easy to get wrong in a way that looks like success. The first `/metrics` reproduction keyed its interleaving on a thread name, and FastAPI dispatches synchronous handlers to an anyio worker thread — so the instrumentation never fired, the leak never reproduced, and the run reported "no leak observed". A18 asserts that the interleave actually happened, because a concurrency test that silently stops being concurrent is worse than no test.
+Writing a mutation test is itself easy to get wrong in a way that looks like success. The first `/metrics` reproduction keyed its interleaving on a thread name, and FastAPI dispatches synchronous handlers to an anyio worker thread — so the instrumentation never fired, the leak never reproduced, and the run reported "no leak observed". A18 asserted that the interleave actually happened, because a concurrency test that silently stops being concurrent is worse than no test. Cycle 6 retired that check with the property it guarded: `/metrics` became operator-only, so no tenant reads those gauges any more.
 
 **Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
 

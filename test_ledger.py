@@ -1883,8 +1883,11 @@ try:
     chk("tenant A can retry its own entry",
         iso_client.post(f"/dlq/{_a_dlq_id}/retry", headers=_hA).status_code == 200)
 
-    _ma = iso_client.get("/metrics", headers=_hA).text
-    chk("metrics are scoped to the caller's org", "dlq_total 1.0" in _ma, "expected A's own total")
+    # /metrics is the operator's (item 7): a tenant key is authenticated but not
+    #     authorised, so the answer is 403, and nothing of the exposition comes back.
+    _ma = iso_client.get("/metrics", headers=_hA)
+    chk("a tenant key cannot read /metrics (operator endpoint) → 403",
+        _ma.status_code == 403 and "dlq_total" not in _ma.text, f"{_ma.status_code}")
 finally:
     L._pool, L.BILLING_API_KEY, L._ANY_ORG_KEYS = original_pool_iso, original_key_iso, original_any_iso
     # Leave no credentials behind: they would flip the NEXT process into enforced auth.
@@ -2380,8 +2383,21 @@ if app_conn is not None:
         _eq = app_client.get("/dlq/entries", headers=_hQ).json()["entries"]
         chk("/dlq/entries answers under RLS, one row each",
             len(_ep) == 1 and len(_eq) == 1, f"P={len(_ep)} Q={len(_eq)}")
-        chk("/metrics answers under RLS",
-            app_client.get("/metrics", headers=_hP).status_code == 200)
+        chk("/metrics refuses a tenant key under RLS too (403)",
+            app_client.get("/metrics", headers=_hP).status_code == 403)
+        # The operator read spans tenants (ALL_ORGS). Under RLS that only works if the
+        #     policy honours the all-orgs scope for billing_app; a default-deny miss
+        #     would report 0 here, not an error.
+        _orig_key_rlsm = L.BILLING_API_KEY
+        L.BILLING_API_KEY = "operator_key_for_rls_metrics_check_0123"
+        try:
+            _mo = app_client.get("/metrics", headers={"X-Api-Key": L.BILLING_API_KEY})
+            chk("/metrics answers the operator under RLS, across both tenants",
+                _mo.status_code == 200 and "dlq_total 2.0" in _mo.text,
+                f"{_mo.status_code} " + " ".join(
+                    _ln for _ln in _mo.text.splitlines() if _ln.startswith("dlq_total")))
+        finally:
+            L.BILLING_API_KEY = _orig_key_rlsm
 
         # ── the write endpoint, and the cross-tenant refusal ──────────────────
         chk("Q cannot retry P's DLQ entry",
@@ -2485,21 +2501,21 @@ prov_conn.close()
 
 
 # =============================================================================
-# A18: /metrics DOES NOT SERVE ONE TENANT'S NUMBERS TO ANOTHER
-# The SQL behind /metrics is correctly scoped by org_id and always was. The leak was one
-#     line later: dlq_depth, dlq_total and outbox_pending are PROCESS-WIDE Gauge objects,
-#     and generate_latest() renders whatever they hold at render time rather than what
-#     the current request computed. Two tenants scraping at once interleave, and a tenant
-#     asking for its own figures is served somebody else's — operational data about
-#     another tenant, through an endpoint whose own docstring calls it scoped.
-#
-#     Row-level security cannot reach this: the database answered correctly every time.
-#     A9/A10 asserted the scoping of the query, and A16 asserted only that /metrics
-#     returns 200 — which is why it survived both.
+# A18: /metrics IS NOT A CROSS-TENANT READ
+# History: the SQL behind /metrics was scoped by org_id, but the gauges are process-wide
+#     objects and generate_latest() renders whatever they hold, so two tenants scraping at
+#     once could be served each other's dlq_depth. A lock made set-then-render atomic.
+#     That fixed the gauges and left the rest: webhook and HTTP counters summed over every
+#     tenant, and billing_secrets_info — the operator's secret fingerprints — in every
+#     tenant's response.
+# Item 7 (Cycle 6) settles the model instead: /metrics is the operator's endpoint. A
+#     tenant key gets 403 and none of the exposition; the operator key gets every tenant's
+#     backlog. The forced-interleave check that lived here is gone with the property it
+#     guarded: no tenant reads these gauges any more, so there is nothing to interleave.
 #
 # This section also exercises the REAL ThreadedConnectionPool. Every other TestClient in
 #     this suite substitutes _MockPool, so the pool the application actually constructs at
-#     import — and its connection settings — had no coverage at all.
+#     import — and its connection settings — would otherwise have no coverage at all.
 # =============================================================================
 print("\n── A18: /metrics is not a cross-tenant read ────────────────────────────")
 
@@ -2510,6 +2526,7 @@ chk("the real pool hands out autocommit connections",
 
 met_owner = fresh_conn()
 _KEY_M, _KEY_N = "key_metrics_m_value", "key_metrics_n_value"
+_KEY_OP = "key_metrics_operator_value_0123456789"
 _DEPTH_M, _DEPTH_N = 2, 9
 with met_owner.cursor() as c:
     c.execute("BEGIN")
@@ -2524,8 +2541,8 @@ with met_owner.cursor() as c:
                       (_o, f"evt_met_{_o}_{_i}"))
     c.execute("COMMIT")
 
-original_any_met = L._ANY_ORG_KEYS
-L._ANY_ORG_KEYS = True
+original_any_met, original_key_met = L._ANY_ORG_KEYS, L.BILLING_API_KEY
+L._ANY_ORG_KEYS, L.BILLING_API_KEY = True, _KEY_OP
 met_client = TestClient(L.app)      # NO _MockPool — this drives the real pool on purpose
 
 
@@ -2537,54 +2554,28 @@ def _depth_line(text: str) -> str:
 
 
 try:
-    _rm = met_client.get("/metrics", headers={"X-Api-Key": _KEY_M}).text
-    _rn = met_client.get("/metrics", headers={"X-Api-Key": _KEY_N}).text
-    chk("sequential scrapes report each tenant's own depth",
-        _depth_line(_rm) == f"{float(_DEPTH_M)}" and _depth_line(_rn) == f"{float(_DEPTH_N)}",
-        f"M={_depth_line(_rm)} N={_depth_line(_rn)}")
+    for _label, _k in (("M", _KEY_M), ("N", _KEY_N)):
+        _r = met_client.get("/metrics", headers={"X-Api-Key": _k})
+        chk(f"tenant {_label}'s key → 403 on /metrics",
+            _r.status_code == 403, f"got {_r.status_code}")
+        chk(f"tenant {_label} receives no exposition at all (no depth, no secret fingerprints)",
+            "dlq_depth" not in _r.text and "billing_secrets" not in _r.text, _r.text[:120])
+    chk("no key → 401", met_client.get("/metrics").status_code == 401)
+    chk("an unknown key → 401, not 403 (it authenticates nobody)",
+        met_client.get("/metrics", headers={"X-Api-Key": "nobody_holds_this"}).status_code == 401)
 
-    # Force the interleave deterministically: park the FIRST scrape between reading its
-    #     own numbers and rendering, then let the other tenant's scrape complete. Keyed on
-    #     call order rather than thread name — FastAPI dispatches sync handlers to an
-    #     anyio worker, so a thread-name check silently never fires and the test passes
-    #     while proving nothing.
-    _real_gen = L.generate_latest
-    _gate_in, _gate_out = threading.Event(), threading.Event()
-    _first = {"pending": True}
-
-    def _gen_parked(*args, **kwargs):
-        if _first["pending"]:
-            _first["pending"] = False
-            _gate_in.set()
-            _gate_out.wait(15)
-        return _real_gen(*args, **kwargs)
-
-    L.generate_latest = _gen_parked
-    _out = {}
-
-    def _scrape_m():
-        _out["M"] = met_client.get("/metrics", headers={"X-Api-Key": _KEY_M}).text
-
-    _tm = threading.Thread(target=_scrape_m)
-    _tm.start()
-    _fired = _gate_in.wait(15)
-    if _fired:
-        _out["N"] = met_client.get("/metrics", headers={"X-Api-Key": _KEY_N}).text
-    _gate_out.set()
-    _tm.join(20)
-    L.generate_latest = _real_gen
-
-    chk("the interleave actually happened (else this section proves nothing)", _fired,
-        "generate_latest was never intercepted")
-    chk("a concurrent scrape does not overwrite the caller's dlq_depth",
-        _depth_line(_out.get("M", "")) == f"{float(_DEPTH_M)}",
-        f"tenant M (depth {_DEPTH_M}) was served {_depth_line(_out.get('M', ''))} — "
-        f"tenant N's depth is {_DEPTH_N}")
-    chk("the other tenant still sees its own depth",
-        _depth_line(_out.get("N", "")) == f"{float(_DEPTH_N)}",
-        f"got {_depth_line(_out.get('N', ''))}")
+    _ro = met_client.get("/metrics", headers={"X-Api-Key": _KEY_OP})
+    chk("the operator key → 200", _ro.status_code == 200, f"got {_ro.status_code}")
+    chk("the operator sees every tenant's backlog",
+        _depth_line(_ro.text) == f"{float(_DEPTH_M + _DEPTH_N)}",
+        f"dlq_depth={_depth_line(_ro.text)}, expected {_DEPTH_M + _DEPTH_N}")
+    chk("billing_secrets_info is still exposed — to the operator",
+        "billing_secrets_info" in _ro.text)
+    chk("/ledger/summary stays per-tenant for a tenant key",
+        met_client.get("/ledger/summary", headers={"X-Api-Key": _KEY_M}).json().get("dlq_depth")
+        == _DEPTH_M)
 finally:
-    L._ANY_ORG_KEYS = original_any_met
+    L._ANY_ORG_KEYS, L.BILLING_API_KEY = original_any_met, original_key_met
     with met_owner.cursor() as c:
         c.execute("BEGIN")
         c.execute("TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY")
