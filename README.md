@@ -254,7 +254,7 @@ Verified end to end, not just traced: two containers with distinct addresses hit
 
 ## 5-Layer Validation Stack
 
-Every Stripe webhook passes through all five layers before touching the database. Any failure routes to DLQ — the raw payload is always preserved byte-perfect.
+Every Stripe webhook passes through all five layers before touching the database. Any failure routes to DLQ with every field of the event Stripe sent — re-serialized, so complete but not byte-for-byte.
 
 ```
 Layer 1 — Pydantic type coercion
@@ -565,7 +565,7 @@ scrape_configs:
 
 ---
 
-**DLQ Operationalization** — `GET /dlq/entries` is the ops interface for triage. Every rejected event lands in the DLQ with its `raw_payload` preserved byte-perfect — never corrected, never truncated. In fintech, a rejected payment event without a recoverable audit trail is a compliance gap, not a logging inconvenience. An operator retrieves entries, inspects the reason code, fixes the upstream issue, and replays the original payload.
+**DLQ Operationalization** — `GET /dlq/entries` is the ops interface for triage. Every rejected event lands in the DLQ with its `raw_payload` holding every field Stripe sent — never corrected, never truncated (re-serialized, so not byte-for-byte). In fintech, a rejected payment event without a recoverable audit trail is a compliance gap, not a logging inconvenience. An operator retrieves entries, inspects the reason code, fixes the upstream issue, and replays the original payload.
 
 ---
 

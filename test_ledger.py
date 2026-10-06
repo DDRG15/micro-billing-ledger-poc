@@ -3226,6 +3226,68 @@ finally:
 
 
 # =============================================================================
+# C6-5: the stored payload is the event Stripe signed, every field of it (item 5c)
+#     The webhook handler passed payload.model_dump() to the ledger: a four-field model
+#     that drops everything else, so created, livemode, api_version, object and
+#     pending_webhooks never reached the ledger, the outbox or the DLQ — while the docs
+#     said the raw payload was preserved byte-perfect.
+# =============================================================================
+print("\n── C6-5: every field Stripe sent reaches the ledger, outbox and DLQ ────")
+
+import hmac  # noqa: E402
+
+
+def _post_raw(client, path: str, body: str, secret: str):
+    """POST `body` exactly as given, signed the way Stripe signs: HMAC over '<ts>.<body>'."""
+    _ts = int(time.time())
+    _sig = hmac.new(secret.encode(), f"{_ts}.{body}".encode(), hashlib.sha256).hexdigest()
+    return client.post(path, content=body, headers={"Content-Type": "application/json",
+                                                    "Stripe-Signature": f"t={_ts},v1={_sig}"})
+
+
+def _stored_json(conn, sql: str, params: tuple) -> dict:
+    _v = _q1(conn, sql, params)
+    return json.loads(_v) if _v else {}
+
+
+c65_conn = fresh_conn()
+_SEC_C65 = "whsec_c65_signing_secret"
+with c65_conn.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+               ("c65", "c65", _SEC_C65))
+original_pool_c65 = L._pool
+L._pool = _MockPool(c65_conn)
+try:
+    _c65_client = TestClient(L.app, raise_server_exceptions=False)
+    _ev = _fixture("invoice.paid", "evt_c65_full")
+    _r = _post_raw(_c65_client, "/webhook/stripe/c65", json.dumps(_ev), _SEC_C65)
+    chk("signed real invoice.paid → 200 POSTED",
+        _r.status_code == 200 and _r.json().get("outcome") == "POSTED", f"{_r.status_code} {_r.text[:200]}")
+
+    _led = _stored_json(c65_conn, "SELECT payload FROM ledger WHERE org_id='c65' "
+                                  "AND transaction_id=%s", ("evt_c65_full",))
+    _env = ("created", "livemode", "api_version", "object", "pending_webhooks")
+    chk("ledger payload keeps the envelope fields the HTTP model never declared",
+        all(_k in _led for _k in _env), str([_k for _k in _env if _k not in _led]))
+    chk("ledger payload equals the event as sent", _led == _ev)
+    chk("outbox payload — what downstream receives — equals the event as sent",
+        _stored_json(c65_conn, "SELECT payload FROM outbox WHERE org_id='c65' "
+                               "AND transaction_id=%s", ("evt_c65_full",)) == _ev)
+
+    _bad = _fixture("invoice.paid", "evt_c65_invalid")
+    _bad["data"]["object"]["customer"] = "not_a_customer"
+    _r = _post_raw(_c65_client, "/webhook/stripe/c65", json.dumps(_bad), _SEC_C65)
+    chk("invalid event over HTTP → 200 DLQ_INVALID",
+        _r.status_code == 200 and _r.json().get("outcome") == "DLQ_INVALID", f"{_r.status_code} {_r.text[:200]}")
+    chk("DLQ raw_payload equals the event as sent, so a replay sees what Stripe sent",
+        _stored_json(c65_conn, "SELECT raw_payload FROM dlq WHERE org_id='c65' "
+                               "AND transaction_id=%s", ("evt_c65_invalid",)) == _bad)
+finally:
+    L._pool = original_pool_c65
+    c65_conn.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

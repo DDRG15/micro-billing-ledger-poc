@@ -486,7 +486,7 @@ class DLQStatus(str, Enum):
 class DLQEntry(BaseModel):
     """
     A typed Dead-Letter Queue record. Every invalid or duplicate event creates
-    one of these. The raw_payload is always preserved byte-perfect — never
+    one of these. The raw_payload holds every field of the event as received — never
     corrected, never truncated. Humans review DLQ entries; the system never
     assumes a DLQ entry is unimportant.
     to_db() serializes to a tuple matching the dlq table column order exactly.
@@ -901,7 +901,8 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         """)
 
         # dlq — every rejected event lands here with a structured reason code.
-        #     raw_payload is the full original JSON, preserved byte-perfect for replay.
+        #     raw_payload is the full event JSON as received (every field; re-serialized,
+        #     so not byte-for-byte), kept for replay.
         #     status/retry columns added in Phase 11 — ADD COLUMN IF NOT EXISTS is
         #     idempotent for databases that already existed before Phase 11.
         cur.execute("""
@@ -2166,7 +2167,15 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
             raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
 
         try:
-            result = process_stripe_event(conn, payload.model_dump(), org_id=org_id)
+            # The body Stripe signed, parsed — not payload.model_dump(). The HTTP model
+            #     declares four fields and drops every other one, so `created`, `livemode`,
+            #     `api_version`, `object` and `pending_webhooks` never reached the ledger,
+            #     the outbox or the DLQ, while the docs said the raw payload was preserved.
+            #     The signature was verified over these exact bytes, and FastAPI has
+            #     already parsed them as a JSON object to build `payload`, so this cannot
+            #     fail where that succeeded. Stored via json.dumps: every field, though
+            #     not byte-for-byte (whitespace and escaping are re-rendered).
+            result = process_stripe_event(conn, json.loads(raw_body), org_id=org_id)
         except RuntimeError as exc:
             # A DB-level failure. 503 tells Stripe to back off and retry, which is correct
             #     for a transient error; 200 would say "got it" when we did not.
