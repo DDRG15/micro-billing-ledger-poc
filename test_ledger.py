@@ -3339,6 +3339,57 @@ finally:
 
 
 # =============================================================================
+# C6-7: a second worker replica drains in parallel (item 6c)
+#     The candidate CTEs took no lock; only the outer SELECT had SKIP LOCKED. A second
+#     worker therefore computed the same window and the same picked ids as the first,
+#     skipped all of them, and returned 0. Two real connections here: worker A is held
+#     mid-batch inside its transaction while worker B drains.
+# =============================================================================
+print("\n── C6-7: a second worker drains while the first holds its batch ────────")
+
+c67_a = fresh_conn()
+c67_b = psycopg2.connect(_TEST_DSN)
+c67_b.autocommit = True                 # _tx issues its own BEGIN
+L.process_stripe_event_batch(c67_a, [fake_event(eid=f"evt_c67_{_i:03d}") for _i in range(120)])
+_orig_dispatch_67, _orig_batch_67 = W._dispatch_row, W.WORKER_BATCH_SIZE
+W.WORKER_BATCH_SIZE = 5                 # window = 50 rows; the backlog spans more than two
+_seen_a, _seen_b = [], []
+_hold_a, _a_parked = threading.Event(), threading.Event()
+
+
+def _dispatch_67(row, destination=None):
+    if threading.current_thread().name == "c67-worker-a":
+        _seen_a.append(row["id"])
+        if len(_seen_a) == 1:           # park A inside its transaction, rows locked
+            _a_parked.set()
+            _hold_a.wait(30)
+    else:
+        _seen_b.append(row["id"])
+
+
+W._dispatch_row = _dispatch_67
+try:
+    _ta = threading.Thread(target=lambda: W.drain_batch(c67_a), name="c67-worker-a")
+    _ta.start()
+    chk("worker A is mid-batch, holding its rows", _a_parked.wait(30))
+    _nb = W.drain_batch(c67_b)
+    _hold_a.set()
+    _ta.join(30)
+    chk("a second worker dispatches while the first holds its batch (was 0)",
+        _nb == 5, f"got {_nb}")
+    chk("the two workers never dispatch the same row",
+        not (set(_seen_a) & set(_seen_b)), f"overlap {sorted(set(_seen_a) & set(_seen_b))}")
+    chk("both batches are marked dispatched, each once",
+        _q1(c67_a, "SELECT COUNT(*) FROM outbox WHERE dispatched = 1") == 10,
+        str(_q1(c67_a, "SELECT COUNT(*) FROM outbox WHERE dispatched = 1")))
+finally:
+    _hold_a.set()
+    W._dispatch_row, W.WORKER_BATCH_SIZE = _orig_dispatch_67, _orig_batch_67
+    c67_b.close()
+    c67_a.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

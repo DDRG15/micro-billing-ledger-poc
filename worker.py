@@ -232,11 +232,23 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
                 -- ingest path depends on. Taking the oldest N x 10 in id order
                 -- keeps the cost flat; fairness still holds across every tenant
                 -- with work inside that window.
+                --
+                -- FOR UPDATE SKIP LOCKED HERE, in the candidate step. It used to sit
+                -- only on the outer SELECT, so a second worker computed the SAME
+                -- window and the same picked ids as the first, skipped every one of
+                -- them, and returned 0: worker replicas added no parallelism at all.
+                -- Locking the window makes a second worker's window start after the
+                -- rows the first one holds. The cost is that the whole window stays
+                -- locked until this transaction commits, so a second worker only
+                -- finds work when the backlog exceeds one window; the lease redesign
+                -- planned for Phase 3 (claim, commit, dispatch outside the
+                -- transaction) removes that.
                 SELECT id, org_id
                 FROM   outbox
                 WHERE  dispatched = 0
                 ORDER  BY id
                 LIMIT  %(window_size)s
+                FOR UPDATE SKIP LOCKED
             ), ranked AS (
                 SELECT id,
                        ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
