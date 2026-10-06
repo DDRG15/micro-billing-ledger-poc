@@ -1186,6 +1186,34 @@ def process_stripe_event(
         #     FastAPI handler converts it to HTTP 503 — telling Stripe to retry.
         #     503 is the correct response; 200 would tell Stripe "got it, stop retrying."
         raise RuntimeError(f"DB write failed: {exc}") from exc
+    except psycopg2.IntegrityError as exc:
+        # The event passed validation and the database still refused the row: a CHECK
+        #     the models do not mirror. `length(payload) < 50000` is the one a real
+        #     Stripe event can reach — an invoice with many line items or large
+        #     metadata. This used to propagate: the webhook answered 500, Stripe retried
+        #     a delivery that fails the same way every time, and after three days the
+        #     event was gone with no ledger row and no DLQ row. A refusal is not
+        #     transient, so a retry cannot fix it; dead-letter it like any other event
+        #     this ledger will not record, where an operator can see it and replay it
+        #     once the limit or the data changes. The transaction has rolled back, so
+        #     neither the ledger nor the outbox holds a partial write.
+        constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)             or type(exc).__name__
+        _log.warning(
+            "ledger refused a validated event transaction_id=%s constraint=%s",
+            transaction_id, constraint,
+            extra={"event": "ledger_row_refused", "transaction_id": transaction_id,
+                   "constraint": constraint, "org_id": org_id},
+        )
+        if not from_retry and not _write_dlq(conn, DLQEntry(
+                org_id=org_id, transaction_id=transaction_id,
+                reason=DLQReason.INVALID, raw_payload=event)):
+            # Same rule as an invalid event: the DLQ row is the only record left.
+            raise RuntimeError(f"DLQ write failed for refused event {transaction_id}") from exc
+        return {
+            "outcome":        "DLQ_INVALID",
+            "transaction_id": transaction_id,
+            "reason":         f"ledger refused the row: {constraint}",
+        }
 
     # ── LAYER 3: DLQ Routing ──────────────────────────────────────────────────
     # After the transaction, check if we actually inserted a new row.

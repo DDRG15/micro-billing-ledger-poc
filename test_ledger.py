@@ -3390,6 +3390,75 @@ finally:
 
 
 # =============================================================================
+# C6-8: an event the database refuses is dead-lettered, not answered with 500
+#     ledger.payload carries CHECK (length(payload) < 50000). A validated event that
+#     crossed it raised IntegrityError, which nothing caught: the webhook answered 500,
+#     Stripe retried a delivery that fails identically every time, and after three days
+#     the event was gone with no ledger row and no DLQ row.
+# =============================================================================
+print("\n── C6-8: a refused row goes to the DLQ, not to a 500 ───────────────────")
+
+c68_conn = fresh_conn()
+_SEC_C68 = "whsec_c68_signing_secret"
+with c68_conn.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+               ("c68", "c68", _SEC_C68))
+
+
+def _oversize(eid: str) -> dict:
+    _ev = _fixture("invoice.paid", eid)
+    _ev["data"]["object"]["metadata"] = {f"k{_i}": "x" * 450 for _i in range(110)}
+    return _ev
+
+
+original_pool_c68 = L._pool
+L._pool = _MockPool(c68_conn)
+_locker68 = psycopg2.connect(_TEST_DSN)
+try:
+    _c68_client = TestClient(L.app, raise_server_exceptions=False)
+    _big = _oversize("evt_c68_big")
+    chk("the probe really crosses the ledger's 50 000-char limit", len(json.dumps(_big)) > 50000)
+    _r = _post_raw(_c68_client, "/webhook/stripe/c68", json.dumps(_big), _SEC_C68)
+    chk("oversize valid event → 200 DLQ_INVALID, not 500",
+        _r.status_code == 200 and _r.json().get("outcome") == "DLQ_INVALID",
+        f"{_r.status_code} {_r.text[:200]}")
+    chk("…the reason names the constraint that refused it",
+        "ledger_payload_check" in (_r.json().get("reason") or ""), _r.text[:200])
+    chk("…no partial write: no ledger row, no outbox row",
+        _q1(c68_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_c68_big'") == 0
+        and _q1(c68_conn, "SELECT COUNT(*) FROM outbox WHERE transaction_id='evt_c68_big'") == 0)
+    chk("…and the DLQ holds the whole event",
+        _stored_json(c68_conn, "SELECT raw_payload FROM dlq WHERE org_id='c68' "
+                               "AND transaction_id=%s", ("evt_c68_big",)) == _big)
+
+    # A replay of a refused event must not append another DLQ row per attempt.
+    _dlq_n = _q1(c68_conn, "SELECT COUNT(*) FROM dlq")
+    _rr = L.process_stripe_event(c68_conn, _big, from_retry=True, org_id="c68")
+    chk("a replay of a refused event → DLQ_INVALID with no new DLQ row",
+        _rr["outcome"] == "DLQ_INVALID" and _q1(c68_conn, "SELECT COUNT(*) FROM dlq") == _dlq_n,
+        str(_rr))
+
+    # And if the DLQ cannot take it either, Stripe must hear 503, not 200.
+    with c68_conn.cursor() as _c:
+        _c.execute("SET statement_timeout = '1s'")
+    with _locker68.cursor() as _lc:
+        _lc.execute("LOCK TABLE dlq IN ACCESS EXCLUSIVE MODE")
+    try:
+        _r = _post_raw(_c68_client, "/webhook/stripe/c68",
+                       json.dumps(_oversize("evt_c68_big_dlq_down")), _SEC_C68)
+        chk("refused event whose DLQ write also failed → 503", _r.status_code == 503,
+            f"{_r.status_code} {_r.text[:200]}")
+    finally:
+        _locker68.rollback()
+        with c68_conn.cursor() as _c:
+            _c.execute("SET statement_timeout = 0")
+finally:
+    L._pool = original_pool_c68
+    _locker68.close()
+    c68_conn.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
