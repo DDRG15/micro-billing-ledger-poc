@@ -59,12 +59,13 @@ COPY alembic/ alembic/
 #     write billing_ledger.log — the app crashes on startup with a PermissionError.
 RUN chown -R billing:billing /app
 
-# DATABASE_URL tells ledger.py where the PostgreSQL instance lives.
-#     Override at runtime: docker run -e DATABASE_URL=postgresql://user:pass@host:5432/db ...
-#     In production, point this at a managed PostgreSQL service (RDS, Cloud SQL, Supabase, etc.).
-#     The default here connects to a postgres container in the same Docker network.
-#     Never hardcode credentials — pass DATABASE_URL as an environment variable at deploy time.
-ENV DATABASE_URL=postgresql://postgres:postgres@postgres:5432/billing
+# No DATABASE_URL here. This image runs three services; only `migrate` needs the owner
+#     connection, and compose gives it that one explicitly. An ENV baked in at build time
+#     reached billing and worker too — the processes that serve traffic held a credential
+#     that bypasses row-level security, while docker-compose.yml said DATABASE_URL was
+#     "deliberately ABSENT" from them. Every service now receives exactly the DSN its
+#     compose entry names: DATABASE_URL for migrate, APP_DATABASE_URL for billing and
+#     worker. stack.yml checks the variable NAMES inside the running containers.
 
 # Switch to the non-root billing user. All subsequent commands (including CMD)
 #     run as billing, not root. Defence in depth.

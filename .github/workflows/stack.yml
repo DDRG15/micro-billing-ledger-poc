@@ -87,6 +87,23 @@ jobs:
             echo "$svc: rls_enforced"
           done
 
+      # --- Regression: the owner credential stays out of the services (Cycle 6 #1)
+      # The Dockerfile baked DATABASE_URL (the owner, which bypasses RLS) into the image,
+      #     so billing and worker held it while compose said it was absent. Variable NAMES
+      #     only: `env | cut -d= -f1` runs inside the container, so no value leaves it.
+      - name: Service containers do not hold the owner database credential
+        run: |
+          for svc in billing worker; do
+            names=$(docker compose exec -T "$svc" sh -c 'env | cut -d= -f1')
+            if echo "$names" | grep -qx 'DATABASE_URL'; then
+              echo "FAIL: $svc has DATABASE_URL — the owner connection, which bypasses RLS"
+              exit 1
+            fi
+            echo "$names" | grep -qx 'APP_DATABASE_URL' \
+              || { echo "FAIL: $svc has no APP_DATABASE_URL"; exit 1; }
+            echo "$svc: DATABASE_URL absent, APP_DATABASE_URL present"
+          done
+
       # --- Regression: billing healthcheck must not be a false negative ------
       - name: Billing container reports healthy
         run: |

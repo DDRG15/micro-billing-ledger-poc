@@ -3459,6 +3459,109 @@ finally:
 
 
 # =============================================================================
+# C6-9: the RLS self-check tells the truth, and the deploy rotates billing_app (item 1)
+#     _rls_status counted policies across the three tables and checked usesuper only, so
+#     a BYPASSRLS role — which skips every policy exactly as a superuser does — or a
+#     table with its row security switched off still logged rls_enforced. And 0006's
+#     billing_app password, printed in the repository, was rotated by nothing.
+# =============================================================================
+print("\n── C6-9: rls_enforced means enforced; provision rotates billing_app ────")
+
+from urllib.parse import urlsplit as _usplit  # noqa: E402
+
+c69_owner = fresh_conn()
+_orig_pool_69 = L._pool
+
+
+def _status_as(conn) -> dict:
+    L._pool = _MockPool(conn)
+    try:
+        return L._rls_status()
+    finally:
+        L._pool = _orig_pool_69
+
+
+try:
+    _st = _status_as(c69_owner)
+    chk("the owner connection (superuser) is reported inert, and why",
+        _st["enforced"] is False and "superuser" in _st["inert_because"], str(_st))
+
+    # A role that is not a superuser but holds BYPASSRLS: the case usesuper missed.
+    _BYP_PW = "c69_bypass_pw_0123456789"
+    with c69_owner.cursor() as _c:
+        _c.execute("DROP ROLE IF EXISTS c69_bypass")
+        _c.execute("CREATE ROLE c69_bypass LOGIN NOSUPERUSER BYPASSRLS PASSWORD %s", (_BYP_PW,))
+    _o = _usplit(_TEST_DSN)
+    _byp = psycopg2.connect(f"postgresql://c69_bypass:{_BYP_PW}@{_o.hostname}:{_o.port or 5432}{_o.path}")
+    _byp.autocommit = True
+    try:
+        _st = _status_as(_byp)
+        chk("a BYPASSRLS role is reported inert (it used to log rls_enforced)",
+            _st["enforced"] is False and "BYPASSRLS" in _st["inert_because"]
+            and _st["superuser"] is False, str(_st))
+    finally:
+        _byp.close()
+        with c69_owner.cursor() as _c:
+            _c.execute("DROP ROLE IF EXISTS c69_bypass")
+
+    # billing_app is enforced — until one table loses row security.
+    _app69 = psycopg2.connect(_APP_DSN)
+    _app69.autocommit = True
+    try:
+        chk("billing_app with policies on all three tables → enforced",
+            _status_as(_app69)["enforced"] is True, str(_status_as(_app69)))
+        with c69_owner.cursor() as _c:
+            _c.execute("ALTER TABLE outbox DISABLE ROW LEVEL SECURITY")
+        try:
+            _st = _status_as(_app69)
+            chk("one table without row security → inert, naming the table",
+                _st["enforced"] is False
+                and any("outbox" in _r for _r in _st["inert_because"]), str(_st))
+        finally:
+            with c69_owner.cursor() as _c:
+                _c.execute("ALTER TABLE outbox ENABLE ROW LEVEL SECURITY")
+        chk("…and enforced again once it is restored", _status_as(_app69)["enforced"] is True)
+    finally:
+        _app69.close()
+
+    # provision.py rotates billing_app from APP_DATABASE_URL — and only billing_app.
+    _a = _usplit(_APP_DSN)
+    _host = f"{_a.hostname}:{_a.port or 5432}{_a.path}"
+    chk("bootstrap password in APP_DATABASE_URL → left unchanged",
+        P.sync_app_role_password(c69_owner, f"postgresql://billing_app:billing_app@{_host}")
+        .startswith("unchanged"))
+    chk("a DSN for another role → skipped, nothing altered",
+        P.sync_app_role_password(c69_owner, f"postgresql://someone_else:pw@{_host}")
+        .startswith("skipped"))
+    _NEW_PW = "c69_rotated_app_password_0123456789"
+    try:
+        chk("a real password → rotated",
+            P.sync_app_role_password(c69_owner, f"postgresql://billing_app:{_NEW_PW}@{_host}")
+            == "rotated")
+        _ok_new = _ok_old = False
+        try:
+            psycopg2.connect(f"postgresql://billing_app:{_NEW_PW}@{_host}").close()
+            _ok_new = True
+        except psycopg2.Error:
+            pass
+        try:
+            psycopg2.connect(f"postgresql://billing_app:billing_app@{_host}").close()
+            _ok_old = True
+        except psycopg2.Error:
+            pass
+        chk("billing_app now authenticates with the new password", _ok_new)
+        chk("…and no longer with the published one", not _ok_old)
+    finally:
+        # The role is cluster-wide and the rest of this suite connects with the
+        #     bootstrap password: put it back whatever happened above.
+        with c69_owner.cursor() as _c:
+            _c.execute("ALTER ROLE billing_app PASSWORD 'billing_app'")
+finally:
+    L._pool = _orig_pool_69
+    c69_owner.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

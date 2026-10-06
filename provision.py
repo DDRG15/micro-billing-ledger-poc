@@ -30,10 +30,16 @@ whoever holds the owner credential, which is exactly the boundary 13.7 drew.
 """
 import os
 import sys
+from urllib.parse import unquote, urlsplit
 
 import psycopg2
+from psycopg2 import sql
+from psycopg2.extensions import encrypt_password
 
 DEFAULT_ORG_ID = "default"
+APP_ROLE = "billing_app"
+# Migration 0006 creates billing_app with this password; it is printed in that file.
+APP_ROLE_BOOTSTRAP_PASSWORD = "billing_app"
 
 
 def _read_secret(name: str, default: str = "") -> str:
@@ -75,6 +81,38 @@ def sync_default_org_secret(conn, secret: str) -> None:
         )
 
 
+def sync_app_role_password(conn, app_dsn: str) -> str:
+    """Give billing_app the password APP_DATABASE_URL carries. Returns what it did.
+
+    A migration cannot carry a secret, so 0006 creates the role with a password that is
+    printed in the repository, and rotating it was a manual ALTER ROLE the docs asked
+    for and nothing performed. The deploy now does it: the operator puts the real
+    password in APP_DATABASE_URL, the service connects with it, and this step makes the
+    role match before the service starts.
+
+    The password never crosses the wire in clear: encrypt_password hashes it client-side
+    (the server's password_encryption, SCRAM on PostgreSQL 16), so the ALTER ROLE that
+    reaches the server — and any statement log — carries only the hash.
+
+    Left alone when APP_DATABASE_URL is absent, names another role (this step speaks for
+    billing_app only), or still carries the bootstrap password: the service refuses
+    to serve traffic on that password outside dev, and rotating to it changes nothing.
+    """
+    if not app_dsn:
+        return "skipped: APP_DATABASE_URL not given to this step"
+    parts = urlsplit(app_dsn)
+    if parts.username != APP_ROLE:
+        return f"skipped: APP_DATABASE_URL connects as {parts.username!r}, not {APP_ROLE}"
+    password = unquote(parts.password or "")
+    if not password or password == APP_ROLE_BOOTSTRAP_PASSWORD:
+        return "unchanged: APP_DATABASE_URL still carries the bootstrap password"
+    hashed = encrypt_password(password, APP_ROLE, conn)
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL("ALTER ROLE {} PASSWORD %s").format(sql.Identifier(APP_ROLE)),
+                    (hashed,))
+    return "rotated"
+
+
 def main() -> int:
     dsn = os.environ.get("DATABASE_URL", "")
     if not dsn:
@@ -88,6 +126,7 @@ def main() -> int:
     conn.autocommit = True
     try:
         sync_default_org_secret(conn, secret)
+        role_result = sync_app_role_password(conn, os.environ.get("APP_DATABASE_URL", ""))
     finally:
         conn.close()
 
@@ -95,6 +134,7 @@ def main() -> int:
     #     fingerprint the API logs at startup (see ledger._secret_fingerprint).
     print(f"provision: default org signing secret synchronised "
           f"({'placeholder' if secret == 'whsec_YOUR_SECRET_HERE' else 'set'})")
+    print(f"provision: {APP_ROLE} password {role_result}")
     return 0
 
 

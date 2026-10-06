@@ -67,6 +67,10 @@ services:
       #     legacy single-tenant route verifies against the operator's current value.
       STRIPE_WEBHOOK_SECRET:      "${STRIPE_WEBHOOK_SECRET:-whsec_YOUR_SECRET_HERE}"
       STRIPE_WEBHOOK_SECRET_FILE: "${STRIPE_WEBHOOK_SECRET_FILE:-}"
+      # Read for its password only: provision.py sets billing_app's password to the one
+      #     the services will connect with, hashed client-side. Same value billing and
+      #     worker receive below, so the role and its users cannot drift apart.
+      APP_DATABASE_URL:           "${APP_DATABASE_URL:-postgresql://billing_app:billing_app@postgres:5432/billing}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -89,7 +93,9 @@ services:
     build: .
     networks: [billing_net]
     environment:
-      # APP_DATABASE_URL only — DATABASE_URL is deliberately ABSENT from this container.
+      # APP_DATABASE_URL only — DATABASE_URL is ABSENT from this container. It used to
+      #     arrive anyway, from an ENV in the Dockerfile; that is gone, and stack.yml now
+      #     asserts the absence inside the running container.
       #     billing_app is NOSUPERUSER NOBYPASSRLS, which is what makes migration 0006's
       #     policies apply instead of being decorative; the owner DSN in here would hand
       #     the same process a way around them. A service that cannot authenticate as the

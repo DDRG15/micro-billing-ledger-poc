@@ -1960,23 +1960,48 @@ def _rls_status() -> dict:
 
     So the process states, out loud and at startup, which of the two worlds it is in.
 
-    Reads pg_user and pg_policies, never a tenant table, so it needs no scope of its own.
+    Enforced means all of it, per table: the role is not a superuser, does not hold
+    BYPASSRLS (which skips every policy exactly as superuser does, without being one),
+    and each of ledger, outbox and dlq has row security switched on with a policy on
+    it. This used to count policies across the three tables and check usesuper only, so
+    a BYPASSRLS role, or one table with its policy dropped, still logged rls_enforced.
+
+    Reads catalogs only, never a tenant table, so it needs no scope of its own.
     """
     _c = _pool.getconn()
     try:
         with _c.cursor() as cur:
-            cur.execute("SELECT current_user, "
-                        "(SELECT usesuper FROM pg_user WHERE usename = current_user)")
-            user, is_super = cur.fetchone()
-            cur.execute("SELECT COUNT(*) FROM pg_policies "
-                        "WHERE tablename IN ('ledger','outbox','dlq')")
-            policies = cur.fetchone()[0]
+            cur.execute("SELECT current_user, rolsuper, rolbypassrls FROM pg_roles "
+                        "WHERE rolname = current_user")
+            user, is_super, bypass = cur.fetchone()
+            cur.execute(
+                "SELECT c.relname FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = current_schema() AND c.relname = ANY(%s) "
+                "AND c.relrowsecurity AND EXISTS (SELECT 1 FROM pg_policies p "
+                "WHERE p.schemaname = n.nspname AND p.tablename = c.relname)",
+                (list(_RLS_TABLES),),
+            )
+            covered = sorted(row[0] for row in cur.fetchall())
     except Exception:  # noqa: BLE001 — a pre-0006 database has no policies to report
-        return {"db_user": "unknown", "policies": 0, "enforced": False}
+        return {"db_user": "unknown", "policies": 0, "enforced": False, "inert_because": []}
     finally:
         _pool.putconn(_c)
-    return {"db_user": user, "superuser": bool(is_super),
-            "policies": policies, "enforced": bool(policies) and not is_super}
+    reasons = []
+    if is_super:
+        reasons.append("superuser")
+    if bypass:
+        reasons.append("BYPASSRLS")
+    missing = sorted(set(_RLS_TABLES) - set(covered))
+    if missing:
+        reasons.append("no row-level security on " + ", ".join(missing))
+    return {"db_user": user, "superuser": bool(is_super), "bypassrls": bool(bypass),
+            "policies": len(covered), "tables_covered": covered,
+            "enforced": not reasons, "inert_because": reasons}
+
+
+# The tables migration 0006 puts behind row-level security.
+_RLS_TABLES = ("ledger", "outbox", "dlq")
 
 
 _ANY_ORG_KEYS: bool = _any_org_keys()
@@ -2002,18 +2027,19 @@ if _dsn_password(APP_DATABASE_URL) == _PLACEHOLDER_APP_DB_PASSWORD:
         "%s. That value is published in this repository's migration file, so anyone who "
         "can reach PostgreSQL can authenticate as the application role and read every "
         "tenant's rows — RLS scopes what a session may see, it does not decide who may "
-        "open one. Rotate it before this database is reachable from a network: "
-        "ALTER ROLE %s PASSWORD '<openssl rand -hex 32>', then update APP_DATABASE_URL.",
-        _PLACEHOLDER_APP_DB_PASSWORD, _PLACEHOLDER_APP_DB_PASSWORD,
+        "open one. Rotate it before this database is reachable from a network: put a "
+        "real password in APP_DATABASE_URL and redeploy; the migrate step (provision.py) "
+        "sets the role's password to it before this service starts.",
+        _PLACEHOLDER_APP_DB_PASSWORD,
         extra={"event": "app_db_password_is_placeholder"},
     )
 if _RLS["policies"] and not _RLS["enforced"]:
     _log.critical(
-        "row-level security policies exist but DO NOT APPLY — connected as %r, which is "
-        "a superuser and bypasses RLS. Tenant isolation currently depends entirely on "
-        "every query carrying its own org_id predicate. Connect as a non-superuser role "
-        "(migration 0006 creates billing_app) to make the database enforce it.",
-        _RLS.get("db_user"),
+        "row-level security policies exist but DO NOT APPLY — connected as %r (%s). "
+        "Tenant isolation currently depends entirely on every query carrying its own "
+        "org_id predicate. Connect as a role that is neither superuser nor BYPASSRLS "
+        "(migration 0006 creates billing_app), with policies on all three tables.",
+        _RLS.get("db_user"), "; ".join(_RLS.get("inert_because", [])),
         extra={"event": "rls_inert", **_RLS},
     )
 elif _RLS["enforced"]:
