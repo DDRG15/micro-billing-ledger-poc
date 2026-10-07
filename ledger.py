@@ -387,16 +387,21 @@ class StripeEvent(BaseModel):
     @model_validator(mode='after')
     def check_invoice_amount_nonzero(self):
         """
-        Cross-field rule: invoice events must carry a non-zero amount.
-            - invoice.paid with $0 = no revenue received. Data quality failure.
-            - invoice.payment_failed with $0 = nothing to retry. Data quality failure.
+        Cross-field rule: a FAILED invoice must carry a non-zero amount.
+            - invoice.payment_failed with $0 = nothing was owed, so nothing failed and
+              nothing is retried. Data quality failure → DLQ.
+            - invoice.paid with $0 is ACCEPTED (Cycle 6, 5f, decided 2026-10-06). A
+              100%-off coupon or a free item produces a real invoice for $0 that Stripe
+              marks paid; rejecting it sent legitimate events to the DLQ, where they
+              counted in dlq_depth like errors. It is posted at 0: a known zero. An
+              UNKNOWN amount (no amount field at all) is still refused, by
+              check_amount_present — that distinction is the one that matters.
             - Subscription events are exempt: they carry no amount at all
               (see _LIFECYCLE_TYPES).
         Field(ge=0) cannot express this — it allows zero for all types.
         This validator runs after Field checks, so it has access to self.type.
         """
-        invoice_types = {EventType.INVOICE_PAID, EventType.INVOICE_FAILED}
-        if self.type in invoice_types:
+        if self.type == EventType.INVOICE_FAILED:
             amount = self.get_billing_amount()
             if amount == 0:
                 raise ValueError(

@@ -569,14 +569,16 @@ chk("subscription.updated → LIFECYCLE",
 #  before the full HTTP integration stack is exercised.)
 # =============================================================================
 
-print("\n── Phase 3: Cross-field validator — invoice amount > 0 ──────────────────")
+print("\n── Phase 3: Cross-field validator — a failed invoice needs an amount > 0 ")
 
 conn7 = fresh_conn()
 
 ev_zero_invoice = fake_event(eid="evt_zero_paid", etype="invoice.paid", amount=0)
 r = L.process_stripe_event(conn7, ev_zero_invoice)
-chk("invoice.paid with amount=0 → DLQ_INVALID",
-    r["outcome"] == "DLQ_INVALID", f"got {r['outcome']}")
+chk("invoice.paid with amount=0 → POSTED (a known zero: coupon, free item — 5f)",
+    r["outcome"] == "POSTED", f"got {r['outcome']}")
+chk("…recorded at 0, not refused",
+    _q1(conn7, "SELECT amount_cents FROM ledger WHERE transaction_id='evt_zero_paid'") == 0)
 
 ev_zero_failed = {
     "id": "evt_zero_failed",
@@ -708,7 +710,7 @@ with patch("stripe.Webhook.construct_event"):
     ev_zero = fake_event(eid="evt_http_zero", amount=0)
     r = client.post("/webhook/stripe", json=ev_zero)
     chk("POST $0 invoice → HTTP 200",               r.status_code == 200)
-    chk("$0 invoice → DLQ_INVALID via HTTP",        r.json()["outcome"] == "DLQ_INVALID",
+    chk("$0 invoice.paid → POSTED via HTTP (5f)",   r.json()["outcome"] == "POSTED",
         f"got {r.json()}")
 
     ev_bad_cus = fake_event(eid="evt_http_bad_cus", customer="notacus_001")
@@ -718,18 +720,19 @@ with patch("stripe.Webhook.construct_event"):
         f"got {r.json()}")
 
     # Summary endpoint — verify shape and counts.
-    #     Posted above: evt_http_001 and evt_http_up_curr (uppercase currency is
-    #     normalized and accepted, so it posts) = 2 ledger rows, 2 outbox rows.
-    #     DLQ: 1 DUPLICATE + 3 INVALID (malformed currency, $0 invoice, bad prefix) = 4.
+    #     Posted above: evt_http_001, evt_http_up_curr (uppercase currency is
+    #     normalized and accepted) and evt_http_zero ($0 invoice.paid, 5f) = 3 ledger
+    #     rows, 3 outbox rows. DLQ: 1 DUPLICATE + 2 INVALID (malformed currency, bad
+    #     prefix) = 3.
     r = client.get("/ledger/summary")
     chk("GET /ledger/summary → 200",                r.status_code == 200)
     summary = r.json()
     chk("summary has 'ledger' key",                 "ledger" in summary)
     chk("summary has 'dlq_depth' key",              "dlq_depth" in summary)
     chk("summary has 'outbox_pending' key",         "outbox_pending" in summary)
-    chk("summary dlq_depth is 4",                   summary["dlq_depth"] == 4,
+    chk("summary dlq_depth is 3",                   summary["dlq_depth"] == 3,
         f"got {summary['dlq_depth']}")
-    chk("summary outbox_pending is 2",              summary["outbox_pending"] == 2,
+    chk("summary outbox_pending is 3",              summary["outbox_pending"] == 3,
         f"got {summary['outbox_pending']}")
 
     # limit=-1 must return HTTP 422, not a PostgreSQL error.
@@ -887,7 +890,7 @@ print("\n── Phase 5: DLQ queryability and payload preservation ────�
 dlq_conn = fresh_conn()
 
 L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_1", currency="WRONG"))
-L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_2", amount=0))
+L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_2", etype="charge.refunded"))
 L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_3", customer=""))
 
 rows = _qall(dlq_conn, "SELECT transaction_id, reason, raw_payload FROM dlq ORDER BY id")
@@ -3559,6 +3562,49 @@ try:
 finally:
     L._pool = _orig_pool_69
     c69_owner.close()
+
+
+# =============================================================================
+# C6-10: a $0 invoice.paid is ledgered at 0 (item 5f, decided 2026-10-06)
+#     A 100%-off coupon or a free item yields a real invoice for $0 that Stripe marks
+#     paid. check_invoice_amount_nonzero sent every one to the DLQ as INVALID, where it
+#     counted in dlq_depth like an error. It is now POSTED at 0: a known zero. An
+#     unknown amount (no amount field) and a $0 payment_failed are still refused.
+# =============================================================================
+print("\n── C6-10: a $0 invoice.paid is POSTED at 0, not dead-lettered ─────────")
+
+c610_conn = fresh_conn()
+_SEC_C610 = "whsec_c610_signing_secret"
+with c610_conn.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+               ("c610", "c610", _SEC_C610))
+original_pool_c610 = L._pool
+L._pool = _MockPool(c610_conn)
+try:
+    _c610_client = TestClient(L.app, raise_server_exceptions=False)
+    _free = _fixture("invoice.paid", "evt_c610_coupon")
+    for _k in ("amount_due", "amount_paid", "amount_remaining", "subtotal", "total"):
+        if _k in _free["data"]["object"]:
+            _free["data"]["object"][_k] = 0
+    _r = _post_raw(_c610_client, "/webhook/stripe/c610", json.dumps(_free), _SEC_C610)
+    chk("signed $0 invoice.paid → 200 POSTED",
+        _r.status_code == 200 and _r.json().get("outcome") == "POSTED",
+        f"{_r.status_code} {_r.text[:200]}")
+    chk("…stored at amount_cents 0",
+        _q1(c610_conn, "SELECT amount_cents FROM ledger WHERE org_id='c610' "
+                       "AND transaction_id='evt_c610_coupon'") == 0)
+    chk("…and nothing in the DLQ for it",
+        _q1(c610_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_c610_coupon'") == 0)
+
+    _failed0 = _fixture("invoice.payment_failed", "evt_c610_failed_zero")
+    _failed0["data"]["object"]["amount_due"] = 0
+    _failed0["data"]["object"]["amount_paid"] = 0
+    _r = _post_raw(_c610_client, "/webhook/stripe/c610", json.dumps(_failed0), _SEC_C610)
+    chk("a $0 invoice.payment_failed is still refused → DLQ_INVALID",
+        _r.status_code == 200 and _r.json().get("outcome") == "DLQ_INVALID", _r.text[:200])
+finally:
+    L._pool = original_pool_c610
+    c610_conn.close()
 
 
 # =============================================================================

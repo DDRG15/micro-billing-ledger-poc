@@ -271,7 +271,8 @@ Layer 3 — StripeEvent @model_validator (cross-field)
   resolve_idempotency_key       request.idempotency_key, else the event id — also when Stripe
                                 sends request: null or idempotency_key: null (automatic events:
                                 renewals, retries), which used to return 422 / 500
-  check_invoice_amount_nonzero  invoice.paid + $0 → DLQ_INVALID (no revenue received)
+  check_invoice_amount_nonzero  invoice.payment_failed + $0 → DLQ_INVALID (nothing was owed);
+                                a $0 invoice.paid (coupon, free item) posts at 0
   check_customer_id_format      customer must start with 'cus_' (structural Stripe API rule)
 
 Layer 4 — Business logic
