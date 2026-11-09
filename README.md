@@ -527,19 +527,25 @@ CREATE INDEX IF NOT EXISTS idx_org_api_key ON org(api_key_sha256) WHERE api_key_
 
 | Status | Event types | Meaning |
 |---|---|---|
-| `POSTED` | `invoice.paid` | Revenue confirmed, recorded at `amount_paid` |
+| `POSTED` | `invoice.paid` | Stripe considers the invoice paid; recorded at the first non-null field in `amount_paid` → `amount` → `amount_due` |
 | `VOID` | `invoice.payment_failed` | Payment failed, recorded at `amount_due` |
 | `LIFECYCLE` | `customer.subscription.created` · `.updated` · `.deleted` | Account state changed; no money moved. `amount_cents` is NULL, and the row is forwarded downstream like any other |
 | `PENDING` | none since Cycle 6 | Was `customer.subscription.updated`; kept so rows written before stay valid |
 
+**Domain decision 5e — settled:** `POSTED` means Stripe considers the invoice paid,
+including payment made outside Stripe. Classification follows `invoice.paid`; the code
+does not check how the invoice was paid.
+
+**Domain decision 5f — settled:** a $0 `invoice.paid` is recorded as `POSTED` with
+`amount_cents=0`. An invoice with no non-null amount field routes to the DLQ as
+`DLQ_INVALID`; a $0 `invoice.payment_failed` is still rejected as `DLQ_INVALID`.
+
 **Subscription events carry no amount, on purpose.** Stripe's Subscription object has no
 top-level amount field — prices live in `items.data[].price` — and the ledger used to
 demand one from every event, so every real `customer.subscription.*` event was
-dead-lettered as `INVALID` and counted in `dlq_depth`. Computing an amount from the items
-would be worse: it posts a list price as revenue next to the `invoice.paid` that actually
-collects it, and the figure is wrong for trials, metered and tiered prices, coupons and
-proration. The money is on the invoice rows; a subscription row records that an account
-changed state, which is what downstream systems act on. The database enforces the split
+dead-lettered as `INVALID` and counted in `dlq_depth`. The ledger reads billing amounts
+from invoice events and ignores amount fields on subscription events. A subscription row
+records that an account changed state, which is what downstream systems act on. The database enforces the split
 (`ledger_amount_matches_kind`), and `SUM(amount_cents)` skips the NULLs.
 
 Upgrading a deployment that ran before this change: its DLQ holds those subscription
@@ -626,7 +632,7 @@ scrape_configs:
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
-Phase 3    Cross-field    — invoice amount > 0, customer ID 'cus_' format
+Phase 3    Cross-field    — failed invoice amount > 0; paid invoice can be 0; customer ID 'cus_'
 Phase 5    Full stack     — HTTP 200/400/422/503, HMAC signature, 5-thread concurrent
                             idempotency, batch duplicate partition, BIGINT, outbox, DLQ
 Phase 7    Outbox worker  — drain_batch dispatch + dispatched_at, SKIP LOCKED, idempotent re-drain
@@ -680,6 +686,8 @@ C6-7       Two workers    — a second replica drains while the first holds its 
 C6-8       Refused rows   — an event the database refuses (> 50 000 chars) → DLQ, not 500
 C6-9       RLS truth      — superuser / BYPASSRLS / a table without RLS all read as inert;
                             provision.py rotates billing_app from APP_DATABASE_URL
+C6-10      Zero invoices  — signed $0 invoice.paid → POSTED at 0 with no DLQ entry;
+                            $0 invoice.payment_failed → DLQ_INVALID
 C6-11      DLQ queries    — status filters, actionable set, unknown status → 422, retry fields;
                             cursor walks all 1,203 entries once in descending ID order
 C6-12      Outbox leases  — idle DB session during dispatch, per-row finish, failed-row backoff;
