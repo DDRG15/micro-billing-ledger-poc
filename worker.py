@@ -245,7 +245,7 @@ _CLAIM_SQL = """
     JOIN   org g ON g.org_id = p.org_id
     WHERE  o.id = p.id
     RETURNING o.id, o.transaction_id, o.event_type, o.payload, o.org_id, o.attempts,
-              g.downstream_url
+              o.claimed_until, g.downstream_url
 """
 
 
@@ -263,13 +263,26 @@ def _claim_batch(conn: psycopg2.extensions.connection) -> List[psycopg2.extras.R
 
 
 def _finish_row(conn: psycopg2.extensions.connection, row: psycopg2.extras.RealDictRow,
-                error: Optional[str]) -> None:
-    """Commit one row's outcome, in its own transaction scoped to that row's tenant."""
+                error: Optional[str]) -> bool:
+    """Commit one row's outcome, in its own transaction scoped to that row's tenant.
+
+    A worker can outlive its lease (a slow downstream, a long GC pause); another worker
+    then claims the row and both are dispatching it. The claimed_until value this worker
+    wrote is its fencing token:
+
+      success  recorded whenever the row is still undelivered, lease or not. The event
+               reached the downstream; saying otherwise only causes another duplicate.
+      failure  recorded only while this worker still holds its own lease. A stale
+               failure used to clear the live worker's lease (letting a third worker in)
+               and stamp attempts / last_error on a row another worker had delivered.
+
+    Returns False when the row was left as it was.
+    """
     with _tx(conn, row["org_id"]) as cur:
         if error is None:
             cur.execute(
                 "UPDATE outbox SET dispatched = 1, dispatched_at = NOW(), "
-                "claimed_until = NULL, last_error = NULL WHERE id = %s",
+                "claimed_until = NULL, last_error = NULL WHERE id = %s AND dispatched = 0",
                 (row["id"],),
             )
         else:
@@ -277,9 +290,15 @@ def _finish_row(conn: psycopg2.extensions.connection, row: psycopg2.extras.RealD
             cur.execute(
                 "UPDATE outbox SET attempts = attempts + 1, "
                 "next_attempt_at = NOW() + make_interval(secs => %s), "
-                "claimed_until = NULL, last_error = %s WHERE id = %s",
-                (delay, error[:500], row["id"]),
+                "claimed_until = NULL, last_error = %s "
+                "WHERE id = %s AND dispatched = 0 AND claimed_until = %s",
+                (delay, error[:500], row["id"], row["claimed_until"]),
             )
+        applied = cur.rowcount == 1
+    if not applied:
+        log.warning("lease_lost id=%s transaction_id=%s outcome=%s — left to the current holder",
+                    row["id"], row["transaction_id"], "delivered" if error is None else "failed")
+    return applied
 
 
 def drain_batch(conn: psycopg2.extensions.connection) -> int:

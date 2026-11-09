@@ -3749,6 +3749,33 @@ try:
                    "WHERE transaction_id = 'evt_c612_y_late'")
     W.drain_batch(c612)
     chk("…and delivered once the lease has expired", _y_dispatched() == 6, str(_y_dispatched()))
+
+    # A worker that outlived its lease: B reclaimed the row while A was still dispatching.
+    #     _finish_row used to update by id alone, so A's late failure cleared B's live
+    #     lease and stamped attempts/last_error on whatever B had done with the row.
+    L.process_stripe_event(c612, fake_event(eid="evt_c612_y_stale"), org_id="c612_y")
+    _row_a = next(_r for _r in W._claim_batch(c612)
+                  if _r["transaction_id"] == "evt_c612_y_stale")
+
+    def _stale_state():
+        with c612.cursor() as _c:
+            _c.execute("SELECT dispatched, attempts, last_error, claimed_until > NOW() "
+                       "FROM outbox WHERE transaction_id = 'evt_c612_y_stale'")
+            return _c.fetchone()
+
+    with c612.cursor() as _c:                     # A's lease expires; B claims the row
+        _c.execute("UPDATE outbox SET claimed_until = NOW() + interval '1 hour' "
+                   "WHERE transaction_id = 'evt_c612_y_stale'")
+    _applied = W._finish_row(c612, _row_a, "A's late timeout")
+    chk("a stale worker's failure does not touch a row another worker now leases",
+        _applied is False and _stale_state() == (0, 0, None, True), str(_stale_state()))
+    _applied = W._finish_row(c612, _row_a, None)
+    chk("…but its success is recorded: the event did reach the downstream",
+        _applied is True and _stale_state()[0] == 1, str(_stale_state()))
+    _row_b = dict(_row_a, claimed_until=None)
+    _applied = W._finish_row(c612, _row_b, "B's late timeout")
+    chk("a late failure never stamps attempts or last_error on a delivered row",
+        _applied is False and _stale_state()[:3] == (1, 0, None), str(_stale_state()))
 finally:
     W._dispatch_row, W.WORKER_BATCH_SIZE = _orig_dispatch_612, _orig_batch_612
     c612_obs.close()
