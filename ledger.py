@@ -904,6 +904,14 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
             ALTER TABLE outbox
             ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ
         """)
+        # Delivery state (migration 0008): attempts / backoff / lease / last error, and the
+        #     partial index the worker's per-tenant claim query uses.
+        cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS claimed_until TIMESTAMPTZ")
+        cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS last_error TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending_by_org "
+                    "ON outbox (org_id, id) WHERE dispatched = 0")
 
         # dlq — every rejected event lands here with a structured reason code.
         #     raw_payload is the full event JSON as received (every field; re-serialized,

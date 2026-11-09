@@ -3673,6 +3673,89 @@ finally:
 
 
 # =============================================================================
+# C6-12: the outbox lease — no locks across HTTP, no tenant starvation (items 6a, 6b)
+#     drain_batch held FOR UPDATE row locks across every HTTP call in the batch, and a
+#     failed dispatch left its row untouched, to be retried on the next poll. A tenant
+#     whose downstream kept failing therefore stayed at the head of the queue, and with
+#     more rows than one window (batch x 10) no other tenant was ever selected.
+# =============================================================================
+print("\n── C6-12: claim, dispatch with no transaction open, commit per row ─────")
+
+c612 = fresh_conn()
+c612_obs = psycopg2.connect(_TEST_DSN)
+c612_obs.autocommit = True
+with c612.cursor() as _c:
+    for _o in ("c612_x", "c612_y"):
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,'whsec_t')",
+                   (_o, _o))
+L.process_stripe_event_batch(c612, [fake_event(eid=f"evt_c612_x_{_i:03d}") for _i in range(60)],
+                             org_id="c612_x")
+L.process_stripe_event_batch(c612, [fake_event(eid=f"evt_c612_y_{_i}") for _i in range(5)],
+                             org_id="c612_y")
+
+_orig_dispatch_612, _orig_batch_612 = W._dispatch_row, W.WORKER_BATCH_SIZE
+W.WORKER_BATCH_SIZE = 5
+_calls_612, _states_612 = [], []
+
+
+def _dispatch_612(row, destination=None):
+    _calls_612.append((row["org_id"], row["id"]))
+    with c612_obs.cursor() as _oc:          # what is the worker's own session doing?
+        _oc.execute("SELECT state FROM pg_stat_activity WHERE pid = %s", (c612.get_backend_pid(),))
+        _states_612.append(_oc.fetchone()[0])
+    if row["org_id"] == "c612_x":
+        raise RuntimeError("downstream for c612_x is down")
+
+
+def _y_dispatched() -> int:
+    return _q1(c612, "SELECT COUNT(*) FROM outbox WHERE org_id='c612_y' AND dispatched=1")
+
+
+W._dispatch_row = _dispatch_612
+try:
+    W.drain_batch(c612)
+    chk("6b: the quiet tenant is served on the FIRST drain, ahead of 60 older failing rows",
+        sum(1 for _o, _ in _calls_612 if _o == "c612_y") >= 2,
+        str([_o for _o, _ in _calls_612]))
+    chk("6a: no transaction is open while a row is being dispatched",
+        _states_612 and all(_st == "idle" for _st in _states_612), str(_states_612))
+    _x_tried = [_i for _o, _i in _calls_612 if _o == "c612_x"]
+    _row = None
+    with c612.cursor() as _c:
+        _c.execute("SELECT attempts, next_attempt_at > NOW(), last_error, claimed_until, "
+                   "dispatched FROM outbox WHERE id = %s", (_x_tried[0],))
+        _row = _c.fetchone()
+    chk("6b: a failed row is backed off with its error recorded, lease released",
+        _row is not None and _row[0] == 1 and _row[1] is True and "down" in (_row[2] or "")
+        and _row[3] is None and _row[4] == 0, str(_row))
+
+    for _ in range(3):
+        W.drain_batch(c612)
+    chk("the quiet tenant is fully delivered within four drains", _y_dispatched() == 5,
+        str(_y_dispatched()))
+    _ids = [_i for _o, _i in _calls_612 if _o == "c612_x"]
+    chk("a backed-off row is not re-attempted before its time (no id twice)",
+        len(_ids) == len(set(_ids)), f"{len(_ids)} attempts, {len(set(_ids))} distinct")
+
+    # A crashed worker's claim: skipped while the lease holds, delivered once it expires.
+    L.process_stripe_event(c612, fake_event(eid="evt_c612_y_late"), org_id="c612_y")
+    with c612.cursor() as _c:
+        _c.execute("UPDATE outbox SET claimed_until = NOW() + interval '1 hour' "
+                   "WHERE transaction_id = 'evt_c612_y_late'")
+    W.drain_batch(c612)
+    chk("a row under another worker's live lease is skipped", _y_dispatched() == 5)
+    with c612.cursor() as _c:
+        _c.execute("UPDATE outbox SET claimed_until = NOW() - interval '1 second' "
+                   "WHERE transaction_id = 'evt_c612_y_late'")
+    W.drain_batch(c612)
+    chk("…and delivered once the lease has expired", _y_dispatched() == 6, str(_y_dispatched()))
+finally:
+    W._dispatch_row, W.WORKER_BATCH_SIZE = _orig_dispatch_612, _orig_batch_612
+    c612_obs.close()
+    c612.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

@@ -22,9 +22,13 @@ WORKER_POLL_INTERVAL (default: 5)  — seconds to sleep when queue is empty
 
 DESIGN NOTES
 ------------
-- SELECT ... FOR UPDATE SKIP LOCKED: two worker replicas never contest the same row.
-- The SELECT and its matching UPDATE run inside the same BEGIN/COMMIT (_tx).
-  If dispatch fails, the UPDATE is never issued → row is retried next poll.
+- Claim, then dispatch, then finish (migration 0008). A short transaction claims a batch
+  (lease: claimed_until); the HTTP calls run with no transaction open; each row is then
+  committed on its own — dispatched, or backed off (attempts, next_attempt_at,
+  last_error). No row lock is held across a network call.
+- Delivery is at-least-once: a worker that dies after dispatching but before committing
+  leaves its claim to expire, and the row is delivered again. Receivers deduplicate on
+  transaction_id.
 - psycopg2.OperationalError triggers exponential backoff + reconnect.
 - SIGTERM sets a stop flag; the worker finishes the current batch then exits 0.
 """
@@ -62,6 +66,15 @@ WORKER_POLL_INTERVAL: float = float(os.environ.get("WORKER_POLL_INTERVAL", "5"))
 #     Must be set explicitly — the worker refuses to start without a DOWNSTREAM_URL
 #     unless this flag is "true", preventing silent data loss in production.
 WORKER_LOG_ONLY: bool = os.environ.get("WORKER_LOG_ONLY", "false").lower() == "true"
+# How long a claim keeps other workers off a row. It must outlast a whole batch of
+#     dispatches (batch x the 10 s HTTP timeout) or a slow but live worker's rows get
+#     claimed twice; it is also how long a crashed worker's rows wait to be reclaimed.
+WORKER_LEASE_SECONDS: int = int(os.environ.get("WORKER_LEASE_SECONDS",
+                                               str(WORKER_BATCH_SIZE * 10 + 60)))
+# Backoff after a failed dispatch, by attempts so far; the last value repeats. Never
+#     gives up: the event is in the ledger, and silently abandoning its delivery is the
+#     one outcome ruled out. A row stuck here shows in outbox_pending and last_error.
+_OUTBOX_BACKOFF_SECONDS = (30, 120, 600, 3600)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -194,120 +207,124 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] =
 # Core drain loop
 # ---------------------------------------------------------------------------
 
+_CLAIM_SQL = """
+    WITH candidates AS (
+        -- Per tenant FIRST, then the batch limit. The previous query capped a global
+        -- window of the oldest batch x 10 rows and ranked tenants inside it: a tenant
+        -- with more than one window of rows its downstream kept refusing filled the
+        -- window on every poll, and no other tenant's rows were ever selected. Each
+        -- tenant now contributes its own oldest eligible rows (the org registry is small;
+        -- each lookup is one index range scan on idx_outbox_pending_by_org), and rows
+        -- that are backing off or leased are not eligible at all.
+        SELECT c.id, c.org_id
+        FROM   org g
+        CROSS  JOIN LATERAL (
+            SELECT o.id, o.org_id
+            FROM   outbox o
+            WHERE  o.org_id = g.org_id
+              AND  o.dispatched = 0
+              AND  (o.next_attempt_at IS NULL OR o.next_attempt_at <= NOW())
+              AND  (o.claimed_until  IS NULL OR o.claimed_until  <  NOW())
+            ORDER  BY o.id
+            LIMIT  %(batch_size)s
+            FOR UPDATE SKIP LOCKED
+        ) c
+    ), picked AS (
+        -- Round-robin across tenants: rank within each tenant, take rank 1 of every
+        -- tenant before rank 2 of any.
+        SELECT id, org_id
+        FROM  (SELECT id, org_id,
+                      ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
+               FROM   candidates) r
+        ORDER  BY rn, id
+        LIMIT  %(batch_size)s
+    )
+    UPDATE outbox o
+    SET    claimed_until = NOW() + make_interval(secs => %(lease)s)
+    FROM   picked p
+    JOIN   org g ON g.org_id = p.org_id
+    WHERE  o.id = p.id
+    RETURNING o.id, o.transaction_id, o.event_type, o.payload, o.org_id, o.attempts,
+              g.downstream_url
+"""
+
+
+def _claim_batch(conn: psycopg2.extensions.connection) -> List[psycopg2.extras.RealDictRow]:
+    """Claim up to WORKER_BATCH_SIZE rows, fairly across tenants, in one short transaction.
+
+    The row locks taken by FOR UPDATE SKIP LOCKED last only until this transaction
+    commits, milliseconds later; what keeps other workers off the rows during dispatch is
+    claimed_until. ALL_ORGS: claiming is cross-tenant by definition.
+    """
+    with _tx(conn, _ledger.ALL_ORGS) as cur:
+        cur.execute(_CLAIM_SQL, {"batch_size": WORKER_BATCH_SIZE,
+                                 "lease": WORKER_LEASE_SECONDS})
+        return sorted(cur.fetchall(), key=lambda r: r["id"])
+
+
+def _finish_row(conn: psycopg2.extensions.connection, row: psycopg2.extras.RealDictRow,
+                error: Optional[str]) -> None:
+    """Commit one row's outcome, in its own transaction scoped to that row's tenant."""
+    with _tx(conn, row["org_id"]) as cur:
+        if error is None:
+            cur.execute(
+                "UPDATE outbox SET dispatched = 1, dispatched_at = NOW(), "
+                "claimed_until = NULL, last_error = NULL WHERE id = %s",
+                (row["id"],),
+            )
+        else:
+            delay = _OUTBOX_BACKOFF_SECONDS[min(row["attempts"], len(_OUTBOX_BACKOFF_SECONDS) - 1)]
+            cur.execute(
+                "UPDATE outbox SET attempts = attempts + 1, "
+                "next_attempt_at = NOW() + make_interval(secs => %s), "
+                "claimed_until = NULL, last_error = %s WHERE id = %s",
+                (delay, error[:500], row["id"]),
+            )
+
+
 def drain_batch(conn: psycopg2.extensions.connection) -> int:
     """
-    Read up to WORKER_BATCH_SIZE undispatched rows, dispatch each to ITS OWN tenant's
-    destination, then mark them dispatched=1 in the same transaction.
-    Returns the number of rows successfully dispatched. Returns 0 when the queue is empty.
+    Claim a batch, dispatch it with no transaction open, commit each row's outcome.
+    Returns the number of rows dispatched.
 
-    FAIRNESS. The batch is selected round-robin across tenants rather than by plain
-        `ORDER BY id`. With a global ordering, one tenant that enqueues a hundred
-        thousand events owns every batch until it drains, and every other tenant's
-        events wait behind it — the queue is shared, so a noisy tenant becomes an
-        outage for the quiet ones. ROW_NUMBER() partitioned by org_id interleaves them:
-        each cycle takes roughly the same number from every tenant with work pending.
-        Ordering within a tenant is still by id, which is what the outbox guarantees;
-        across tenants there was never an ordering to preserve.
+    This used to be one transaction: SELECT ... FOR UPDATE, an HTTP call per row (10 s
+    timeout each), then one UPDATE for the successes. With 100 rows that held locks for
+    up to ~17 minutes, and a failure left the row exactly as it was, to be retried on the
+    very next poll. Now:
+      1. _claim_batch — short transaction; sets claimed_until (the lease).
+      2. dispatch — no transaction, no locks, while the network is slow.
+      3. _finish_row — one small transaction per row: dispatched, or backed off by
+         _OUTBOX_BACKOFF_SECONDS with the error recorded. A row backing off is not
+         eligible, so a tenant whose downstream is down stops occupying the batch.
 
-    The ranking lives in a CTE because PostgreSQL rejects FOR UPDATE in a query that
-        contains a window function. `FOR UPDATE OF o` then locks only the outbox rows;
-        locking the org registry alongside them would serialise every worker replica
-        behind the same handful of tenant rows.
-
-    The join to org resolves each tenant's downstream_url in the same query, so
-        dispatching does not issue a lookup per row.
+    Delivery is at-least-once: if this process dies between 2 and 3, the lease expires
+    and the row is dispatched again. Receivers deduplicate on transaction_id.
     """
-    # ALL_ORGS: draining is cross-tenant by definition — the fairness ranking below only
-    #     means anything if the query can see every tenant's rows. The join to `org` is
-    #     unaffected either way; migration 0006 puts no policy on the registry.
-    with _tx(conn, _ledger.ALL_ORGS) as cur:
-        cur.execute(
-            """
-            WITH capped AS (
-                -- Bound what the window function sees. PostgreSQL cannot push the
-                -- outer LIMIT into a WindowAgg, so ranking the unbounded backlog
-                -- sorts EVERY dispatched=0 row on every poll: with a stuck
-                -- downstream the drain query grows more expensive exactly as the
-                -- backlog it is meant to drain grows, on the same database the
-                -- ingest path depends on. Taking the oldest N x 10 in id order
-                -- keeps the cost flat; fairness still holds across every tenant
-                -- with work inside that window.
-                --
-                -- FOR UPDATE SKIP LOCKED HERE, in the candidate step. It used to sit
-                -- only on the outer SELECT, so a second worker computed the SAME
-                -- window and the same picked ids as the first, skipped every one of
-                -- them, and returned 0: worker replicas added no parallelism at all.
-                -- Locking the window makes a second worker's window start after the
-                -- rows the first one holds. The cost is that the whole window stays
-                -- locked until this transaction commits, so a second worker only
-                -- finds work when the backlog exceeds one window; the lease redesign
-                -- planned for Phase 3 (claim, commit, dispatch outside the
-                -- transaction) removes that.
-                SELECT id, org_id
-                FROM   outbox
-                WHERE  dispatched = 0
-                ORDER  BY id
-                LIMIT  %(window_size)s
-                FOR UPDATE SKIP LOCKED
-            ), ranked AS (
-                SELECT id,
-                       ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
-                FROM   capped
-            ), picked AS (
-                SELECT id FROM ranked ORDER BY rn, id LIMIT %(batch_size)s
+    rows = _claim_batch(conn)
+    if not rows:
+        return 0
+
+    dispatched = 0
+    t0 = time.monotonic()
+    for row in rows:
+        try:
+            _dispatch_row(row, row.get("downstream_url"))
+        except Exception as exc:
+            log.warning(
+                "dispatch_failed id=%s transaction_id=%s attempts=%d error=%s",
+                row["id"], row["transaction_id"], row["attempts"] + 1, exc,
             )
-            SELECT o.id, o.transaction_id, o.event_type, o.payload, o.org_id,
-                   g.downstream_url
-            FROM   outbox o
-            LEFT   JOIN org g ON g.org_id = o.org_id
-            WHERE  o.id IN (SELECT id FROM picked)
-            ORDER  BY o.id
-            FOR UPDATE OF o SKIP LOCKED
-            """,
-            {"batch_size": WORKER_BATCH_SIZE, "window_size": WORKER_BATCH_SIZE * 10},
+            _finish_row(conn, row, str(exc) or type(exc).__name__)
+            continue
+        _finish_row(conn, row, None)
+        dispatched += 1
+
+    if dispatched:
+        log.info(
+            "dispatched=%d lag_ms=%d oldest_id=%d newest_id=%d",
+            dispatched, int((time.monotonic() - t0) * 1000), rows[0]["id"], rows[-1]["id"],
         )
-        rows = cur.fetchall()
-
-        if not rows:
-            return 0
-
-        dispatched_ids: List[int] = []
-        oldest_id = rows[0]["id"]
-        newest_id = rows[-1]["id"]
-        t0 = time.monotonic()
-
-        for row in rows:
-            try:
-                _dispatch_row(row, row.get("downstream_url"))
-                dispatched_ids.append(row["id"])
-            except Exception as exc:
-                log.warning(
-                    "dispatch_failed id=%s transaction_id=%s error=%s",
-                    row["id"],
-                    row["transaction_id"],
-                    exc,
-                )
-
-        if dispatched_ids:
-            cur.execute(
-                """
-                UPDATE outbox
-                SET    dispatched    = 1,
-                       dispatched_at = NOW()
-                WHERE  id = ANY(%(ids)s)
-                """,
-                {"ids": dispatched_ids},
-            )
-            lag_ms = int((time.monotonic() - t0) * 1000)
-            log.info(
-                "dispatched=%d lag_ms=%d oldest_id=%d newest_id=%d",
-                len(dispatched_ids),
-                lag_ms,
-                oldest_id,
-                newest_id,
-            )
-
-        return len(dispatched_ids)
+    return dispatched
 
 
 # ---------------------------------------------------------------------------
