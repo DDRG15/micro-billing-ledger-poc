@@ -1,5 +1,5 @@
 # test.yml — run the full test suite on every push and PR
-# Every test hits a real PostgreSQL 16 container — zero mocks.
+# Idempotency, RLS and worker concurrency use PostgreSQL 16; targeted checks use test doubles.
 
 name: Tests
 

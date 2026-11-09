@@ -8,7 +8,7 @@
 **Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
 
 **Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 463 / 463 — no mocks, no stubs, every assertion hits a live PostgreSQL database  
+**Tests:** 486 passed / 0 failed — recorded 2026-11-09 against PostgreSQL 16; database integration tests plus targeted test doubles\
 **Throughput:** 4,143 TPS batch · 112 TPS over HTTP at 16 concurrent clients (p50 112ms) · 24 TPS per-event · all reproducible via `python benchmark.py`, measured against the restricted role the service actually deploys as
 
 ---
@@ -577,7 +577,7 @@ scrape_configs:
 ## Test Coverage
 
 ```
-463 tests · python test_ledger.py · zero mocks · zero stubs · real PostgreSQL
+486 passed / 0 failed · python test_ledger.py · 2026-11-09 · PostgreSQL 16
 
 Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
 Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
@@ -630,7 +630,7 @@ C6-3       Demo credentials — refused at startup unless BILLING_ENV=dev AND a 
 C6-4       Subscriptions  — Stripe's documented objects (fixtures/stripe/) ledgered as LIFECYCLE
                             with no amount; DB constraint; pre-fix DLQ entries settle on replay
 C6-5       Full payload   — ledger, outbox and DLQ hold every field Stripe sent
-C6-6       DLQ outage     — invalid event whose DLQ write fails → 503 (real lock, no mocks)
+C6-6       DLQ outage     — invalid event whose DLQ write fails → 503 (PostgreSQL lock + timeout)
 C6-7       Two workers    — a second replica drains while the first holds its batch
 C6-8       Refused rows   — an event the database refuses (> 50 000 chars) → DLQ, not 500
 C6-9       RLS truth      — superuser / BYPASSRLS / a table without RLS all read as inert;
@@ -643,9 +643,13 @@ Writing a mutation test is itself easy to get wrong in a way that looks like suc
 
 Cycle 6 added fourteen more — every fix except the `/metrics` model change, which the rewritten A18 covers — and each reproduced the defect it guards against rather than failing somewhere else: the suite's guard skipped (exit 1 instead of 2), `request: dict` restored (422 back), the idempotency `.get` default restored (500 back), dev mode forced on (six refusal checks), five ways of undoing the subscription change — one of them caught by the database constraint alone — the four-field payload restored, a DLQ write result ignored (200 back), the candidate-step lock removed (second worker "got 0" back), the refused-row handler removed (500 back), and the BYPASSRLS check removed (`"enforced": true` for a role that bypasses every policy).
 
-**Why no mocks:** the concurrency bug does not live in `process_stripe_event()`. It lives at the thread-connection boundary — specifically in whether PostgreSQL's constraint engine serializes two concurrent inserts. A mock returns whatever you tell it to return; it cannot reproduce `ON CONFLICT DO NOTHING` semantics. The only proof that the idempotency guarantee holds is five real threads firing the same `event_id` at a real `PRIMARY KEY` constraint simultaneously.
+**Database coverage and test doubles:** idempotency tests execute real inserts; RLS tests connect as the restricted role; worker concurrency tests use separate PostgreSQL connections. Many HTTP sections use `_MockPool` to inject one controlled real connection. Phase 5 application checks and some retry/metrics checks patch Stripe signature verification to isolate routing and response behavior; separate signed-request checks exercise verification. Phase 4 injects a `process_stripe_event` failure to check the HTTP 503 response. Tenant delivery checks (A13), worker concurrency (C6-7), and lease/backoff checks (C6-12) replace dispatch to capture destinations, control interleaving, or simulate downstream failure without an external HTTP service. Model and formatter checks also run in memory.
 
-**Test isolation:** each section calls `fresh_conn()`, which issues `TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY` — resets data and `BIGSERIAL` sequences. No shared state between sections. Every assertion starts from a known-empty database.
+**Why concurrency needs PostgreSQL:** the idempotency guarantee depends on PostgreSQL's constraint engine serializing concurrent inserts at the thread-connection boundary. A test double cannot establish `ON CONFLICT DO NOTHING` behavior. The test releases five threads through a barrier, each with its own database connection, to insert the same `event_id`; a separate connection verifies that exactly one ledger row exists.
+
+CI runs the suite on Python 3.12 and 3.13 with PostgreSQL 16.
+
+**Test isolation:** database sections use `fresh_conn()`, which issues `TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY` and removes non-default tenants. This resets table data and sequences before the section builds its fixtures.
 
 **Concurrent idempotency test:**
 ```python
