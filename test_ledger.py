@@ -76,7 +76,8 @@ L.BILLING_API_KEY = ""
 # Test infrastructure
 # Minimal test runner — two globals (ok, fail) and one helper function.
 #     chk() is the assertion function: prints PASS or FAIL with the test name.
-#     No pytest, no unittest — intentional. Any recruiter can read and run this.
+#     No pytest, no unittest — intentional: the suite is one script that runs top to
+#     bottom against a disposable database, with no framework to install or learn.
 # ---------------------------------------------------------------------------
 ok = fail = 0
 
