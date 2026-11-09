@@ -108,26 +108,21 @@ from anywhere; the service warns at startup for as long as it is unrotated. The 
 credential still bypasses RLS by design, because migrations need DDL — it belongs to the
 migration step and to no process serving traffic.
 
-**And it governs rows, not what the process does with them afterwards.** An audit of the
-work above found a cross-tenant leak that row-level security could not have caught: the
-`/metrics` queue gauges are process-wide Prometheus objects, so a tenant's own scrape
-could render another tenant's `dlq_depth` if the two overlapped. The database answered
-correctly every time — the crossing happened one layer up, in shared process state.
-Fixed by making set-and-render atomic, and covered by a test that forces the interleave.
-It is worth stating plainly because the failure mode generalises: a database-enforced
-boundary says nothing about what happens after the rows are read.
+**RLS governs rows, not process-wide state.** `/metrics` exposes counters and queue gauges
+aggregated across tenants, plus `billing_secrets_info` for the operator's secrets. When
+authentication is configured, only the operator key (`BILLING_API_KEY`) is accepted;
+a tenant key gets 403, and missing or unknown keys get 401. With no keys configured
+anywhere, the endpoint remains open in development mode. A18 tests operator access and
+tenant refusal through the application's real connection pool. A tenant's own queue
+counts are available through `/ledger/summary`.
 
-The modelling question that left open — operator endpoint or tenant one — is settled:
-`/metrics` answers only the operator key (`BILLING_API_KEY`); a tenant key gets 403. Its
-counters were always aggregate across tenants, and `billing_secrets_info` fingerprints the
-operator's secrets, so a tenant view would be a separate endpoint with its own
-registry, not a filter on this one. One limit remains, deliberately: `rls_inert` is a
+One limit remains: `rls_inert` is a
 log line and a CI gate, not an alert: a deployment that quietly drops
 `APP_DATABASE_URL` reverts isolation to the application's own predicates, and nothing
 pages anyone. Grep for it after any deploy that touches database configuration.
 
-**Not attempted, within tenancy.** There is no admin credential, so no operator-wide view
-across tenants exists. No authentication beyond a single shared API key per tenant — no
+**Not attempted, within tenancy.** There is no cross-tenant ledger or DLQ API credential;
+the operator key grants aggregate `/metrics` access. No authentication beyond a single shared API key per tenant — no
 user accounts, no roles, no rotation flow. No audit log of who read operational data. No
 encryption at rest beyond whatever PostgreSQL is configured to provide. No GDPR/LGPD
 erasure path; the ledger is deliberately append-only and resolving that conflict needs a

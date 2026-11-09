@@ -556,9 +556,23 @@ events as `INVALID` entries. Replay them with `POST /dlq/{id}/retry`; each settl
 | `POST` | `/webhook/stripe/{org_id}` | Per-tenant ingest. Signature verified with that tenant's secret, so the path cannot be used to write into another tenant. Unknown org returns the same 400 as a bad signature — no enumeration. |
 | `GET` | `/health` | Liveness check |
 | `GET` | `/ledger/summary` | Row counts by status, DLQ depth, outbox pending count |
-| `GET` | `/dlq/entries?limit=N` | Inspect DLQ, newest first. Default 50, capped at 1,000. |
+| `GET` | `/dlq/entries` | Inspect the caller's DLQ, newest ID first; filter by `status`, page with `before_id`, and set `limit` (default 50, effective range 1–1,000). |
 | `POST` | `/dlq/{id}/retry` | Replay one entry. `409` if already `resolved` — the ledger holds it, so there is nothing to replay. `exhausted` stays replayable. |
 | `GET` | `/metrics` | Prometheus exposition, operator only: `BILLING_API_KEY` → 200, a tenant key → 403. |
+
+`GET /dlq/entries` query parameters:
+
+| Parameter | Behavior |
+|---|---|
+| `status` | Omit for all statuses, or select `pending`, `retrying`, `resolved`, `exhausted`, or `actionable`. `actionable` includes pending, retrying and exhausted entries. Any other value returns 422. |
+| `before_id` | Keyset cursor: return entries with `id < before_id`, ordered by descending ID. Pass the response's `next_before_id` for the next page. |
+| `limit` | Default 50; values below 1 return 422; values above 1,000 are capped at 1,000. |
+
+The response contains `entries`, `count`, and `next_before_id`. A full page returns its
+last entry's ID as the cursor; a short or empty page returns null. Each entry includes
+`status`, `retry_count`, `max_retries`, `next_retry_at`, and `claimed_at`, alongside its
+ID, transaction ID, reason, raw payload and received timestamp. Use `status=pending`
+to find old pending entries even when newer resolved entries fill the unfiltered page.
 
 ---
 
@@ -587,7 +601,7 @@ Secrets can also be supplied as files via `BILLING_API_KEY_FILE` and `STRIPE_WEB
 
 Publishing a hash is safe for a high-entropy secret and not for a guessable one; see [SECURITY.md](SECURITY.md).
 
-`/metrics` is the operator's endpoint: it answers only `BILLING_API_KEY`. Its counters are summed over every tenant and `billing_secrets_info` fingerprints the operator's own secrets, so no tenant view of it exists — a tenant key gets `403`, no key or an unknown one `401`. The queue gauges cover every tenant; a tenant's own figures are `/ledger/summary`. With tenants holding keys and `BILLING_API_KEY` empty there is no operator credential, and `/metrics` answers `403` to everyone until one is set.
+`/metrics` is the operator's endpoint when authentication is configured: it accepts `BILLING_API_KEY`. Its counters are summed over every tenant and `billing_secrets_info` fingerprints the operator's own secrets, so a tenant key gets `403`, no key or an unknown one `401`. The queue gauges cover every tenant; a tenant's own figures are `/ledger/summary`. With tenants holding keys and `BILLING_API_KEY` empty, set an operator key to enable scrapes. When no key is configured anywhere, the endpoint remains open in development mode.
 
 The header is `X-Api-Key`, which Prometheus's `authorization:` block cannot send (it sends `Authorization: <type> <credentials>`, so the example this section used to show got `401` on every scrape). Use `http_headers` — check that your Prometheus version's configuration reference lists it:
 
@@ -666,6 +680,8 @@ C6-7       Two workers    — a second replica drains while the first holds its 
 C6-8       Refused rows   — an event the database refuses (> 50 000 chars) → DLQ, not 500
 C6-9       RLS truth      — superuser / BYPASSRLS / a table without RLS all read as inert;
                             provision.py rotates billing_app from APP_DATABASE_URL
+C6-11      DLQ queries    — status filters, actionable set, unknown status → 422, retry fields;
+                            cursor walks all 1,203 entries once in descending ID order
 C6-12      Outbox leases  — idle DB session during dispatch, per-row finish, failed-row backoff;
                             quiet tenant served despite an older failing backlog;
                             live lease skipped, expired lease reclaimed;
@@ -720,7 +736,7 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Currency normalization | **LOW** | Done | Lowercased at the entry boundary by a `mode="before"` validator, so `USD` is accepted and stored as `usd` rather than dead-lettered. `LedgerEntry` still rejects un-normalized input as a second layer. |
 | Dependency pins | **MEDIUM** | Done | `psycopg2-binary==2.9.9` had no cp313 wheel, so the documented "Python 3.12+" prerequisite could not be followed. Bumped to 2.9.12; supported range stated explicitly. |
 | CI blind spot | **HIGH** | Done | No workflow built the image or started compose, which is why the three runtime findings above survived four audit cycles with green badges. `stack.yml` now builds, boots, and attacks the stack. |
-| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the tenant is derived from the API key rather than a header; ops queries scoped; per-tenant ingest verified with that tenant's own signing secret; the worker delivers to each tenant's `downstream_url` and drains round-robin so one tenant's backlog cannot starve another. Remaining: no admin credential — see [SECURITY.md](SECURITY.md). |
+| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the tenant is derived from the API key rather than a header; ops queries scoped; per-tenant ingest verified with that tenant's own signing secret; the worker delivers to each tenant's `downstream_url` and drains round-robin so one tenant's backlog cannot starve another. Remaining: no cross-tenant ledger or DLQ API credential; the operator key grants aggregate `/metrics` access — see [SECURITY.md](SECURITY.md). |
 | Row-level security | **HIGH** | Done | Isolation was a convention every query had to keep, and on 2026-08-11 the batch path forgot it in two branches — one tenant's payload readable by another, one Stripe event POSTED under two tenants. `ledger`, `outbox` and `dlq` now carry default-deny policies with `USING` and `WITH CHECK`, and the service connects as `billing_app` (`NOSUPERUSER NOBYPASSRLS`). The role is the part that matters: a superuser bypasses RLS regardless of `ENABLE` or `FORCE`, so policies alone enforce nothing. The process logs `rls_enforced` or `rls_inert` at every boot, and CI fails the build on `rls_inert`. |
 | GDPR / LGPD erasure | — | Not attempted | Conflicts directly with the append-only ledger this system is built around. Resolving that needs a documented retention and pseudonymization policy first, not code. |
 | PgBouncer + Kubernetes | — | Not attempted | Deployment topology, not application behavior. The `--workers 1` / `maxconn=20` note above is the prerequisite to settle first. |
