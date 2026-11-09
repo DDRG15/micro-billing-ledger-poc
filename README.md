@@ -154,10 +154,10 @@ flowchart TD
 
     TX -->|COMMIT| C[HTTP 200 to Stripe]
 
-    O -->|worker.py polls every N seconds\nSELECT FOR UPDATE SKIP LOCKED| W[Worker Service\ndispatched=0 → dispatched=1]
+    O -->|short claim transaction\nSELECT FOR UPDATE SKIP LOCKED + lease| W[Worker Service\nclaim → dispatch → finish per row]
     W -->|POST to that tenant's downstream_url| DS[Downstream System
 per tenant]
-    W -->|structured log if WORKER_LOG_ONLY| LOG[Log / Audit]
+    W -->|structured log when no destination is set| LOG[Log / Audit]
 
     DI --> OPS[Ops — GET /dlq/entries]
     DD --> OPS
@@ -175,33 +175,56 @@ The Transactional Outbox pattern guarantees that a `ledger` row and its correspo
 
 `worker.py` is a standalone Docker service — not a thread inside the API process. An in-process thread shares the connection pool, dies with the web server, and cannot be restarted independently. A separate service has its own lifecycle, its own connection, and its own failure domain.
 
-**`SELECT FOR UPDATE SKIP LOCKED`** is the concurrency mechanism:
+The worker runs **claim → dispatch → finish**:
+
+1. **Claim:** a short transaction selects eligible rows per tenant with `FOR UPDATE SKIP LOCKED`, ranks them round-robin across tenants, and sets `claimed_until`. Rows already delivered, backing off, or under a live lease are excluded. The transaction commits before dispatch starts. `WORKER_LEASE_SECONDS` defaults to `WORKER_BATCH_SIZE * 10 + 60` seconds (1,060 seconds for the default batch of 100).
+2. **Dispatch:** HTTP calls run with no database transaction open and no row locks held. The HTTP timeout is 10 seconds per row.
+3. **Finish:** each row's result commits in its own transaction scoped to that row's tenant. Success sets `dispatched=1` and `dispatched_at`; failure increments `attempts`, records `last_error` (up to 500 characters), sets `next_attempt_at`, and clears the lease.
+
+The claim query uses per-tenant candidate selection before the batch limit:
 
 ```sql
--- Round-robin across tenants, then lock. ROW_NUMBER() interleaves tenants so one
--- tenant's backlog cannot own every batch; the ranking sits in a CTE because
--- PostgreSQL rejects FOR UPDATE in a query containing a window function.
-WITH ranked AS (
-    SELECT id, ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
-    FROM   outbox WHERE dispatched = 0
+WITH candidates AS (
+    SELECT c.id, c.org_id
+    FROM org g
+    CROSS JOIN LATERAL (
+        SELECT o.id, o.org_id
+        FROM outbox o
+        WHERE o.org_id = g.org_id AND o.dispatched = 0
+          AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= NOW())
+          AND (o.claimed_until IS NULL OR o.claimed_until < NOW())
+        ORDER BY o.id
+        LIMIT %(batch_size)s
+        FOR UPDATE SKIP LOCKED
+    ) c
 ), picked AS (
-    SELECT id FROM ranked ORDER BY rn, id LIMIT 100
+    SELECT id, org_id
+    FROM (SELECT id, org_id,
+                 ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
+          FROM candidates) r
+    ORDER BY rn, id
+    LIMIT %(batch_size)s
 )
-SELECT o.id, o.transaction_id, o.event_type, o.payload, o.org_id, g.downstream_url
-FROM   outbox o
-LEFT   JOIN org g ON g.org_id = o.org_id
-WHERE  o.id IN (SELECT id FROM picked)
-ORDER  BY o.id
-FOR UPDATE OF o SKIP LOCKED;   -- locks outbox rows only, never the org registry
+UPDATE outbox o
+SET claimed_until = NOW() + make_interval(secs => %(lease)s)
+FROM picked p
+JOIN org g ON g.org_id = p.org_id
+WHERE o.id = p.id
+RETURNING o.id, o.transaction_id, o.event_type, o.payload, o.org_id, o.attempts,
+          o.claimed_until, g.downstream_url;
 ```
 
-`FOR UPDATE` locks the selected rows for the duration of the transaction. `SKIP LOCKED` skips rows already locked by another worker — rather than blocking, it moves on. Two worker replicas running simultaneously process different rows without any coordination. No event is dispatched twice.
+**Dispatch retry:** failures back off for 30 → 120 → 600 → 3,600 seconds; subsequent failures repeat the 3,600-second delay. There is no attempt limit and the worker never abandons an undelivered row. Backed-off rows are ineligible until their retry time, allowing other tenants' eligible rows into later batches.
 
-The `dispatched=1` update happens in the **same `BEGIN…COMMIT`** as the dispatch confirmation. A crash before `COMMIT` leaves `dispatched=0` — the event is retried on the next poll. Delivery is at-least-once. The ledger's `ON CONFLICT DO NOTHING` makes receipt exactly-once.
+**Lease fencing:** `claimed_until` is also the worker's fencing token. A failure updates delivery state only if the row is still undelivered and its lease value still matches that worker's claim. A late success is recorded whenever the row is still undelivered, even if another worker has reclaimed it. An update that does not apply emits `lease_lost`. A stale failure cannot clear another worker's lease or overwrite a delivered row's retry state.
+
+**Delivery is at-least-once.** A crash after dispatch but before the finish commit leaves the row eligible for redelivery once its lease expires. A worker that outlives its lease can overlap with a worker that reclaims the row. The downstream receiver must deduplicate by `transaction_id`; ingest idempotency does not deduplicate downstream side effects.
+
+**Downstream format:** the worker forwards the stored event payload as generic JSON over HTTP POST to each tenant's `org.downstream_url`, falling back to `DOWNSTREAM_URL`. It sends `Content-Type: application/json`, `X-Event-Type`, `X-Transaction-Id`, and `X-Org-Id`. There is no PostHog adapter or PostHog integration in this repository.
 
 **Fail-fast on misconfiguration:** if `DOWNSTREAM_URL` is empty and `WORKER_LOG_ONLY` is not `"true"`, the worker exits at startup with a structured error. The alternative — marking rows `dispatched=1` without forwarding them — is undetectable data loss.
 
-**Resilience:** `psycopg2.OperationalError` triggers exponential backoff (5 → 10 → 20 → 60s cap) and a reconnect loop. `SIGTERM` sets a stop flag; the worker finishes the current batch then exits 0. This is the correct behavior for Docker rolling deploys and Kubernetes graceful termination.
+**Database reconnect:** `psycopg2.OperationalError` triggers a reconnect loop with a delay starting at 5 seconds and doubling to a 60-second cap. This is separate from per-row dispatch backoff. `SIGTERM` sets a stop flag; the worker finishes the current batch before leaving the run loop.
 
 ---
 
@@ -418,6 +441,7 @@ CREATE TABLE org (
     api_key_sha256        TEXT        UNIQUE,
     stripe_webhook_secret TEXT        NOT NULL,
     active                BOOLEAN     NOT NULL DEFAULT TRUE,
+    downstream_url        TEXT,       -- migration 0005; NULL falls back to DOWNSTREAM_URL
     created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -449,7 +473,7 @@ CREATE TABLE ledger (
 --   cannot exist without its corresponding ledger row.
 --   Application logic alone is not sufficient; the FK constraint is the guarantee.
 -- dispatched=0 = pending downstream delivery.
--- A worker flips to dispatched=1 in the same TX as delivery confirmation.
+-- Claim commits before HTTP; each delivery result commits in a separate transaction.
 CREATE TABLE outbox (
     id             BIGSERIAL   PRIMARY KEY,
     org_id         TEXT        NOT NULL DEFAULT 'default',
@@ -458,6 +482,12 @@ CREATE TABLE outbox (
     payload        TEXT        NOT NULL,
     dispatched     INTEGER     NOT NULL DEFAULT 0,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    dispatched_at  TIMESTAMPTZ,
+    -- Delivery state (migration 0008)
+    attempts       INTEGER     NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ,
+    claimed_until  TIMESTAMPTZ,
+    last_error     TEXT,
     -- Composite, following the ledger key above.
     FOREIGN KEY (org_id, transaction_id)
         REFERENCES ledger(org_id, transaction_id) ON DELETE CASCADE
@@ -489,6 +519,7 @@ CREATE TABLE dlq (
 -- index that does not lead with the predicate's first column cannot serve it.
 CREATE INDEX IF NOT EXISTS idx_ledger_org_customer ON ledger(org_id, customer_id);
 CREATE INDEX IF NOT EXISTS idx_outbox_org_dispatched ON outbox(org_id, dispatched, id) WHERE dispatched=0;
+CREATE INDEX IF NOT EXISTS idx_outbox_pending_by_org ON outbox(org_id, id) WHERE dispatched=0;
 CREATE INDEX IF NOT EXISTS idx_dlq_org_retry ON dlq(org_id, status, next_retry_at) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS idx_dlq_stale_claim ON dlq(status, claimed_at) WHERE status='retrying';
 CREATE INDEX IF NOT EXISTS idx_org_api_key ON org(api_key_sha256) WHERE api_key_sha256 IS NOT NULL AND active;
@@ -635,6 +666,11 @@ C6-7       Two workers    — a second replica drains while the first holds its 
 C6-8       Refused rows   — an event the database refuses (> 50 000 chars) → DLQ, not 500
 C6-9       RLS truth      — superuser / BYPASSRLS / a table without RLS all read as inert;
                             provision.py rotates billing_app from APP_DATABASE_URL
+C6-12      Outbox leases  — idle DB session during dispatch, per-row finish, failed-row backoff;
+                            quiet tenant served despite an older failing backlog;
+                            live lease skipped, expired lease reclaimed;
+                            stale failure preserves a replacement lease, late success records delivery,
+                            late failure leaves a delivered row's retry state untouched
 ```
 
 **Mutation-verified.** A passing suite proves nothing until you watch it fail. Seventeen deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, letting `dlq_depth` count resolved rows again, reverting the pool to `minconn=1`, quietly changing a rate-limit default, making each `_tx` accept its tenant scope and silently never apply it, dropping the `/metrics` render lock, and dropping the pool's `autocommit` — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch. The two scope mutants reproduced the state row-level security shipped in before it was in force: policies present, nothing enforced — the API's raised `new row violates row-level security policy`, the worker's silently drained zero rows.
@@ -674,7 +710,7 @@ assert ledger_row_count == 1               # verified by a separate connection
 | Container healthcheck | **HIGH** | Done | Probed bare `localhost`, which musl resolves to `::1` while uvicorn binds IPv4 only — a healthy service reported `unhealthy` on every start. Now probes `127.0.0.1`. |
 | DLQ self-amplification | **HIGH** | Done | Retrying an entry whose event already reached the ledger appended a *new* DLQ row while resolving the old one, so the queue grew by one row per retry and `dlq_depth` became inflatable by retry activity. A replay now never creates DLQ rows, and `resolved` is terminal — 409 at the endpoint and a `status <> 'resolved'` guard on the one UPDATE that wrote status without checking it. |
 | Stranded retry claims | **HIGH** | Done | `retry_dlq_batch` commits its claim before doing the work; a failure in the recovery path left rows in `retrying` that the claim query never selected again. Migration 0003 adds `claimed_at`; stale claims are reclaimed automatically. |
-| Outbox worker | **HIGH** | Done | Standalone Docker service — `SELECT FOR UPDATE SKIP LOCKED`, exponential backoff, SIGTERM-safe. |
+| Outbox worker | **HIGH** | Done | Standalone Docker service — short claim transaction with `SELECT FOR UPDATE SKIP LOCKED` and a lease, HTTP outside transactions, per-row finish with lease fencing, per-tenant round-robin selection, and dispatch backoff with no attempt limit. Migration 0008 adds the delivery state and per-tenant pending index. Delivery is at-least-once; receivers deduplicate by `transaction_id`. |
 | DLQ retry budget | **HIGH** | Done | `retry_count`/`max_retries`/`next_retry_at` columns, exponential backoff, `POST /dlq/{id}/retry`, and a worker retry loop are implemented. Only `TRANSIENT` entries auto-retry; nothing in the live ingest path classifies an event as `TRANSIENT` yet (single-event DB failures return 503 so Stripe retries). The mechanism is provisioned for a future non-Stripe / async source with no upstream retrier. |
 | DLQ retention | **MEDIUM** | Done | `prune_dlq()` deletes `DUPLICATE` rows older than 90 days; the worker runs it at most once per hour. Without retention, Stripe's at-least-once redelivery grows the `dlq` table without bound. |
 | Schema migrations | **HIGH** | Done | Alembic migrations in `alembic/versions/` manage the production schema; the `migrate` service runs `alembic upgrade head`, then `provision.py`, before the API starts. CI applies the migrations too — `_bootstrap()` mirrors the tables with `IF NOT EXISTS` guards but creates neither the RLS policies nor the `billing_app` role, so a suite running without alembic could not have tested either. The API no longer calls `_bootstrap()` when it runs as the restricted role: it has no DDL rights, and shipping owner credentials to the container that serves traffic would undo the point of the role. |

@@ -60,12 +60,19 @@ URL would have been the largest leak in the system — the outbox payload carrie
 ids and amounts — since isolating the database means nothing if the data is then handed to
 a shared endpoint. NULL falls back to the process-wide `DOWNSTREAM_URL`, so a
 single-operator deployment is unchanged. Dispatch carries `X-Org-Id` so the receiver knows
-which tenant it is being handed.
+which tenant it is being handed, and `X-Transaction-Id` for receiver deduplication. Delivery
+is at-least-once: a crash after HTTP success but before the finish commit, or dispatch
+that outlives its lease, can deliver an event again. The worker forwards generic JSON;
+there is no PostHog adapter.
 
-The worker also drains round-robin across tenants rather than by global id order. That is
-an availability property rather than a confidentiality one: a shared queue drained in id
-order lets a tenant with a large backlog own every batch, making a noisy tenant an outage
-for the quiet ones.
+The worker selects eligible candidates per tenant, then ranks them round-robin before
+applying the batch limit. Claims commit before HTTP; `claimed_until` keeps other workers
+off a claimed row until the lease expires. Each result commits separately. Dispatch
+failures back off for 30, 120, 600 and then 3,600 seconds, repeating the final delay
+without an attempt limit. Backed-off and leased rows are excluded from selection. These
+are availability controls: a tenant's failing backlog does not fill every later batch.
+A stale failure can update only an undelivered row whose lease still matches its claim;
+a late success can mark an undelivered row delivered even after another worker claims it.
 
 **The database enforces isolation, not only the queries.** Every `SELECT` and `INSERT`
 used to carry its own `org_id` predicate, which holds exactly as long as nobody forgets
