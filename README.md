@@ -165,7 +165,7 @@ per tenant]
 
 ### Why this handles concurrent load correctly
 
-`INSERT INTO ledger ... ON CONFLICT (transaction_id) DO NOTHING` is a **database-level serialization point** — not an application lock, not a SELECT-then-INSERT race. Five threads firing the same `event_id` simultaneously all enter the transaction; PostgreSQL's PRIMARY KEY constraint ensures exactly one INSERT wins; all others produce `rowcount=0` (single-event path) or are absent from the `RETURNING` set (batch path). Zero application-level coordination required.
+`INSERT INTO ledger ... ON CONFLICT (org_id, transaction_id) DO NOTHING` is the **database-level serialization point** for each tenant. Five threads firing the same `event_id` for one tenant simultaneously all enter the transaction; PostgreSQL's composite PRIMARY KEY ensures exactly one INSERT wins; all others produce `rowcount=0` (single-event path) or are absent from the `RETURNING` set (batch path). No application lock is required.
 
 ---
 
@@ -427,8 +427,8 @@ The 500 TPS floor is a hard test assertion in `test_ledger.py` — not a metric,
 ## Schema
 
 ```sql
--- Financial record. transaction_id is PRIMARY KEY and the idempotency guard.
--- ON CONFLICT (transaction_id) DO NOTHING makes replay a zero-lock no-op at DB level.
+-- Financial record. The composite primary key is the per-tenant idempotency guard.
+-- ON CONFLICT (org_id, transaction_id) DO NOTHING skips a duplicate within its tenant.
 -- BIGINT: covers amounts up to ~$92 quadrillion (INTEGER max is only ~$21M).
 -- CHECK (length(payload) < 50000): prevents unbounded growth from malicious payloads.
 -- Tenant registry (migration 0004). The API key is stored only as a SHA-256, so a
