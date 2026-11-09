@@ -3611,6 +3611,68 @@ finally:
 
 
 # =============================================================================
+# C6-11: an old pending DLQ entry can be found over HTTP (item 8a)
+#     /dlq/entries returned the newest `limit` rows (max 1000) with no status, no retry
+#     state and no paging, so a pending entry behind a thousand newer resolved ones was
+#     unreachable — and pending is what an operator comes looking for.
+# =============================================================================
+print("\n── C6-11: /dlq/entries filters by status and pages by cursor ──────────")
+
+c611_conn = fresh_conn()
+# This section makes ~7 ops requests right after others that also count against
+#     RATE_LIMIT_OPS (20/minute per client); a 429 here would be the limiter, not 8a.
+L._limiter.reset()
+with c611_conn.cursor() as _c:
+    _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status, retry_count, "
+               "max_retries) VALUES ('evt_c611_old_pending','INVALID','{}','pending',1,3)")
+    _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status) "
+               "SELECT 'evt_c611_resolved_' || g, 'DUPLICATE', '{}', 'resolved' "
+               "FROM generate_series(1, 1200) g")
+    for _st in ("retrying", "exhausted"):
+        _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status) "
+                   "VALUES (%s,'INVALID','{}',%s)", (f"evt_c611_{_st}", _st))
+original_pool_c611 = L._pool
+L._pool = _MockPool(c611_conn)
+try:
+    _c611 = TestClient(L.app, raise_server_exceptions=False)
+    _all = _c611.get("/dlq/entries?limit=1000").json()
+    chk("the unfiltered newest-1000 page does not contain the old pending entry",
+        all(_e["transaction_id"] != "evt_c611_old_pending" for _e in _all["entries"]))
+    _p = _c611.get("/dlq/entries?status=pending").json()
+    chk("status=pending finds it",
+        [_e["transaction_id"] for _e in _p["entries"]] == ["evt_c611_old_pending"], str(_p)[:200])
+    _e0 = _p["entries"][0] if _p["entries"] else {}
+    chk("…with its retry state",
+        _e0.get("status") == "pending" and _e0.get("retry_count") == 1
+        and _e0.get("max_retries") == 3 and "next_retry_at" in _e0 and "claimed_at" in _e0,
+        str(_e0)[:200])
+    _act = _c611.get("/dlq/entries?status=actionable").json()
+    chk("status=actionable = pending + retrying + exhausted",
+        sorted(_e["status"] for _e in _act["entries"]) == ["exhausted", "pending", "retrying"],
+        str([_e["status"] for _e in _act["entries"]]))
+    chk("an unknown status → 422, not an empty 'all clear'",
+        _c611.get("/dlq/entries?status=pendng").status_code == 422)
+
+    # Page through everything with the cursor: every row exactly once, newest first.
+    _seen, _cursor, _pages = [], None, 0
+    while _pages < 20:
+        _url = "/dlq/entries?limit=500" + (f"&before_id={_cursor}" if _cursor else "")
+        _pg = _c611.get(_url).json()
+        _seen += [_e["id"] for _e in _pg["entries"]]
+        _pages += 1
+        _cursor = _pg["next_before_id"]
+        if _cursor is None:
+            break
+    chk("the cursor walks every entry exactly once",
+        len(_seen) == 1203 and len(set(_seen)) == 1203, f"{len(_seen)} rows, {len(set(_seen))} distinct")
+    chk("…newest first, in order", _seen == sorted(_seen, reverse=True))
+    chk("…and the last page says so (next_before_id null)", _cursor is None)
+finally:
+    L._pool = original_pool_c611
+    c611_conn.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

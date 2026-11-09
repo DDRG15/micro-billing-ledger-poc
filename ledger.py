@@ -2453,30 +2453,68 @@ def metrics(request: Request, _operator: None = Depends(_require_operator_key)) 
 
 @app.get("/dlq/entries")
 @_limiter.limit(RATE_LIMIT_OPS)
-def dlq_entries(request: Request, limit: int = 50,
+def dlq_entries(request: Request, limit: int = 50, status: Optional[str] = None,
+                before_id: Optional[int] = None,
                 org_id: str = Depends(_require_api_key)) -> JSONResponse:
     """
     Inspect DLQ entries over HTTP — newest first. This is the ops endpoint:
     without it, "check the DLQ" means "SSH into the box and run a psql query."
-    Default limit 50; capped at 1000 to prevent accidental full-table dumps.
     raw_payload is deserialized so callers get a JSON object, not a string.
     Requires X-Api-Key header when BILLING_API_KEY is set.
     sync def: runs in FastAPI's thread pool — no event loop blocking.
+
+    It used to return the newest `limit` rows (at most 1000) and nothing else: no
+    status, no retry state, no way to page. An old pending entry behind a thousand newer
+    resolved ones could not be reached over HTTP at all — and pending is exactly what an
+    operator comes here to find. So:
+
+      status     one of pending / retrying / resolved / exhausted, or `actionable`
+                 (pending + retrying + exhausted — the same set dlq_depth counts).
+                 Anything else is 422, not an empty list that reads as "all clear".
+      before_id  keyset cursor: entries with a smaller id. The response's
+                 next_before_id is the value for the next page, null on the last one.
+                 Keyset, not OFFSET: a row written between two pages cannot shift the
+                 next page and make an entry appear twice or never.
+      limit      1..1000, default 50.
+
+    Each entry carries its retry state: status, retry_count, max_retries,
+    next_retry_at and claimed_at.
     """
     if limit < 1:
         raise HTTPException(status_code=422, detail="limit must be >= 1")
+    limit = min(limit, 1000)  # never dump the entire table
+    if status is None:
+        statuses = None
+    elif status == "actionable":
+        statuses = ["pending", "retrying", "exhausted"]
+    elif status in {s.value for s in DLQStatus}:
+        statuses = [status]
+    else:
+        raise HTTPException(status_code=422, detail=(
+            "status must be one of pending, retrying, resolved, exhausted, actionable"))
 
+    where, params = ["org_id = %s"], [org_id]
+    if statuses is not None:
+        where.append("status = ANY(%s)")
+        params.append(statuses)
+    if before_id is not None:
+        where.append("id < %s")
+        params.append(before_id)
     conn = _pool.getconn()
     try:
         with _tx(conn, org_id) as cur:
             cur.execute(
-                "SELECT id, transaction_id, reason, raw_payload, received_at "
-                "FROM dlq WHERE org_id=%s ORDER BY id DESC LIMIT %s",
-                (org_id, min(limit, 1000)),  # cap at 1000 — never dump the entire table
+                "SELECT id, transaction_id, reason, raw_payload, received_at, status, "
+                "       retry_count, max_retries, next_retry_at, claimed_at "
+                "FROM dlq WHERE " + " AND ".join(where) + " ORDER BY id DESC LIMIT %s",
+                (*params, limit),
             )
             rows = cur.fetchall()
     finally:
         _pool.putconn(conn)
+
+    def _iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
 
     return JSONResponse(content={
         "entries": [
@@ -2485,11 +2523,18 @@ def dlq_entries(request: Request, limit: int = 50,
                 "transaction_id": r[1],
                 "reason":         r[2],
                 "raw_payload":    json.loads(r[3]),  # string → dict for clean JSON response
-                "received_at":    r[4].isoformat() if hasattr(r[4], "isoformat") else r[4],
+                "received_at":    _iso(r[4]),
+                "status":         r[5],
+                "retry_count":    r[6],
+                "max_retries":    r[7],
+                "next_retry_at":  _iso(r[8]),
+                "claimed_at":     _iso(r[9]),
             }
             for r in rows
         ],
         "count": len(rows),
+        # A full page may have more behind it; a short page is the last one.
+        "next_before_id": rows[-1][0] if len(rows) == limit else None,
     })
 
 
