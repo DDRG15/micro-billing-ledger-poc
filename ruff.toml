@@ -1,0 +1,10 @@
+# ruff configuration — defaults everywhere, one documented exception.
+
+[lint.per-file-ignores]
+# E402 (import not at top of file): both scripts must verify or set DATABASE_URL —
+#     disposable_db.require_disposable_database() — BEFORE `import ledger`, because ledger
+#     opens its connection pool at import. Moving those imports to the top is exactly the
+#     bug the guard exists to prevent: the pool would connect to whatever database the
+#     environment named before anything checked it was disposable.
+"test_ledger.py" = ["E402"]
+"benchmark.py" = ["E402"]

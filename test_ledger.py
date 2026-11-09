@@ -1437,7 +1437,8 @@ chk("1st delivery → POSTED",
 chk("Stripe redelivery → DLQ_DUPLICATE",
     L.process_stripe_event(amp_conn, ev_amp)["outcome"] == "DLQ_DUPLICATE")
 
-_amp_count = lambda: _q1(amp_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_amp_001'")
+def _amp_count():
+    return _q1(amp_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_amp_001'")
 chk("redelivery leaves exactly 1 DLQ row", _amp_count() == 1, f"got {_amp_count()}")
 
 r_amp = L.process_stripe_event(amp_conn, ev_amp, from_retry=True)
@@ -1453,7 +1454,8 @@ chk("money still counted exactly once",
 # The same rule covers INVALID: replaying a malformed payload must not append rows either.
 ev_amp_bad = fake_event(eid="evt_amp_bad", currency="WRONG")
 L.process_stripe_event(amp_conn, ev_amp_bad)
-_bad_count = lambda: _q1(amp_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_amp_bad'")
+def _bad_count():
+    return _q1(amp_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_amp_bad'")
 chk("invalid payload writes 1 DLQ row on ingest", _bad_count() == 1, f"got {_bad_count()}")
 L.process_stripe_event(amp_conn, ev_amp_bad, from_retry=True)
 L.process_stripe_event(amp_conn, ev_amp_bad, from_retry=True)
@@ -1484,7 +1486,8 @@ chk("1st manual retry → 200", r_t1.status_code == 200, f"got {r_t1.status_code
 chk("entry marked resolved",
     _q1(term_conn, "SELECT status FROM dlq WHERE id=%s", (term_dlq_id,)) == "resolved")
 
-_term_count = lambda: _q1(term_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_term_001'")
+def _term_count():
+    return _q1(term_conn, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_term_001'")
 chk("manual retry appends no DLQ row", _term_count() == 1, f"got {_term_count()}")
 
 r_t2 = term_client.post(f"/dlq/{term_dlq_id}/retry")
