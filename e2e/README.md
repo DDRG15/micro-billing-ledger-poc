@@ -79,3 +79,48 @@ Measured on one machine (12 cores, 14 GB RAM) against the default compose limits
 
 Numbers depend on the machine; the properties (no lost or duplicated events, `503`
 rather than `500`, bounded memory) are what the run checks.
+
+## Stripe sandbox reconciliation
+
+`stripe_sandbox.py` runs the service against a real Stripe sandbox (test mode only; it
+never passes `--live` and aborts on a live-mode event) and checks that the books match
+what Stripe says it emitted.
+
+Requirements: the Stripe CLI logged in to a sandbox, Docker, and the normal stack
+running with `STRIPE_WEBHOOK_SECRET` set to the CLI's signing secret
+(`stripe listen --print-secret`). `stripe listen` signs every forwarded event with
+that one secret, and it reaches the service from a single address, so raise the webhook
+limit for the run (`RATE_LIMIT_WEBHOOK=100000/minute`); a burst above the default 100
+per minute is refused, and the script counts any non-200 answer as a failure.
+
+```bash
+cp .env.example .env
+export STRIPE_WEBHOOK_SECRET="$(stripe listen --print-secret | grep -oE 'whsec_[A-Za-z0-9]+')"
+RATE_LIMIT_WEBHOOK=100000/minute docker compose up -d --build --wait
+stripe listen --all-snapshot --forward-to localhost:8000/webhook/stripe > listen.log 2>&1 &
+
+python e2e/stripe_sandbox.py --listen-log listen.log --out-dir evidence
+```
+
+`--stripe-cmd` (or `STRIPE_CLI`) replaces `stripe`, for a containerised CLI;
+`--psql-cmd` replaces `docker compose exec -T postgres psql -U postgres -d billing`.
+Run it from the directory holding `docker-compose.yml`. The listener log can also come
+from a command (`--listen-log-cmd "docker logs <container>"`). The exit status is 0
+only when every control passes. The evidence directory holds the report, the masked
+listener log and the Stripe events the run compared against; nothing in it is a secret.
+
+| Phase | What it does |
+|---|---|
+| 1. Volume | `stripe trigger` over about 100 event types, four at a time (lowered if Stripe rate-limits), until more than `--target-events` (default 1000) events were forwarded |
+| 2. Resends | `stripe events resend` for `--resends` (default 60) delivered events, `invoice.paid` and subscription events included |
+| 3. Controls | the checks below |
+
+| Control | Pass condition |
+|---|---|
+| a | every forwarded event has exactly one row, in `ledger` or in `dlq` (not counting `DUPLICATE` rows) |
+| b | Stripe's count of `invoice.paid`, `invoice.payment_failed` and `customer.subscription.{created,updated,deleted}` since the start equals the ledger's POSTED, VOID and LIFECYCLE rows, and the event id sets are equal |
+| c | `amount_paid` of the `invoice.paid` events equals the POSTED `amount_cents`, and `amount_due` of the failed payments equals the VOID `amount_cents`, to the cent |
+| d | every delivery the listener logged was answered 200 |
+| e | no pending outbox rows, and no ledger row without an outbox row |
+| g | the listener forwarded every event Stripe emitted in the window |
+| r | each resend was redelivered, answered 200, and left the ledger unchanged |
