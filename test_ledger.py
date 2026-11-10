@@ -4116,6 +4116,67 @@ finally:
     c618.close()
 
 
+
+# =============================================================================
+# C6-19: malformed input gets a 4xx — the same one for every tenant
+#     A non-ASCII signature (TypeError in compare_digest) or a non-UTF-8 body escaped as
+#     500 for existing orgs while unknown orgs got 400: a tenant-enumeration oracle. A
+#     non-ASCII X-Api-Key was a 500. An 8 KB org id was logged twice, verbatim. A body
+#     nested 1,000 deep made the 422 handler recurse into a 500. All reproduced live.
+# =============================================================================
+print("\n── C6-19: hostile input → the same 4xx, bounded logs ────────────────────")
+
+c619 = fresh_conn()
+with c619.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES ('c619','c619','whsec_c619')")
+_orig_pool_619 = L._pool
+L._pool = _MockPool(c619)
+_cl619 = TestClient(L.app, raise_server_exceptions=False)
+_logged_619 = []
+
+
+class _Grab619(logging.Handler):
+    def emit(self, record):
+        _logged_619.append(record.getMessage() + " " + str(getattr(record, "org_id", "")))
+
+
+_grab_619 = _Grab619()
+L._log.addHandler(_grab_619)
+try:
+    _bad_sig = {"Content-Type": "application/json", "Stripe-Signature": b"t=1,v1=\xe9"}
+    _known = _cl619.post("/webhook/stripe/c619", content=b'{"id":"a","type":"b"}', headers=_bad_sig)
+    _unknown = _cl619.post("/webhook/stripe/nosuchorg", content=b'{"id":"a","type":"b"}',
+                           headers=_bad_sig)
+    chk("a non-ASCII signature → 400 for a real tenant, same as for an unknown one",
+        _known.status_code == _unknown.status_code == 400 and _known.text == _unknown.text,
+        f"{_known.status_code} vs {_unknown.status_code}")
+    _u16 = '{"id":"evt_u16","type":"invoice.paid"}'.encode("utf-16")
+    _r = _cl619.post("/webhook/stripe/c619", content=_u16,
+                     headers={"Content-Type": "application/json", "Stripe-Signature": "t=1,v1=00"})
+    chk("a UTF-16 body → 4xx, not 500", 400 <= _r.status_code < 500, str(_r.status_code))
+    _orig_key_619, L.BILLING_API_KEY = L.BILLING_API_KEY, "op_key_c619"
+    try:
+        _r = _cl619.get("/ledger/summary", headers={"X-Api-Key": b"caf\xe9"})
+        _r2 = _cl619.get("/metrics", headers={"X-Api-Key": b"caf\xe9"})
+    finally:
+        L.BILLING_API_KEY = _orig_key_619
+    chk("a non-ASCII X-Api-Key → 401 on ops and /metrics, not 500",
+        _r.status_code == 401 and _r2.status_code == 401, f"{_r.status_code} {_r2.status_code}")
+    _r = _cl619.post("/webhook/stripe/" + "A" * 8000, content=b'{"id":"a","type":"b"}',
+                     headers={"Content-Type": "application/json"})
+    _longest = max((len(_m) for _m in _logged_619 if "AAAA" in _m), default=0)
+    chk("an 8 KB org id → 400, logged truncated", _r.status_code == 400 and 0 < _longest < 300,
+        f"{_r.status_code}, longest log line {_longest}")
+    _r = _cl619.post("/webhook/stripe", content=b"[" * 1000 + b"]" * 1000,
+                     headers={"Content-Type": "application/json", "Stripe-Signature": "t=1,v1=00"})
+    chk("a body nested 1,000 deep → 422, not a 500 from the error handler",
+        _r.status_code == 422 and len(_r.content) < 5000, f"{_r.status_code} {len(_r.content)} bytes")
+finally:
+    L._log.removeHandler(_grab_619)
+    L._pool = _orig_pool_619
+    c619.close()
+
+
 # =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.

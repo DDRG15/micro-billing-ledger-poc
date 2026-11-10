@@ -39,6 +39,7 @@ import json           # JSON serialization for raw payload archiving
 import logging        # Structured log output to file and stderr
 from logging.handlers import RotatingFileHandler  # Rotating file handler — caps log file size to prevent disk fill
 import os             # DATABASE_URL, STRIPE_WEBHOOK_SECRET, BILLING_API_KEY env var lookup
+import re             # the shape a tenant id may take in a webhook path (_ORG_ID_RE)
 import time           # perf_counter for benchmark timing
 import threading      # serialises the /metrics set-then-render pair (see metrics())
 import stripe         # Stripe SDK for HMAC-SHA256 webhook signature verification
@@ -126,6 +127,7 @@ _log = logging.getLogger("ledger")
 #     All pinned in requirements.txt — no surprise version changes.
 # ---------------------------------------------------------------------------
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.responses import JSONResponse, Response  # noqa: E402
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator  # noqa: E402
 from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: E402
@@ -1954,6 +1956,20 @@ class _BodySizeCap:
 
 app.add_middleware(_BodySizeCap, max_bytes=MAX_REQUEST_BODY_BYTES)
 
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 without echoing the input back.
+
+    FastAPI's default handler returns each error's `input` and serializes it with the
+    recursive jsonable_encoder: an unauthenticated body nested 1,000 levels deep raised
+    RecursionError there and answered 500 with a traceback in the log. The location,
+    type and message are what a caller needs; the input is what they just sent.
+    """
+    detail = [{"type": e.get("type"), "loc": [str(x)[:64] for x in e.get("loc", ())][:8],
+               "msg": str(e.get("msg", ""))[:200]} for e in exc.errors()[:20]]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
 # Ensure all three tables and their indexes exist before the pool opens connections.
 #     The bootstrap connection is closed immediately — it is not reused.
 #
@@ -2284,7 +2300,9 @@ def _require_api_key(x_api_key: str = Header(default="")) -> str:
 
     # compare_digest, not ==. String equality short-circuits on the first differing
     #     byte, which leaks the length of a correct prefix to anyone timing the response.
-    if BILLING_API_KEY and hmac.compare_digest(x_api_key, BILLING_API_KEY):
+    #     On bytes: compare_digest raises TypeError for a non-ASCII str, and any caller
+    #     could send `X-Api-Key: café` to turn a 401 into a 500.
+    if BILLING_API_KEY and hmac.compare_digest(x_api_key.encode(), BILLING_API_KEY.encode()):
         return DEFAULT_ORG_ID
 
     raise HTTPException(status_code=401, detail="Invalid API key")
@@ -2308,7 +2326,7 @@ def _require_operator_key(x_api_key: str = Header(default="")) -> None:
         return  # dev mode — the startup warning already says the endpoints are open
     if not x_api_key:
         raise HTTPException(status_code=401, detail="X-Api-Key header required")
-    if BILLING_API_KEY and hmac.compare_digest(x_api_key, BILLING_API_KEY):
+    if BILLING_API_KEY and hmac.compare_digest(x_api_key.encode(), BILLING_API_KEY.encode()):
         return
     if _ANY_ORG_KEYS:
         conn = _pool.getconn()
@@ -2355,6 +2373,18 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
     raw_body   = request._body
     sig_header = request.headers.get("stripe-signature", "")
 
+    # The org_id is attacker-chosen and was logged as given, twice per request: an 8 KB
+    #     path produced a 16 KB log line, at the webhook rate limit, into a log Docker
+    #     does not rotate by default. A malformed one cannot name a tenant, so it gets the
+    #     same answer as an unknown org without touching the database.
+    if not _ORG_ID_RE.fullmatch(org_id):
+        _log.warning(
+            "webhook for malformed org_id=%r", org_id[:64],
+            extra={"event": "webhook_unknown_org", "org_id": org_id[:64]},
+        )
+        _WEBHOOK_EVENTS.labels("UNKNOWN_ORG").inc()
+        raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
+
     conn = _pool.getconn()
     try:
         secret = _org_webhook_secret(conn, org_id)
@@ -2368,7 +2398,12 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
 
         try:
             stripe.Webhook.construct_event(raw_body, sig_header, secret)
-        except stripe.error.SignatureVerificationError:
+        except (stripe.error.SignatureVerificationError, UnicodeError, TypeError, ValueError):
+            # Not only SignatureVerificationError: a non-ASCII v1= raises TypeError in
+            #     compare_digest and a non-UTF-8 body UnicodeDecodeError. Those escaped as
+            #     500 — but only for orgs that exist, since an unknown org answers 400
+            #     before this point: a tenant-enumeration oracle. Every malformed
+            #     signature is the same 400 now.
             raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
 
         try:
@@ -2404,6 +2439,10 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
         },
     )
     return JSONResponse(content=result)
+
+
+# What a tenant id can look like. Anything else is refused before any lookup.
+_ORG_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 @app.post("/webhook/stripe/{org_id}", status_code=status.HTTP_200_OK)

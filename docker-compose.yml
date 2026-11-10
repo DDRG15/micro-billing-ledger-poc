@@ -22,12 +22,21 @@
 #     For the full stack:
 #       docker compose up
 
+# Docker's json-file driver keeps a container's stdout forever unless told otherwise; an
+#     attacker-influenced log line at the webhook rate limit could fill the host disk.
+x-logging: &capped-logs
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
 
   # ---------------------------------------------------------------------------
   # postgres — the database backend
   # ---------------------------------------------------------------------------
   postgres:
+    logging: *capped-logs
     image: postgres:16-alpine
     networks: [billing_net]
     environment:
@@ -51,6 +60,7 @@ services:
   # migrate — runs alembic upgrade head before the API starts (Phase 10)
   # ---------------------------------------------------------------------------
   migrate:
+    logging: *capped-logs
     build: .
     networks: [billing_net]
     # Schema first, then the deploy-time rows that need owner rights. provision.py syncs
@@ -90,6 +100,7 @@ services:
   # billing — the FastAPI application
   # ---------------------------------------------------------------------------
   billing:
+    logging: *capped-logs
     build: .
     networks: [billing_net]
     environment:
@@ -172,6 +183,7 @@ services:
   # worker — Transactional Outbox drain worker
   # ---------------------------------------------------------------------------
   worker:
+    logging: *capped-logs
     build: .
     networks: [billing_net]
     command: python worker.py
@@ -230,6 +242,7 @@ services:
   #     Or skip Caddy locally and use http://localhost:8000 directly.
   # ---------------------------------------------------------------------------
   caddy:
+    logging: *capped-logs
     image: caddy:2-alpine
     networks:
       billing_net:
