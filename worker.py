@@ -404,7 +404,11 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
     failed_orgs: set = set()
     t0 = time.monotonic()
     for row in rows:
-        if row["org_id"] in failed_orgs:
+        # Stopping (SIGTERM) or a tenant that already failed in this batch: hand the row
+        #     back untried. Leaving it claimed stranded it for the whole lease — a worker
+        #     restarted mid-batch kept up to a batch of paid events undelivered for
+        #     ~17 minutes (reproduced against the compose stack).
+        if _stop or row["org_id"] in failed_orgs:
             _release_row(conn, row)
             continue
         try:

@@ -175,6 +175,10 @@ services:
     build: .
     networks: [billing_net]
     command: python worker.py
+    # SIGTERM lets the row in flight finish (DISPATCH_DEADLINE_SECONDS, 15 s by default)
+    #     and hands the rest of the batch back. Docker's default 10 s grace would SIGKILL
+    #     it first, stranding the batch under its lease.
+    stop_grace_period: 30s
     environment:
       # Same restricted role as billing, same reason. The worker is the process that
       #     legitimately crosses tenants (outbox drain, DLQ retry claim, retention), so

@@ -4028,6 +4028,41 @@ finally:
     c616.close()
 
 
+# =============================================================================
+# C6-17: a worker stopped mid-batch hands its unsent rows back
+#     A restart (deploy, SIGTERM) left the rest of the claimed batch under its lease:
+#     against the compose stack, five paid events sat undelivered for ~17 minutes.
+# =============================================================================
+print("\n── C6-17: SIGTERM mid-batch releases the rows not yet sent ──────────────")
+
+c617 = fresh_conn()
+L.process_stripe_event_batch(c617, [fake_event(eid=f"evt_c617_{_i}") for _i in range(5)])
+_orig_dispatch_617, _orig_batch_617 = W._dispatch_row, W.WORKER_BATCH_SIZE
+W.WORKER_BATCH_SIZE = 10
+_sent_617 = []
+
+
+def _dispatch_617(row, destination=None):
+    _sent_617.append(row["transaction_id"])
+    if len(_sent_617) == 2:
+        W._stop = True          # SIGTERM arrives while the second row is in flight
+
+
+W._dispatch_row = _dispatch_617
+try:
+    W.drain_batch(c617)
+    with c617.cursor() as _c:
+        _c.execute("SELECT COUNT(*) FILTER (WHERE dispatched = 1), "
+                   "COUNT(*) FILTER (WHERE dispatched = 0 AND claimed_until IS NULL AND attempts = 0) "
+                   "FROM outbox WHERE transaction_id LIKE 'evt_c617_%'")
+        _st_617 = _c.fetchone()
+    chk("the row in flight finishes; the three not yet sent are released untried",
+        len(_sent_617) == 2 and _st_617 == (2, 3), f"sent={len(_sent_617)} state={_st_617}")
+finally:
+    W._stop = False
+    W._dispatch_row, W.WORKER_BATCH_SIZE = _orig_dispatch_617, _orig_batch_617
+    c617.close()
+
 
 # =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
