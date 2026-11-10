@@ -3398,14 +3398,18 @@ finally:
 
 # =============================================================================
 # C6-8: an event the database refuses is dead-lettered, not answered with 500
-#     ledger.payload carries CHECK (length(payload) < 50000). A validated event that
-#     crossed it raised IntegrityError, which nothing caught: the webhook answered 500,
+#     A validated event that a ledger CHECK refused raised IntegrityError, which nothing caught: the webhook answered 500,
 #     Stripe retried a delivery that fails identically every time, and after three days
-#     the event was gone with no ledger row and no DLQ row.
+#     the event was gone with no ledger row and no DLQ row. The payload limit that
+#     used to trigger it is now 8 MiB (C6-18), out of reach through the 1 MiB body cap,
+#     so this section installs its own 50,000-char CHECK to exercise the refusal path.
 # =============================================================================
 print("\n── C6-8: a refused row goes to the DLQ, not to a 500 ───────────────────")
 
 c68_conn = fresh_conn()
+with c68_conn.cursor() as _c:
+    _c.execute("ALTER TABLE ledger ADD CONSTRAINT c68_probe_check "
+               "CHECK (length(payload) < 50000) NOT VALID")
 _SEC_C68 = "whsec_c68_signing_secret"
 with c68_conn.cursor() as _c:
     _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
@@ -3424,13 +3428,13 @@ _locker68 = psycopg2.connect(_TEST_DSN)
 try:
     _c68_client = TestClient(L.app, raise_server_exceptions=False)
     _big = _oversize("evt_c68_big")
-    chk("the probe really crosses the ledger's 50 000-char limit", len(json.dumps(_big)) > 50000)
+    chk("the probe really crosses the probe's 50 000-char limit", len(json.dumps(_big)) > 50000)
     _r = _post_raw(_c68_client, "/webhook/stripe/c68", json.dumps(_big), _SEC_C68)
     chk("oversize valid event → 200 DLQ_INVALID, not 500",
         _r.status_code == 200 and _r.json().get("outcome") == "DLQ_INVALID",
         f"{_r.status_code} {_r.text[:200]}")
     chk("…the reason names the constraint that refused it",
-        "ledger_payload_check" in (_r.json().get("reason") or ""), _r.text[:200])
+        "c68_probe_check" in (_r.json().get("reason") or ""), _r.text[:200])
     chk("…no partial write: no ledger row, no outbox row",
         _q1(c68_conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_c68_big'") == 0
         and _q1(c68_conn, "SELECT COUNT(*) FROM outbox WHERE transaction_id='evt_c68_big'") == 0)
@@ -3463,6 +3467,11 @@ finally:
     L._pool = original_pool_c68
     _locker68.close()
     c68_conn.close()
+    _undo68 = psycopg2.connect(_TEST_DSN)
+    _undo68.autocommit = True
+    with _undo68.cursor() as _c:
+        _c.execute("ALTER TABLE ledger DROP CONSTRAINT IF EXISTS c68_probe_check")
+    _undo68.close()
 
 
 # =============================================================================
@@ -4062,6 +4071,49 @@ finally:
     W._stop = False
     W._dispatch_row, W.WORKER_BATCH_SIZE = _orig_dispatch_617, _orig_batch_617
     c617.close()
+
+
+
+# =============================================================================
+# C6-18: a large real invoice is ledgered, not dead-lettered
+#     CHECK (length(payload) < 50000) refused a signed invoice.paid with forty line items
+#     (60 KB): 200 to Stripe, DLQ INVALID with max_retries 0, and a replay hit the same
+#     CHECK — a $4,999 payment that never reached the ledger. Migration 0009: 8 MiB.
+# =============================================================================
+print("\n── C6-18: a 60 KB invoice.paid is POSTED; the limit covers the body cap ──")
+
+c618 = fresh_conn()
+_SEC_C618 = "whsec_c618_signing_secret"
+with c618.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+               ("c618", "c618", _SEC_C618))
+_orig_pool_618 = L._pool
+L._pool = _MockPool(c618)
+try:
+    _cl618 = TestClient(L.app, raise_server_exceptions=False)
+    _ev618 = _fixture("invoice.paid", "evt_c618_lines")
+    _ev618["data"]["object"]["lines"] = {"object": "list", "data": [
+        {"id": f"il_{_i}", "amount": 12000, "description": "Plan Pro — línea " + "x" * 1400}
+        for _i in range(40)]}
+    chk("the probe is a 60 KB event", len(json.dumps(_ev618)) > 60000)
+    _r = _post_raw(_cl618, "/webhook/stripe/c618", json.dumps(_ev618), _SEC_C618)
+    chk("a signed 60 KB invoice.paid → POSTED, with its ledger and outbox rows",
+        _r.status_code == 200 and _r.json().get("outcome") == "POSTED"
+        and _q1(c618, "SELECT COUNT(*) FROM outbox WHERE transaction_id='evt_c618_lines'") == 1,
+        f"{_r.status_code} {_r.text[:160]}")
+    # The worst case the 1 MiB body cap admits: all non-ASCII, escaped 6x by json.dumps.
+    _ev618b = _fixture("invoice.paid", "evt_c618_wide")
+    _ev618b["data"]["object"]["metadata"] = {"note": "é" * 450_000}
+    _body618 = json.dumps(_ev618b, ensure_ascii=False)
+    chk("…and the largest body the cap admits fits the ledger limit",
+        len(_body618.encode()) <= L.MAX_REQUEST_BODY_BYTES
+        and len(json.dumps(_ev618b)) <= 8388608, f"{len(_body618.encode())} bytes on the wire")
+    _r = _post_raw(_cl618, "/webhook/stripe/c618", _body618, _SEC_C618)
+    chk("…and is POSTED", _r.status_code == 200 and _r.json().get("outcome") == "POSTED",
+        f"{_r.status_code} {_r.text[:160]}")
+finally:
+    L._pool = _orig_pool_618
+    c618.close()
 
 
 # =============================================================================

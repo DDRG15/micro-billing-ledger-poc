@@ -868,7 +868,7 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
                 currency        TEXT    NOT NULL DEFAULT 'usd',
                 status          TEXT    NOT NULL,
                 idempotency_key TEXT    NOT NULL,
-                payload         TEXT    NOT NULL CHECK (length(payload) < 50000),
+                payload         TEXT    NOT NULL CHECK (length(payload) <= 8388608),
                 created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 CONSTRAINT ledger_amount_matches_kind
                     CHECK ((amount_cents IS NULL) = (event_type LIKE 'customer.subscription.%')),
@@ -912,6 +912,19 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         cur.execute("ALTER TABLE outbox ADD COLUMN IF NOT EXISTS last_error TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_pending_by_org "
                     "ON outbox (org_id, id) WHERE dispatched = 0")
+        # Payload limit (migration 0009): 50,000 chars refused real invoices; now 8 MiB.
+        #     Swapped only while the old definition is still in place.
+        cur.execute("""
+            DO $$ BEGIN
+                IF EXISTS (SELECT 1 FROM pg_constraint
+                           WHERE conname = 'ledger_payload_check'
+                             AND pg_get_constraintdef(oid) LIKE '%50000%') THEN
+                    ALTER TABLE ledger DROP CONSTRAINT ledger_payload_check;
+                    ALTER TABLE ledger ADD CONSTRAINT ledger_payload_check
+                        CHECK (length(payload) <= 8388608) NOT VALID;
+                END IF;
+            END $$
+        """)
 
         # dlq — every rejected event lands here with a structured reason code.
         #     raw_payload is the full event JSON as received (every field; re-serialized,
@@ -1201,9 +1214,9 @@ def process_stripe_event(
         raise RuntimeError(f"DB write failed: {exc}") from exc
     except psycopg2.IntegrityError as exc:
         # The event passed validation and the database still refused the row: a CHECK
-        #     the models do not mirror. `length(payload) < 50000` is the one a real
-        #     Stripe event can reach — an invoice with many line items or large
-        #     metadata. This used to propagate: the webhook answered 500, Stripe retried
+        #     the models do not mirror. The payload limit used to be one a real Stripe
+        #     event could reach (50,000 chars — an invoice with many line items); it is
+        #     8 MiB since migration 0009, above anything the 1 MiB body cap admits. This used to propagate: the webhook answered 500, Stripe retried
         #     a delivery that fails the same way every time, and after three days the
         #     event was gone with no ledger row and no DLQ row. A refusal is not
         #     transient, so a retry cannot fix it; dead-letter it like any other event
