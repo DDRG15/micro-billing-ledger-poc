@@ -114,6 +114,18 @@ found with `grep`.
 | C6-26 | An event id outside printable ASCII is `INVALID` |
 | C6-27 | A replayed event leaves one `DUPLICATE` row |
 | C6-28 | Event types the ledger does not record are `UNSUPPORTED`, not `INVALID` |
+| C6-30 | Every error path, driven through the real app, moves `http_errors_total` by one with the right `status`, `error_class` and `error_type`, moves `http_requests_total` by one (the 413 and the 500 included), and leaves exactly one `http_request` line with the same class and type; none ends in the `unclassified` fallback; no bare `HTTPException` in `ledger.py` |
+| C6-31 | The Caddyfile writes a JSON access log with the request headers removed (site logger and default logger), and marks its own `413` and `502` with the application's class and type |
+
+## Caddy behaviour the suite cannot check
+
+The suite does not start Caddy. C6-31 checks the Caddyfile as text. What Caddy actually
+records for each failure was measured against the `caddy:2-alpine` image (Caddy 2.11.9)
+with the Compose stack running, using raw TLS sockets for the slow and oversized cases.
+The results are in the README, under "Errors: class and type". Re-measure after changing
+the Caddy image or the Caddyfile: the 499 case, the missing line for a `read_header` cut
+and the unfiltered default logger for an unknown `Host` are all behaviour of Caddy, not of
+this repository.
 
 ## Mutation testing
 
@@ -121,6 +133,11 @@ A passing test proves little until you have seen it fail. For the later fixes, t
 was to revert the fix, run the new test, and confirm it fails for the reason it is meant
 to catch, not somewhere else. That is mutation testing done by hand: there is no
 automated mutation run in this repository, and CI does not repeat it.
+
+C6-30 was checked this way. Registering the observability layer inside the body cap again
+fails 3 checks, all on the 413. Removing the code that records class and type fails 53.
+Making the type marking a no-op fails 50, with every error landing in the `unclassified`
+fallback.
 
 One trap is worth knowing. A test that reports "no leak observed" can mean the leak does
 not exist or that the instrumentation never ran. The `/metrics` isolation test therefore

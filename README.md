@@ -14,7 +14,7 @@ without seeing each other's data.
 **Status:** proof of concept. It is built and tested to behave correctly under failure,
 but it has not carried real traffic, and the [limitations](#limitations) are listed below.
 **Stack:** Python 3.12 and 3.13 · FastAPI · Pydantic v2 · PostgreSQL 16 · Docker Compose ·
-Caddy. **Tests:** 612 checks in one script, plus a separate end-to-end failure harness.
+Caddy. **Tests:** 733 checks in one script, plus a separate end-to-end failure harness.
 
 ---
 
@@ -146,6 +146,7 @@ Each guarantee names the mechanism and the section of `test_ledger.py` that chec
 | A broken downstream cannot starve the others or fake a success | Per-tenant tasks on a bounded thread pool; a 15 s dispatch deadline; a redirect counts as a failure; rows are handed back on shutdown | C6-15, C6-16, C6-17, C6-22, C6-29 |
 | Tenants cannot read or write each other's rows, even through a bug | Row-level security enforced for the restricted `billing_app` role; the tenant comes from the API key, never from a header | A9 to A16 |
 | Hostile input is bounded | 1 MiB body cap (Caddy and the app), slow-client timeouts at Caddy, event ids limited to printable ASCII, failed authentications rate-limited before the database lookup, interactive API docs off outside dev | C6-14, C6-19, C6-21, C6-24, C6-25, C6-26 |
+| Every error response is recorded with a class and a type, including the 413 and the 500 | Pure ASGI observability layer outside the body cap; a fixed table of types; Caddy access log with request headers removed | C6-30, C6-31 |
 | The service will not run on published demo credentials unless the run is declared local | Start-up refusal unless `BILLING_ENV=dev` and the ingress is on loopback | C6-3 |
 
 **Delivery is at least once, not exactly once.** A worker that crashes after delivering
@@ -157,7 +158,7 @@ Every delivery carries `X-Transaction-Id`, so the receiver can discard repeats.
 ## How it was tested
 
 **The suite.** `test_ledger.py` is a single script that prints one line per check and
-exits non-zero on a failure: 612 checks against a live PostgreSQL 16. The guarantees above
+exits non-zero on a failure: 733 checks against a live PostgreSQL 16. The guarantees above
 are behaviour of the database (a unique key serializing concurrent inserts, policies
 applying to a restricted role, row locks skipping claimed rows), so the suite runs
 against one rather than a mock. CI runs it on Python 3.12 and 3.13, runs ruff and bandit,
@@ -219,7 +220,9 @@ amount), `DLQ_INVALID`, `DLQ_DUPLICATE`, and `UNSUPPORTED` (a well-formed Stripe
 type the ledger does not record: stored as a `resolved` DLQ row, not counted in
 `dlq_depth`, pruned with the duplicates).
 
-**Metrics.** `webhook_events_total{outcome}`, `http_requests_total`,
+**Metrics.** `webhook_events_total{outcome}`, `http_requests_total{method,path,status}`,
+`http_errors_total{status,error_class,error_type}` (one sample per response with status 400
+or above, see "Errors: class and type" below),
 `http_request_duration_seconds` (labelled by route template, not by resolved path),
 `dlq_depth` (rows needing action), `dlq_total`, `outbox_pending` and
 `billing_secrets_info` (a hash prefix of the live secrets, to confirm a rotation took
@@ -241,6 +244,79 @@ force:
 ```bash
 docker compose logs billing | grep -E "rls_enforced|rls_inert"
 ```
+
+Every response leaves one `http_request` line with `method`, `path` (the route template),
+`status`, `duration_ms` and `client_ip`. When the status is 400 or above the same line
+also carries `error_class` and `error_type`:
+
+```bash
+docker compose logs billing | grep '"event": "http_request"' | grep error_type
+```
+
+Caddy writes one JSON access line per request to its stdout, with the request headers
+removed (`X-Api-Key` and `Stripe-Signature` would otherwise be logged in plaintext):
+
+```bash
+docker compose logs caddy | grep '"http.log.access'
+```
+
+**Errors: class and type.**
+
+Each error response is recorded with a class (what kind of failure) and a type (which
+one). Both come from a fixed table in `ledger.py`, never from the request, so the metric's
+cardinality is bounded. "Recorded" means one log line and one `http_errors_total` sample.
+It does not mean alerted: Prometheus is not part of the Compose stack, so nothing pages
+anyone until something outside this repository scrapes `/metrics` and evaluates a rule.
+
+| Status | Class | Type | Origin |
+|---|---|---|---|
+| 400 | `authentication` | `invalid_signature` | Signature does not verify against the tenant's secret |
+| 400 | `authentication` | `unknown_tenant` | `org_id` names no active tenant. The response body is the same as `invalid_signature`, so a caller cannot enumerate tenants; only the log and the metric tell them apart |
+| 400 | `validation` | `malformed_tenant_id` | `org_id` does not match the tenant id pattern. Same response body as above |
+| 401 | `authentication` | `missing_api_key` | No `X-Api-Key` header |
+| 401 | `authentication` | `invalid_api_key` | Key matches no tenant and not `BILLING_API_KEY` |
+| 403 | `authorization` | `operator_key_required` | A tenant key on `/metrics` |
+| 404 | `not_found` | `route_not_found` | No such route, including `/docs` outside a dev run |
+| 404 | `not_found` | `dlq_entry_not_found` | `POST /dlq/{id}/retry` for an id this tenant does not have |
+| 405 | `validation` | `method_not_allowed` | The route exists, the method does not |
+| 409 | `conflict` | `dlq_already_resolved` | Retry of a `resolved` DLQ entry |
+| 413 | `size_limit` | `body_too_large` | Body over `MAX_REQUEST_BODY_BYTES`, or a malformed `Content-Length` |
+| 422 | `validation` | `request_validation` | The JSON body is not a valid envelope |
+| 422 | `validation` | `invalid_query` | A query or path parameter is invalid (`limit`, `status`, a non-integer `dlq_id`) |
+| 429 | `rate_limit` | `rate_limited` | A per-route limit (`RATE_LIMIT_WEBHOOK`, `RATE_LIMIT_OPS`, `RATE_LIMIT_METRICS`) |
+| 429 | `rate_limit` | `auth_failure_budget` | The client spent its failed-authentication budget |
+| 500 | `internal` | `unhandled_exception` | An exception no handler caught |
+| 503 | `dependency` | `database_unavailable` | `psycopg2.OperationalError` or `InterfaceError` |
+| 503 | `dependency` | `pool_exhausted` | Every pooled connection stayed checked out for `DB_POOL_WAIT_SECONDS` |
+| 503 | `dependency` | `ingest_db_failure` | The ingest path's own `RuntimeError` (event or DLQ row not stored) |
+
+A response that reaches the middleware without a type is recorded as class
+`unclassified`, type `unclassified_4xx` or `unclassified_5xx`. A test fails if any known
+path ends there, and another test rejects a bare `HTTPException` in `ledger.py`.
+
+A few useful queries:
+
+```promql
+sum by (error_type) (rate(http_errors_total[5m]))
+http_errors_total{error_class="dependency"}
+http_errors_total{error_type="unclassified_4xx"} > 0
+```
+
+Caddy marks the errors it produces itself with the same names, as extra fields on its
+access line: `413` is `size_limit` / `body_too_large`, and `502` (the `billing` container
+unreachable) is `dependency` / `upstream_unavailable`. Anything the application returns,
+including its own `4xx` and `5xx`, is a normal proxied response: Caddy logs the status
+and the application's line carries the class and type.
+
+**What is not recorded, measured against the `caddy:2-alpine` image (Caddy 2.11.9):**
+
+| Case | What Caddy and the application leave |
+|---|---|
+| Headers not finished within `read_header` (10 s) | Nothing. Caddy closes the connection with no response, and writes no line at the default log level or at debug level (only the TLS handshake) |
+| Body not finished within `read_body` (30 s) | Caddy answers `499`; one access line with `status` 499, `bytes_read` below the `Content-Length` and a duration of about 30 s. No class or type: Caddy's error routes do not run for 499. The application never sees the request |
+| Client closes the connection mid-body | Same `499` line from Caddy, after however long the client took. Duration tells it apart from the 30 s case. Directly against the application there is no line and no counter |
+| A request that is not valid HTTP | uvicorn answers `400` and writes its own `Invalid HTTP request received` warning. No `http_request` line, no class, no type |
+| A request for a `Host` that matches no site | Caddy answers an empty `200`; its default logger writes the line with status 0 |
 
 **Adding a tenant.** There is no admin API; a tenant is a row in `org`. The `INSERT` is
 in `.env.example`. Restart the API afterwards: whether any tenant holds a key is read once
