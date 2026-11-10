@@ -25,7 +25,7 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: ruff check
-        run: ruff check ledger.py worker.py provision.py send_test_webhook.py disposable_db.py test_ledger.py benchmark.py scripts/build_architecture_viewer.py e2e/check_run.py e2e/downstream.py e2e/loadgen.py
+        run: ruff check ledger.py worker.py provision.py send_test_webhook.py disposable_db.py test_ledger.py benchmark.py scripts/build_architecture_viewer.py e2e/check_run.py e2e/downstream.py e2e/loadgen.py e2e/stripe_sandbox.py
 
       - name: bandit security scan
-        run: bandit -r ledger.py worker.py provision.py send_test_webhook.py disposable_db.py e2e/check_run.py e2e/downstream.py e2e/loadgen.py -ll
+        run: bandit -r ledger.py worker.py provision.py send_test_webhook.py disposable_db.py e2e/check_run.py e2e/downstream.py e2e/loadgen.py e2e/stripe_sandbox.py -ll
