@@ -4,7 +4,7 @@
 #     service container and lint.yml runs static analysis. Neither builds the
 #     image or starts compose, so an entire class of defect was invisible to CI —
 #     a deploy could go green while the actual ingress path was dead. Three
-#     findings from the 2026-08-09 audit lived in exactly that blind spot:
+#     defects lived in exactly that blind spot:
 #
 #       - Caddy crash-looped on every `up` (CADDY_DOMAIN never reached the
 #         container), so HTTPS ingress had never once worked.
@@ -54,7 +54,7 @@ jobs:
           docker compose logs --tail 50
           exit 1
 
-      # --- Regression: Caddy must actually start (2026-08-09 CRITICAL) --------
+      # --- Regression: Caddy must actually start ------------------------------
       - name: Caddy is healthy, not crash-looping
         run: |
           status=$(docker compose ps --format '{{.Service}} {{.Status}}' | grep '^caddy')
@@ -65,10 +65,11 @@ jobs:
             && { echo "FAIL: caddy is crash-looping"; docker compose logs caddy; exit 1; }
           exit 0
 
-      # --- Regression: RLS must be IN FORCE, not merely present (Phase 13.7) -
-      # The acceptance criterion for 13.7, asserted where it can actually be observed.
-      #     13.6 shipped policies that were completely inert because the service
-      #     connected as a superuser, and the only external symptom was a log line. A
+      # --- Regression: RLS must be IN FORCE, not merely present ---------------
+      # The acceptance criterion for the unprivileged application role, asserted where it
+      #     can actually be observed. The first RLS migration shipped policies that were
+      #     completely inert because the service connected as a superuser, and the only
+      #     external symptom was a log line. A
       #     deploy that reverts APP_DATABASE_URL to the owner passes every other check
       #     in this file and every test in the suite — the isolation just silently stops
       #     being enforced by the database. So the log line is the assertion.
@@ -87,7 +88,7 @@ jobs:
             echo "$svc: rls_enforced"
           done
 
-      # --- Regression: the owner credential stays out of the services (Cycle 6 #1)
+      # --- Regression: the owner credential stays out of the services
       # The Dockerfile baked DATABASE_URL (the owner, which bypasses RLS) into the image,
       #     so billing and worker held it while compose said it was absent. Variable NAMES
       #     only: `env | cut -d= -f1` runs inside the container, so no value leaves it.

@@ -4,7 +4,7 @@ Revision ID: 0007
 Revises: 0006
 Create Date: 2026-10-04
 
-Subscription events are ledgered with no amount. Cycle 6, item 5d.
+Subscription events are ledgered with no amount.
 
 WHY. A Stripe Subscription object carries no top-level amount — prices live in
     items.data[].price — and the ledger demanded one from every event, so every real

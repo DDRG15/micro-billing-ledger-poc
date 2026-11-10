@@ -5,14 +5,14 @@ Revises: 0005
 Create Date: 2026-08-11
 
 Creates a non-superuser application role and puts tenant isolation behind PostgreSQL
-row-level security. Phase 13.6.
+row-level security.
 
 WHY. Until now isolation lived entirely in application queries: every SELECT and INSERT
     carried its own org_id predicate. That holds exactly as long as nobody forgets one,
     and on 2026-08-11 somebody did — process_stripe_event_batch built its DLQ rows
     without org_id in the INVALID and DUPLICATE branches, so one tenant's raw payload
     became readable by another and the same Stripe event ended up POSTED under two
-    tenants. Two audits caught it; three passes of my own review did not. No linter,
+    tenants. It surfaced in review, not in any automated check. No linter,
     type checker or constraint could have caught it, because the guarantee was a habit.
 
 THE PART THAT ACTUALLY MATTERS IS THE ROLE, NOT THE POLICY.

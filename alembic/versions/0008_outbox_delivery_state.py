@@ -4,7 +4,7 @@ Revision ID: 0008
 Revises: 0007
 Create Date: 2026-10-06
 
-Outbox rows carry their own delivery state. Cycle 6, items 6a and 6b.
+Outbox rows carry their own delivery state.
 
 WHY. drain_batch selected a batch FOR UPDATE and dispatched it over HTTP inside that
     transaction: 100 rows x a 10 s timeout held row locks for up to ~17 minutes. A failed

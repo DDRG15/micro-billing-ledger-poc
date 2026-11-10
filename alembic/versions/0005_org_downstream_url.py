@@ -5,7 +5,7 @@ Revises: 0004
 Create Date: 2026-08-11
 
 Adds org.downstream_url so each tenant's events are forwarded to that tenant's own
-endpoint. Phase 13.4.
+endpoint.
 
 WHY THIS IS THE POINT OF TENANCY IN THE WORKER. Until now every tenant's events went
     to one global DOWNSTREAM_URL. That is not a data leak in the single-operator

@@ -580,7 +580,7 @@ conn7 = fresh_conn()
 
 ev_zero_invoice = fake_event(eid="evt_zero_paid", etype="invoice.paid", amount=0)
 r = L.process_stripe_event(conn7, ev_zero_invoice)
-chk("invoice.paid with amount=0 → POSTED (a known zero: coupon, free item — 5f)",
+chk("invoice.paid with amount=0 → POSTED (a known zero: coupon, free item)",
     r["outcome"] == "POSTED", f"got {r['outcome']}")
 chk("…recorded at 0, not refused",
     _q1(conn7, "SELECT amount_cents FROM ledger WHERE transaction_id='evt_zero_paid'") == 0)
@@ -715,7 +715,7 @@ with patch("stripe.Webhook.construct_event"):
     ev_zero = fake_event(eid="evt_http_zero", amount=0)
     r = client.post("/webhook/stripe", json=ev_zero)
     chk("POST $0 invoice → HTTP 200",               r.status_code == 200)
-    chk("$0 invoice.paid → POSTED via HTTP (5f)",   r.json()["outcome"] == "POSTED",
+    chk("$0 invoice.paid → POSTED via HTTP", r.json()["outcome"] == "POSTED",
         f"got {r.json()}")
 
     ev_bad_cus = fake_event(eid="evt_http_bad_cus", customer="notacus_001")
@@ -726,7 +726,7 @@ with patch("stripe.Webhook.construct_event"):
 
     # Summary endpoint — verify shape and counts.
     #     Posted above: evt_http_001, evt_http_up_curr (uppercase currency is
-    #     normalized and accepted) and evt_http_zero ($0 invoice.paid, 5f) = 3 ledger
+    #     normalized and accepted) and evt_http_zero ($0 invoice.paid) = 3 ledger
     #     rows, 3 outbox rows. DLQ: 1 DUPLICATE + 2 INVALID (malformed currency, bad
     #     prefix) = 3.
     r = client.get("/ledger/summary")
@@ -1424,7 +1424,7 @@ amt_conn.close()
 
 
 # =============================================================================
-# A1: DLQ SELF-AMPLIFICATION (audit 2026-08-09)
+# A1: DLQ SELF-AMPLIFICATION
 # A retry must never create DLQ rows. The entry being replayed IS the DLQ record
 #     for that payload; its status/retry_count columns carry each attempt's result.
 #     Before the fix, retrying an entry whose event had already reached the ledger
@@ -1432,7 +1432,7 @@ amt_conn.close()
 #     pending row than it consumed, each itself retry-eligible. The queue amplified
 #     itself and inflated the dlq_depth operators read to judge ingestion health.
 # =============================================================================
-print("\n── A1: retry does not amplify the DLQ (audit 2026-08-09) ───────────────")
+print("\n── A1: retry does not amplify the DLQ ──────────────────────────────────")
 
 amp_conn = fresh_conn()
 ev_amp = fake_event(eid="evt_amp_001")
@@ -1469,7 +1469,7 @@ amp_conn.close()
 
 
 # =============================================================================
-# A2: 'resolved' IS TERMINAL (audit 2026-08-09)
+# A2: 'resolved' IS TERMINAL
 # A resolved entry means the ledger already holds its event, so replaying it can
 #     only produce DLQ_DUPLICATE. The endpoint used to accept it anyway, re-resolve
 #     the row and append another DLQ row, letting one id be reopened without limit.
@@ -1517,7 +1517,7 @@ term_conn.close()
 
 
 # =============================================================================
-# A3: STALE RETRY CLAIMS ARE RECLAIMED (audit 2026-08-09)
+# A3: STALE RETRY CLAIMS ARE RECLAIMED
 # retry_dlq_batch commits the claim (status='retrying') before doing the work, so a
 #     crash — or a failure inside the recovery UPDATE, likely because the outage that
 #     caused the retry is still going — left rows claimed forever. The claim query only
@@ -1829,7 +1829,7 @@ tenant_conn.close()
 
 # =============================================================================
 # A10: THE ORG IS DERIVED FROM THE CREDENTIAL, AND SCOPES EVERY OPS QUERY
-# The roadmap called for an X-Org-Id header validated against a shared key. That is
+# An X-Org-Id header validated against a shared key is a rejected design. That is
 #     not an isolation boundary: anyone holding the key reads another tenant's data by
 #     editing a header. Whoever presents the key IS the org. These tests assert a
 #     tenant cannot see, or act on, another tenant's rows — including the retry
@@ -1877,7 +1877,7 @@ try:
     chk("tenant A sees its own DLQ row",  _sa["dlq_total"] == 1, str(_sa))
     chk("tenant B sees no DLQ rows",      _sb["dlq_total"] == 0, str(_sb))
 
-    # A header cannot override the credential — that was the roadmap's flaw.
+    # A header cannot override the credential.
     _spoof = iso_client.get("/ledger/summary", headers={**_hB, "X-Org-Id": "org_a"}).json()
     chk("X-Org-Id cannot override the credential", _spoof.get("org_id") == "org_b",
         str(_spoof.get("org_id")))
@@ -1896,7 +1896,7 @@ try:
     chk("tenant A can retry its own entry",
         iso_client.post(f"/dlq/{_a_dlq_id}/retry", headers=_hA).status_code == 200)
 
-    # /metrics is the operator's (item 7): a tenant key is authenticated but not
+    # /metrics is the operator's: a tenant key is authenticated but not
     #     authorised, so the answer is 403, and nothing of the exposition comes back.
     _ma = iso_client.get("/metrics", headers=_hA)
     chk("a tenant key cannot read /metrics (operator endpoint) → 403",
@@ -1913,7 +1913,7 @@ finally:
 
 
 # =============================================================================
-# A11: PER-TENANT INGEST (Phase 13.3)
+# A11: PER-TENANT INGEST
 # POST /webhook/stripe/{org_id} verifies the signature with THAT tenant's registered
 #     secret. This is self-validating: a signature only checks out against the account
 #     that produced the event, so the path segment is a routing hint rather than a
@@ -2064,7 +2064,7 @@ finally:
 
 
 # =============================================================================
-# A13: THE WORKER DELIVERS TO EACH TENANT'S OWN DESTINATION, FAIRLY (Phase 13.4)
+# A13: THE WORKER DELIVERS TO EACH TENANT'S OWN DESTINATION, FAIRLY
 # Isolating the database and then forwarding every tenant's events to one shared URL
 #     is not isolation — it is the largest leak in the system, since the payload
 #     carries customer ids and amounts. And a shared queue drained by `ORDER BY id`
@@ -2191,7 +2191,7 @@ bt_conn.close()
 
 
 # =============================================================================
-# A15: ROW-LEVEL SECURITY — ISOLATION THE DATABASE ENFORCES (Phase 13.6)
+# A15: ROW-LEVEL SECURITY — ISOLATION THE DATABASE ENFORCES
 # Every other tenancy test proves the application remembers its org_id predicate.
 #     This one proves the guarantee survives forgetting it. A first attempt at this
 #     shipped policies that were completely inert — the app connects as a SUPERUSER,
@@ -2263,7 +2263,7 @@ if _rls_ready:
         chk("a query that FORGETS its org_id predicate still cannot see another tenant",
             _scoped("SELECT org_id, transaction_id FROM ledger", "rls_a")
             == [("rls_a", "evt_rls_a")],
-            "RLS is not enforcing — this is the whole point of Phase 13.6")
+            "RLS is not enforcing — this is the whole point of row-level security")
 
         # WITH CHECK: reading is only half of it. USING alone would still permit
         #     inserting a row that belongs to somebody else.
@@ -2301,11 +2301,11 @@ rls_owner.close()
 
 
 # =============================================================================
-# A16: THE APPLICATION'S OWN PATHS RUN UNDER ENFORCED RLS (Phase 13.7)
+# A16: THE APPLICATION'S OWN PATHS RUN UNDER ENFORCED RLS
 # A15 proved the policies bite, using hand-written SQL. That says nothing about whether
-#     the APPLICATION establishes a scope at each of its own query sites, and 13.6 shipped
-#     with it establishing one at none of them: the service connected as `postgres` and
-#     every policy was inert.
+#     the APPLICATION establishes a scope at each of its own query sites, and the first
+#     RLS migration shipped with it establishing one at none of them: the service
+#     connected as `postgres` and every policy was inert.
 #
 #     Under default-deny a forgotten scope is not a leak — it is a service that sees
 #     nothing and cannot write. So these tests drive the real endpoints, the real core
@@ -2450,11 +2450,12 @@ app_owner.close()
 
 
 # =============================================================================
-# A17: THE DEFAULT TENANT'S SIGNING SECRET STILL FOLLOWS ROTATION (Phase 13.7)
+# A17: THE DEFAULT TENANT'S SIGNING SECRET STILL FOLLOWS ROTATION
 # _bootstrap() did two unrelated jobs under one name: create the tables, and sync the
-#     default org's stripe_webhook_secret from STRIPE_WEBHOOK_SECRET. 13.7 stopped the
-#     API from calling it — billing_app cannot issue DDL and holds SELECT-only on the
-#     registry — and very nearly dropped the second job with the first.
+#     default org's stripe_webhook_secret from STRIPE_WEBHOOK_SECRET. Moving the service
+#     to billing_app stopped the API from calling it — billing_app cannot issue DDL and
+#     holds SELECT-only on the registry — and very nearly dropped the second job with
+#     the first.
 #
 #     Nothing would have failed loudly. Migration 0004 seeds the literal
 #     'whsec_YOUR_SECRET_HERE' under ON CONFLICT DO NOTHING and alembic re-runs nothing,
@@ -2521,7 +2522,7 @@ prov_conn.close()
 #     That fixed the gauges and left the rest: webhook and HTTP counters summed over every
 #     tenant, and billing_secrets_info — the operator's secret fingerprints — in every
 #     tenant's response.
-# Item 7 (Cycle 6) settles the model instead: /metrics is the operator's endpoint. A
+# The model settles on this instead: /metrics is the operator's endpoint. A
 #     tenant key gets 403 and none of the exposition; the operator key gets every tenant's
 #     backlog. The forced-interleave check that lived here is gone with the property it
 #     guarded: no tenant reads these gauges any more, so there is nothing to interleave.
@@ -3050,7 +3051,7 @@ finally:
 
 
 # =============================================================================
-# C6-4: real Stripe subscription events are ledgered with no amount (item 5d)
+# C6-4: real Stripe subscription events are ledgered with no amount
 #     A Stripe Subscription object has no top-level amount — prices live in
 #     items.data[].price. The fixtures above invented one, so the suite stayed green
 #     while every real customer.subscription.* event failed validation and landed in the
@@ -3230,7 +3231,7 @@ finally:
 
 
 # =============================================================================
-# C6-5: the stored payload is the event Stripe signed, every field of it (item 5c)
+# C6-5: the stored payload is the event Stripe signed, every field of it
 #     The webhook handler passed payload.model_dump() to the ledger: a four-field model
 #     that drops everything else, so created, livemode, api_version, object and
 #     pending_webhooks never reached the ledger, the outbox or the DLQ — while the docs
@@ -3292,7 +3293,7 @@ finally:
 
 
 # =============================================================================
-# C6-6: an invalid event the DLQ could not record is not acknowledged (item 3)
+# C6-6: an invalid event the DLQ could not record is not acknowledged
 #     _write_dlq swallowed every error and process_stripe_event returned DLQ_INVALID
 #     anyway, so the webhook answered 200 and Stripe stopped delivering an event that
 #     existed only in a log file the container does not persist. The failure below is
@@ -3352,7 +3353,7 @@ finally:
 
 
 # =============================================================================
-# C6-7: a second worker replica drains in parallel (item 6c)
+# C6-7: a second worker replica drains in parallel
 #     The candidate CTEs took no lock; only the outer SELECT had SKIP LOCKED. A second
 #     worker therefore computed the same window and the same picked ids as the first,
 #     skipped all of them, and returned 0. Two real connections here: worker A is held
@@ -3481,7 +3482,7 @@ finally:
 
 
 # =============================================================================
-# C6-9: the RLS self-check tells the truth, and the deploy rotates billing_app (item 1)
+# C6-9: the RLS self-check tells the truth, and the deploy rotates billing_app
 #     _rls_status counted policies across the three tables and checked usesuper only, so
 #     a BYPASSRLS role — which skips every policy exactly as a superuser does — or a
 #     table with its row security switched off still logged rls_enforced. And 0006's
@@ -3584,7 +3585,7 @@ finally:
 
 
 # =============================================================================
-# C6-10: a $0 invoice.paid is ledgered at 0 (item 5f, decided 2026-10-06)
+# C6-10: a $0 invoice.paid is ledgered at 0
 #     A 100%-off coupon or a free item yields a real invoice for $0 that Stripe marks
 #     paid. check_invoice_amount_nonzero sent every one to the DLQ as INVALID, where it
 #     counted in dlq_depth like an error. It is now POSTED at 0: a known zero. An
@@ -3627,7 +3628,7 @@ finally:
 
 
 # =============================================================================
-# C6-11: an old pending DLQ entry can be found over HTTP (item 8a)
+# C6-11: an old pending DLQ entry can be found over HTTP
 #     /dlq/entries returned the newest `limit` rows (max 1000) with no status, no retry
 #     state and no paging, so a pending entry behind a thousand newer resolved ones was
 #     unreachable — and pending is what an operator comes looking for.
@@ -3689,7 +3690,7 @@ finally:
 
 
 # =============================================================================
-# C6-12: the outbox lease — no locks across HTTP, no tenant starvation (items 6a, 6b)
+# C6-12: the outbox lease — no locks across HTTP, no tenant starvation
 #     drain_batch held FOR UPDATE row locks across every HTTP call in the batch, and a
 #     failed dispatch left its row untouched, to be retried on the next poll. A tenant
 #     whose downstream kept failing therefore stayed at the head of the queue, and with
