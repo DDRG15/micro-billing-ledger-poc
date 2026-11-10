@@ -7,11 +7,11 @@ from a process that serves traffic. Exits non-zero on failure so the compose gat
 
 WHY THIS FILE EXISTS
 --------------------
-Until Phase 13.7 the API container connected as `postgres` and called _bootstrap() at
+Originally the API container connected as `postgres` and called _bootstrap() at
 import, which did two unrelated jobs under one name: it created the tables, and it
 synchronised the default tenant's Stripe signing secret from STRIPE_WEBHOOK_SECRET.
 
-13.7 pointed the service at `billing_app` — NOSUPERUSER, NOBYPASSRLS, and holding only
+The service now connects as `billing_app` — NOSUPERUSER, NOBYPASSRLS, and holding only
 SELECT on the org registry — because a superuser bypasses row-level security entirely
 and leaves migration 0006's policies decorative. That correctly removed the service's
 ability to run _bootstrap. It also silently removed the second job, and the two failure
@@ -26,7 +26,7 @@ registry at all. Both surface as Stripe apparently sending bad signatures — a 
 that points at the sender rather than at the row that is actually wrong.
 
 The org registry stays read-only to the application. Writing it is a deploy-time act by
-whoever holds the owner credential, which is exactly the boundary 13.7 drew.
+whoever holds the owner credential, which is exactly the boundary the `billing_app` role draws.
 """
 import os
 import sys

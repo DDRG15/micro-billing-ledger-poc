@@ -429,7 +429,7 @@ class StripeEvent(BaseModel):
         Cross-field rule: a FAILED invoice must carry a non-zero amount.
             - invoice.payment_failed with $0 = nothing was owed, so nothing failed and
               nothing is retried. Data quality failure → DLQ.
-            - invoice.paid with $0 is ACCEPTED (Cycle 6, 5f, decided 2026-10-06). A
+            - invoice.paid with $0 is ACCEPTED. A
               100%-off coupon or a free item produces a real invoice for $0 that Stripe
               marks paid; rejecting it sent legitimate events to the DLQ, where they
               counted in dlq_depth like errors. It is posted at 0: a known zero. An
@@ -497,8 +497,8 @@ class LedgerStatus(str, Enum):
     POSTED    = "POSTED"     # Revenue confirmed — invoice.paid
     VOID      = "VOID"       # Payment failed — invoice.payment_failed
     LIFECYCLE = "LIFECYCLE"  # Account state changed, no money moved — customer.subscription.*
-    # No event type maps to PENDING since Cycle 6 (it was subscription.updated). Kept
-    #     because rows written before then carry it, and an enum that cannot name a
+    # No event type maps to PENDING any more (subscription.updated used to). Kept
+    #     because rows written earlier carry it, and an enum that cannot name a
     #     stored value turns a historical row into a validation error.
     PENDING   = "PENDING"
 
