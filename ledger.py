@@ -3040,8 +3040,10 @@ def dlq_entries(request: Request, limit: int = 50, status: Optional[str] = None,
     conn = _pool.getconn()
     try:
         with _tx(conn, org_id) as cur:
+            # B608 false positive: `where` holds only the three fixed fragments appended
+            #     above, and every value (org, statuses, cursor, limit) is a psycopg2 parameter.
             cur.execute(
-                "SELECT id, transaction_id, reason, raw_payload, received_at, status, "
+                "SELECT id, transaction_id, reason, raw_payload, received_at, status, "  # nosec B608
                 "       retry_count, max_retries, next_retry_at, claimed_at "
                 "FROM dlq WHERE " + " AND ".join(where) + " ORDER BY id DESC LIMIT %s",
                 (*params, limit),
