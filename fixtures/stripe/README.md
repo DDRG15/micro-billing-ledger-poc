@@ -25,5 +25,10 @@ event could fail validation while the suite passed.
 **Known mismatch.** `api_version` is `"2019-02-19"`, copied from the Event reference's
 own sample, while the object shapes follow the current reference (for example
 `items.data[].current_period_end`). Nothing in this codebase branches on
-`api_version`. Replace these with events captured from a Stripe test-mode account
-(`stripe trigger customer.subscription.updated`) when one is available.
+`api_version`.
+
+**Not captured yet.** The service has also received events from a Stripe test-mode
+account (API version `2026-10-28`; see the README, Limitations). Those payloads were not
+saved, so these five files are still reference-built. Replace them with captured events
+(`stripe trigger customer.subscription.updated` and the other four types) and update
+this page to say which files were captured.

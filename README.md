@@ -386,6 +386,8 @@ deliberately not covered, and how to report a vulnerability.
   declared local.
 - Request size and speed are limited at Caddy and in the app; failed logins are
   rate-limited.
+- Every error response is recorded with a class and a type. Caddy's access log leaves out
+  the request headers, so `X-Api-Key` and `Stripe-Signature` never reach it.
 - The container runs as a non-root user and `/docs` is off outside dev.
 
 These are engineering controls, not a compliance programme.
@@ -405,7 +407,8 @@ These are engineering controls, not a compliance programme.
   `stripe trigger` for `invoice.paid`, `invoice.payment_failed` and the three subscription
   events: 73 events, all answered `200`, 10 recorded in the ledger (4 `POSTED`, 1 `VOID`,
   5 `LIFECYCLE`) and 63 stored as `UNSUPPORTED`, none lost or recorded twice. It has not
-  received live-mode traffic.
+  received live-mode traffic. [docs/architecture.md](docs/architecture.md#verified-against-a-stripe-test-mode-account)
+  has the commands to repeat the run.
 - **One shared API key per tenant.** No user accounts, roles or key-rotation flow, and no
   log of who read what.
 - **Tenants are added with SQL**, and a tenant's Stripe signing secret is stored in plain
@@ -426,12 +429,11 @@ These are engineering controls, not a compliance programme.
 
 ## Roadmap
 
-1. **Stripe test-mode integration** (next): receive real test-mode events with the Stripe
-   CLI (`stripe listen --forward-to`) and replace the reference-built fixtures with
-   captured ones.
-2. **Checkout and PaymentIntent event types**, once real payload shapes are in hand.
-3. Deferred connection-pool start-up, then retiring `_bootstrap()`.
-4. An optional PostHog adapter.
+1. **Checkout and PaymentIntent event types** (next), with captured payloads saved as
+   fixtures in place of the reference-built ones. The sandbox run already delivers
+   `payment_intent.*` and `charge.*` events, which are stored as `UNSUPPORTED` today.
+2. Deferred connection-pool start-up, then retiring `_bootstrap()`.
+3. An optional PostHog adapter.
 
 What, when, where, why and done-when for each item are in
 [docs/architecture.md](docs/architecture.md#proposals-order-and-dependencies).

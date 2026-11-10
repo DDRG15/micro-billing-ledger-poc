@@ -317,67 +317,122 @@ flowchart TB
 - **There is no PostHog code.** The repository folder carries the name; the downstream is
   a generic JSON POST.
 
+### Verified against a Stripe test-mode account
+
+The five event types were first tested against fixtures built from Stripe's API
+reference. A fixture shows that the code accepts what the reference documents; it does
+not show what Stripe sends. The service has since received events from a Stripe sandbox
+(test mode, API version `2026-10-28`): `stripe listen` forwarded to
+`localhost:8000/webhook/stripe`, the published loopback port and the `default` tenant, and
+`stripe trigger` generated `invoice.paid`, `invoice.payment_failed` and
+`customer.subscription.created`, `.updated` and `.deleted`.
+
+| Measured | Result |
+|---|---|
+| Events forwarded by the CLI | 73, every one answered `200` |
+| Recorded in the ledger | 10: 4 `POSTED`, 1 `VOID`, 5 `LIFECYCLE` |
+| Stored as `UNSUPPORTED` in `dlq` | 63, across 17 event types |
+| Lost | 0: 10 ledger rows plus 63 `dlq` rows equal the 73 events |
+| Recorded twice | 0: the 10 ledger rows carry 10 distinct event ids |
+| Stripe dashboard | gross volume USD 65.00, the four `POSTED` rows (20.00 + 15.00 + 15.00 + 15.00); one failed payment of USD 20.00, the `VOID` row |
+
+The 63 `UNSUPPORTED` events were not requested. A `stripe trigger` creates the customer,
+the payment method, the invoice and the payment around the event it names, and each of
+those resources produces its own event. The types that arrived include `customer.created`,
+`payment_method.attached`, `invoice.created`, `invoice.finalized`,
+`invoice.payment_succeeded`, `charge.succeeded`, `payment_intent.created` and
+`payment_intent.succeeded`. Every one was answered `200` and stored as a resolved `dlq`
+row, which is what the ledger is built to do with a type it does not record.
+
+To repeat it, with the Stripe CLI logged in to a test-mode account:
+
+```bash
+# 1. Start the listener. It prints its own whsec_ signing secret.
+#    CLI 1.55 refuses to start without --events or --all-snapshot.
+stripe listen --all-snapshot --forward-to localhost:8000/webhook/stripe
+
+# 2. Put that secret in STRIPE_WEBHOOK_SECRET in .env, then start or recreate the stack.
+docker compose up -d
+
+# 3. In a second terminal, generate the five supported types.
+stripe trigger invoice.paid
+stripe trigger invoice.payment_failed
+stripe trigger customer.subscription.created
+stripe trigger customer.subscription.updated
+stripe trigger customer.subscription.deleted
+
+# 4. Compare the ledger with what the listener forwarded.
+curl -H "X-Api-Key: dev_key_change_in_production" http://localhost:8000/ledger/summary
+```
+
+The check is that the ledger counts plus `dlq_total` equal the number of
+`<--  [200]` lines the listener printed. The split between the two depends on what the
+triggers generate. `--events` with the five type names keeps the `UNSUPPORTED` rows out;
+a listener that forwards every type, as the one in this run did, shows what else the
+account produces. To use a tenant instead of the default one, forward to
+`/webhook/stripe/<org_id>` and store the printed secret in that tenant's
+`org.stripe_webhook_secret` (the `INSERT` example is in `.env.example`).
+
+What this did not do. The captured payloads were not saved: the five files in
+`fixtures/stripe/` are still built from the API reference. The service has not received
+live-mode traffic.
+
 ## Proposals, order and dependencies
 
 Nothing in this section is implemented. The diagram shows planned work in the order it is
 meant to be done, and which item needs which. Each numbered proposal says
 `NOT IMPLEMENTED`, and its sub-steps share the same dashed purple style. A solid arrow is a
 step or a dependency in the main sequence; a dashed arrow marks the dependency of the
-optional item 5 on the event set that items 1 and 2 produce.
+optional item 4 on the event set that item 1 produces. The Stripe test-mode run that used
+to be the first proposal is done; see "Verified against a Stripe test-mode account" above.
 
 ```mermaid
 flowchart LR
     BASE["Implemented system<br/>see the Implemented diagram"]
 
-    P1["Order 1, next<br/>Stripe test-mode integration<br/>NOT IMPLEMENTED"]
-    P1A["Run stripe listen --forward-to<br/>http://localhost:8000/webhook/stripe/org_id<br/>optionally with --events limited to the five supported types"]
-    P1B["Register the signing secret that<br/>stripe listen prints as the org stripe_webhook_secret"]
-    P1C["Save captured test-mode payloads<br/>under fixtures/stripe/<br/>and record the outcomes"]
+    P1["Order 1, next<br/>Checkout and PaymentIntent event types<br/>NOT IMPLEMENTED"]
+    P1A["Capture the payloads with stripe trigger<br/>save them under fixtures/stripe/<br/>replacing the reference-built files"]
+    P1B["Decide which event is the money event<br/>invoice.paid already ledgers a paid invoice"]
+    P1C["Extend EventType, _STATUS_MAP<br/>and the amount field lookup in ledger.py<br/>handle objects with no customer id"]
+    P1D["New Alembic revision if a type<br/>conflicts with ledger_amount_matches_kind"]
+    P1E["Tests in test_ledger.py<br/>built from the captured payloads"]
 
-    P2["Order 2<br/>Checkout and PaymentIntent event types<br/>NOT IMPLEMENTED"]
-    P2A["Extend EventType, _STATUS_MAP<br/>and the amount field lookup in ledger.py<br/>handle objects with no customer id"]
-    P2B["New Alembic revision if a type<br/>conflicts with ledger_amount_matches_kind"]
-    P2C["Tests in test_ledger.py<br/>built from the captured payloads"]
+    P2["Order 2<br/>Deferred pool initialization<br/>NOT IMPLEMENTED"]
+    P2A["Move _pool, _RLS and _ANY_ORG_KEYS<br/>out of import time into _lifespan<br/>in ledger.py"]
+    P2B["import ledger opens no connection<br/>worker.py stops opening an unused pool"]
 
-    P3["Order 3<br/>Deferred pool initialization<br/>NOT IMPLEMENTED"]
-    P3A["Move _pool, _RLS and _ANY_ORG_KEYS<br/>out of import time into _lifespan<br/>in ledger.py"]
-    P3B["import ledger opens no connection<br/>worker.py stops opening an unused pool"]
+    P3["Order 3<br/>Retire _bootstrap<br/>NOT IMPLEMENTED"]
+    P3A["test_ledger.py and benchmark.py<br/>build the schema with alembic<br/>instead of calling _bootstrap"]
+    P3B["Delete _bootstrap and the import-time<br/>branch that calls it in ledger.py"]
 
-    P4["Order 4<br/>Retire _bootstrap<br/>NOT IMPLEMENTED"]
-    P4A["test_ledger.py and benchmark.py<br/>build the schema with alembic<br/>instead of calling _bootstrap"]
-    P4B["Delete _bootstrap and the import-time<br/>branch that calls it in ledger.py"]
-
-    P5["Order 5, optional<br/>PostHog adapter<br/>NOT IMPLEMENTED, no PostHog code exists"]
-    P5A["Small receiver service<br/>accepts the worker POST<br/>and calls the PostHog capture API"]
-    P5B["Point org.downstream_url at the receiver<br/>worker.py stays unchanged"]
+    P4["Order 4, optional<br/>PostHog adapter<br/>NOT IMPLEMENTED, no PostHog code exists"]
+    P4A["Small receiver service<br/>accepts the worker POST<br/>and calls the PostHog capture API"]
+    P4B["Point org.downstream_url at the receiver<br/>worker.py stays unchanged"]
 
     BASE -->|"next"| P1
     P1 --> P1A
-    P1A --> P1B
+    P1A -->|"real payload shapes first"| P1B
     P1B --> P1C
-    P1C -->|"real payload shapes first"| P2
+    P1C -->|"if a new type carries no amount"| P1D
+    P1C --> P1E
+    P1D --> P1E
+
+    BASE -->|"independent of 1"| P2
     P2 --> P2A
-    P2A -->|"if a new type carries no amount"| P2B
-    P2A --> P2C
-    P2B --> P2C
-
-    BASE -->|"independent of 1 and 2"| P3
+    P2A --> P2B
+    P2B -->|"schema is applied before first use"| P3
     P3 --> P3A
-    P3A --> P3B
-    P3B -->|"schema is applied before first use"| P4
-    P4 --> P4A
-    P4A -->|"no caller left"| P4B
+    P3A -->|"no caller left"| P3B
 
-    P2C -.->|"event set is final"| P5
-    P1C -.->|"real events to map"| P5
-    P5 --> P5A
-    P5A --> P5B
+    P1E -.->|"event set is final"| P4
+    P4 --> P4A
+    P4A --> P4B
 
     %% legend done: Implemented today
     %% legend planned: Planned, not implemented
     classDef planned fill:#2b2438,stroke:#a371f7,color:#e6edf3,stroke-dasharray:5 3
     classDef done fill:#14301f,stroke:#3fb950,color:#e6edf3
-    class P1,P2,P3,P4,P5,P1A,P1B,P1C,P2A,P2B,P2C,P3A,P3B,P4A,P4B,P5A,P5B planned
+    class P1,P2,P3,P4,P1A,P1B,P1C,P1D,P1E,P2A,P2B,P3A,P3B,P4A,P4B planned
     class BASE done
 ```
 
@@ -385,71 +440,59 @@ flowchart LR
 
 | Order | Proposal | Needs | Blocks |
 |---|---|---|---|
-| 1 | Stripe test-mode integration | Implemented system | 2, 5 |
-| 2 | Checkout and PaymentIntent event types | 1 (real payloads) | 5 |
-| 3 | Deferred pool initialization | none | 4 |
-| 4 | Retire `_bootstrap()` | 3 | none |
-| 5 | PostHog adapter, optional | 1 and 2 | none |
+| 1 | Checkout and PaymentIntent event types | Implemented system | 4 |
+| 2 | Deferred pool initialization | none | 3 |
+| 3 | Retire `_bootstrap()` | 2 | none |
+| 4 | PostHog adapter, optional | 1 | none |
 
-Items 3 and 4 do not depend on 1 and 2. Item 2 and items 3 and 4 all edit `ledger.py`
+Items 2 and 3 do not depend on item 1. Item 1 and items 2 and 3 all edit `ledger.py`
 and `test_ledger.py`, so run them in sequence, not in parallel branches.
 
-### 1. Stripe test-mode integration
-
-- **What.** Receive real Stripe test-mode events through the Stripe CLI instead of only
-  through `send_test_webhook.py`, which signs synthetic payloads.
-- **When.** Next. It produces the payloads item 2 needs.
-- **Where.** No application code changes. A tenant row in `org` that holds the test-mode
-  signing secret (see the `INSERT INTO org` example in `.env.example`); a short runbook
-  section; captured payloads under `fixtures/stripe/`.
-- **Why.** The five event types are tested against fixtures built from the sample objects
-  in Stripe's API reference (`fixtures/stripe/README.md` lists the known mismatch). Events
-  captured from a test-mode account are the only check that those shapes match what
-  Stripe sends.
-- **How.** `stripe listen --forward-to http://localhost:8000/webhook/stripe/<org_id>`
-  against the published loopback port. Without `--events`, the CLI forwards every event
-  type. A type outside `EventType` is answered 200 with outcome `UNSUPPORTED` and stored as
-  a resolved `dlq` row, which does not count in `dlq_depth`. `--events` with the five
-  supported types keeps those rows out of the table and is a convenience, not a
-  requirement. The CLI prints its own `whsec_` signing secret; it goes into
-  `org.stripe_webhook_secret` for the tenant used for the test, not into the default org.
-- **Depends on.** The Stripe CLI and a Stripe account in test mode. Neither is part of
-  this repository.
-- **Done when.** `stripe trigger invoice.paid` produces a `POSTED` ledger row and an
-  outbox row for the test tenant; the same event replayed produces `DLQ_DUPLICATE`; the
-  other four supported types produce the status `_STATUS_MAP` assigns; the captured JSON
-  files are saved under `fixtures/stripe/`, replacing the reference-built ones, and
-  `fixtures/stripe/README.md` states which files were captured.
-
-### 2. Checkout and PaymentIntent event types
+### 1. Checkout and PaymentIntent event types
 
 - **What.** Accept `checkout.session.completed` and `payment_intent.succeeded` (and, if
   the captured payloads justify it, their failure counterparts) into the ledger.
-- **When.** After item 1.
+- **When.** Next. Nothing in the repository blocks it.
 - **Where.** `ledger.py`: `EventType`, `_STATUS_MAP`, `_AMOUNT_FIELDS_BY_TYPE`,
   `StripeObject` and the `cus_` check in `check_customer_id_format`; a new Alembic
-  revision if needed; `test_ledger.py`.
+  revision if needed; `test_ledger.py`; `fixtures/stripe/`.
 - **Why.** Both objects report money under different field names than an invoice
   (`amount_total` on a Checkout session, `amount` or `amount_received` on a
   PaymentIntent), and both can have no customer, for example a guest checkout. Today
-  these types are answered 200 and stored as `UNSUPPORTED`. Once they are in `EventType`
-  they reach validation, where `StripeObject.customer` is required and must start with
-  `cus_`, so a customer-less event would be dead-lettered as `INVALID`.
-- **Constraint to resolve first.** The `ledger_amount_matches_kind` CHECK (revision 0007)
-  allows a NULL amount only for `customer.subscription.%` types. A new type without an
-  amount needs a revision that widens the CHECK; a new type with an amount does not.
-  Decide how a customer-less payment is stored before writing code: a NULL `customer_id`
-  changes the column contract.
-- **Depends on.** Item 1, for real payload shapes.
+  these types are answered 200 and stored as `UNSUPPORTED`: the Stripe sandbox run
+  delivered `payment_intent.created`, `payment_intent.succeeded`,
+  `payment_intent.payment_failed`, `charge.succeeded` and `charge.failed` that way. It
+  delivered no Checkout event, because nothing in that run triggered one. Once the types
+  are in `EventType` they reach validation, where `StripeObject.customer` is required and
+  must start with `cus_`, so a customer-less event would be dead-lettered as `INVALID`.
+- **Constraints to resolve first.** Two, and the second is the dangerous one.
+  - The `ledger_amount_matches_kind` CHECK (revision 0007) allows a NULL amount only for
+    `customer.subscription.%` types. A new type without an amount needs a revision that
+    widens the CHECK; a new type with an amount does not. Decide how a customer-less
+    payment is stored before writing code: a NULL `customer_id` changes the column
+    contract.
+  - One payment arrives as several events. In the sandbox run each paid invoice came with
+    a `payment_intent.succeeded` and a `charge.succeeded` within one second of it: 4
+    `invoice.paid`, 4 `payment_intent.succeeded`, 4 `charge.succeeded`. The ledger key is
+    `(org_id, transaction_id)` and the transaction id is the Stripe event id, so these are
+    different rows. Recording `payment_intent.succeeded` next to `invoice.paid` counts
+    one payment twice, and the idempotency guard cannot see it. Decide which event is the
+    money event for a payment that has an invoice before writing code.
+- **Depends on.** The Stripe CLI and a Stripe account in test mode, to capture the
+  payloads with `stripe trigger`. Neither is part of this repository.
 - **Done when.** Each new type, fed with its captured payload, reaches the ledger with the
   expected status and amount; a replay is `DLQ_DUPLICATE`; an event with a missing amount
-  still goes to the DLQ; the README lists the new types wherever it lists the supported ones.
+  still goes to the DLQ; a payment that arrives as an invoice event and as a PaymentIntent
+  event is recorded once; the captured payloads, for the new types and for the five
+  already supported, are saved under `fixtures/stripe/` in place of the reference-built
+  files, and `fixtures/stripe/README.md` states which files were captured; the README lists
+  the new types wherever it lists the supported ones.
 
-### 3. Deferred pool initialization
+### 2. Deferred pool initialization
 
 - **What.** Stop opening the connection pool, reading the RLS status and probing the org
   registry when `ledger.py` is imported. Do that work in the application's `_lifespan`.
-- **When.** Third. It has no dependency on items 1 and 2.
+- **When.** Second. It has no dependency on item 1.
 - **Where.** `ledger.py` (`_pool`, `_RLS`, `_ANY_ORG_KEYS` and the routes that read them),
   `worker.py` (imports `ledger` for `retry_dlq_batch` and `prune_dlq`), `test_ledger.py`,
   `benchmark.py` and `disposable_db.py`.
@@ -466,41 +509,41 @@ and `test_ledger.py`, so run them in sequence, not in parallel branches.
   appear exactly once, at application start; the full test suite and the stack workflow
   pass unchanged.
 
-### 4. Retire `_bootstrap()`
+### 3. Retire `_bootstrap()`
 
 - **What.** Remove the second schema path. Alembic already owns the production schema;
   `_bootstrap()` mirrors it with `CREATE TABLE IF NOT EXISTS` and has to be kept in step
   by hand.
-- **When.** After item 3.
+- **When.** After item 2.
 - **Where.** `ledger.py` (`_bootstrap`, the import-time branch that calls it when
   `APP_DATABASE_URL` equals `DATABASE_URL`, and `_run_headless_benchmark`),
-  `test_ledger.py` (three call sites), `benchmark.py` (one call site).
+  `test_ledger.py` (four call sites), `benchmark.py` (one call site).
 - **Why.** The CI workflow already runs `alembic upgrade head` before the suite, because
   the RLS policies and the `billing_app` role exist only in a migration. `_bootstrap()`
   cannot create them, so any test that relies on it alone tests a schema that production
   never has.
-- **Depends on.** Item 3. With the pool built at import, `_bootstrap()` is the only thing
+- **Depends on.** Item 2. With the pool built at import, `_bootstrap()` is the only thing
   that makes a bare local run work against an empty database; once start-up is deferred,
   the caller can apply the schema before the first use.
 - **Done when.** `grep _bootstrap` finds nothing in the code; tests and the benchmark
-  create their schema with `alembic upgrade head` through an owner connection; the checks
-  in `test_ledger.py` that compare `_bootstrap()` with the migrations are removed with it.
+  create their schema with `alembic upgrade head` through an owner connection; the check in
+  `test_ledger.py` labelled `_bootstrap parity` is removed with it.
 
-### 5. PostHog adapter (optional)
+### 4. PostHog adapter (optional)
 
 - **What.** A way to deliver ledger events to PostHog. **No PostHog code exists in this
   repository today.** The folder name is historical; the worker forwards each event as
   generic JSON to `org.downstream_url`.
-- **When.** Last, and only if it is wanted. It maps the event set, so it waits for items 1
-  and 2 to settle which events exist.
+- **When.** Last, and only if it is wanted. It maps the event set, so it waits for item 1
+  to settle which events exist.
 - **Where.** A new, separate receiver (for example `posthog_adapter.py`) that accepts the
   worker's POST and calls the PostHog capture API. `org.downstream_url` points at it, so
   `worker.py` does not change. The `X-Transaction-Id` header is the natural
   de-duplication key, because delivery is at-least-once.
 - **Why.** It would make the name of the repository true, and it exercises the
   per-tenant downstream path with a real third party.
-- **Depends on.** Items 1 and 2 for the event set; a PostHog project and API key, which
-  are outside this repository.
+- **Depends on.** Item 1 for the event set; a PostHog project and API key, which are
+  outside this repository.
 - **Done when.** An event posted by the worker appears once in PostHog, a redelivery does
   not create a second event, a PostHog outage makes the adapter answer non-2xx so the
   outbox backs off, and the README sentence that says no adapter exists is replaced.
