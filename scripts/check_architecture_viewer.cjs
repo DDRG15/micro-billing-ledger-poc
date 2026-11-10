@@ -23,6 +23,7 @@ const file = path.resolve(process.argv[2] || 'docs/architecture.html');
 const evidence = process.argv[3] ? path.resolve(process.argv[3]) : null;
 const results = [];
 const ok = (name, cond, detail = '') => results.push(`${cond ? 'PASS' : 'FAIL'} ${name}${cond ? '' : ' :: ' + detail}`);
+const frame = () => new Promise(resolve => setTimeout(resolve, 60));  // let layout and hit-testing catch up
 const settle = () => new Promise(resolve => setTimeout(resolve, 350));  // CSS transitions are 120 ms
 
 (async () => {
@@ -73,8 +74,19 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 350));  // CSS t
       ok(`tab ${index + 1}: ${ids.length} nodes and ${total} connectors, every node focusable with an accessible label`, ids.length > 0 && total > 0 && labelled);
       const mismatches = [];
       for (const id of ids) {
-        await page.hover(`${panel} [data-node-id="${id}"]`);
-        const s = await read(panel);
+        // Scrolling a node into view can leave the pointer where it already was, so no enter
+        // event fires; move away and hover again until the preview shows the node we aimed at.
+        let s;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          await page.$eval(`${panel} [data-node-id="${id}"]`, n => n.scrollIntoView({block: 'center', inline: 'center'}));
+          await page.mouse.move(2, 2);
+          await frame();
+          await page.hover(`${panel} [data-node-id="${id}"]`);
+          await frame();
+          s = await read(panel);
+          const label = await page.$eval(`${panel} [data-node-id="${id}"]`, n => n.dataset.label);
+          if (s.title === label) break;
+        }
         const expected = await page.$$eval(`${panel} .edge-connection`, (e, id) => ({
           incoming: e.filter(x => x.dataset.target === id && x.dataset.source !== id).map(x => `${x.dataset.source}>${x.dataset.target}`).sort(),
           outgoing: e.filter(x => x.dataset.source === id && x.dataset.target !== id).map(x => `${x.dataset.source}>${x.dataset.target}`).sort(),
@@ -126,6 +138,16 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 350));  // CSS t
     await settle();
     const restored = await page.$$eval(`${P} .edge-connection`, e => e.every(x => !/-(incoming|outgoing|both)\)/.test(x.getAttribute('marker-end'))));
     ok('leaving the node restores every original arrowhead', restored);
+
+    // The details panel keeps its height, so the page does not move under the pointer.
+    const heights = [];
+    for (const target of ['PGDLQ', 'DOWN']) {
+      await page.hover(node(target)); await frame();
+      heights.push(await page.$eval(`${P} .details`, d => d.getBoundingClientRect().height));
+    }
+    await page.mouse.move(2, 2); await frame();
+    heights.push(await page.$eval(`${P} .details`, d => d.getBoundingClientRect().height));
+    ok('the details panel keeps one height with and without a selection', new Set(heights).size === 1, JSON.stringify(heights));
 
     // Pin, preview another node, leave, release, reset paths.
     const ids = await page.$$eval(`${P} [data-node-id]`, n => n.map(x => x.dataset.nodeId));

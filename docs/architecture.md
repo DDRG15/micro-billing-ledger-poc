@@ -39,9 +39,10 @@ flowchart TB
     DOWN["Tenant downstream endpoint<br/>org.downstream_url, else DOWNSTREAM_URL"]
     LOGONLY["Log line only<br/>no URL and WORKER_LOG_ONLY=true"]
 
-    CADDY["Caddy 2<br/>TLS for CADDY_DOMAIN<br/>request_body max_size 1MiB"]
+    CADDY["Caddy 2<br/>TLS for CADDY_DOMAIN<br/>request_body max_size 1MiB<br/>timeouts: read_header 10s, read_body 30s, idle 2m"]
 
-    STARTUP["Import time and start-up<br/>import: pool, _rls_status, tenancy mode logged<br/>_bootstrap only if APP_DATABASE_URL equals DATABASE_URL<br/>_lifespan: _enforce_no_demo_credentials"]
+    STARTUP["Import time and start-up<br/>import: pool, _rls_status, tenancy mode logged<br/>_bootstrap only if APP_DATABASE_URL equals DATABASE_URL<br/>_lifespan: _log_api_startup_notices, then _enforce_no_demo_credentials"]
+    DOCS["/docs, /redoc, /openapi.json<br/>served only when BILLING_ENV=dev and ingress is loopback<br/>otherwise 404"]
     BODYCAP["_BodySizeCap, ASGI<br/>MAX_REQUEST_BODY_BYTES, default 1 MiB"]
     OBS["_observability middleware<br/>http_requests_total<br/>http_request_duration_seconds"]
     PARSE["FastAPI body parse<br/>StripeWebhookPayload: id, type, data"]
@@ -49,10 +50,10 @@ flowchart TB
     INGEST["_ingest_webhook<br/>org_id must match the tenant id pattern"]
     ORGSEC["_org_webhook_secret<br/>read per request, active orgs only"]
     SIG["stripe.Webhook.construct_event<br/>HMAC with the tenant secret"]
-    PROC["process_stripe_event<br/>StripeEvent validation<br/>five EventType values"]
+    PROC["process_stripe_event<br/>unsupported type check, then StripeEvent validation<br/>five EventType values, event id printable ASCII 1 to 255"]
     TX["_tx(conn, org_id)<br/>BEGIN, SET LOCAL app.org_id, COMMIT"]
     INS["Idempotent dual write<br/>ledger row and outbox row<br/>in one transaction"]
-    WDLQ["_write_dlq<br/>reasons INVALID and DUPLICATE<br/>raw payload kept for replay"]
+    WDLQ["_write_dlq<br/>reasons INVALID, DUPLICATE, UNSUPPORTED<br/>one DUPLICATE or UNSUPPORTED row per event, ON CONFLICT DO NOTHING<br/>UNSUPPORTED is stored as resolved"]
     POOL["_AutocommitPool<br/>DB_POOL_SIZE, default 20<br/>bounded wait DB_POOL_WAIT_SECONDS, default 5"]
     AUTH["_require_api_key and _require_operator_key<br/>SHA-256 lookup in org, or BILLING_API_KEY<br/>failed-auth budget RATE_LIMIT_AUTH_FAILURES"]
     LIMOPS["slowapi limits<br/>RATE_LIMIT_OPS, default 20/minute<br/>RATE_LIMIT_METRICS, default 60/minute"]
@@ -62,25 +63,26 @@ flowchart TB
     METRICS["GET /metrics<br/>operator key only, tenant key gets 403"]
     HEALTH["GET /health<br/>process liveness, no database check"]
 
-    WLOOP["run_loop<br/>WORKER_POLL_INTERVAL, reconnect with backoff<br/>SIGTERM finishes the batch"]
-    CLAIM["_claim_batch<br/>per-tenant limit, round-robin across tenants<br/>FOR UPDATE SKIP LOCKED, lease WORKER_LEASE_SECONDS"]
-    DISPATCH["_dispatch_row and _post<br/>no redirects followed<br/>DISPATCH_DEADLINE_SECONDS, default 15"]
-    FINISH["_finish_row<br/>success: dispatched = 1<br/>failure: backoff 30, 120, 600, 3600 s<br/>fenced by claimed_until"]
+    WLOOP["run_loop and _Dispatcher.poll<br/>each poll records finished tasks, then claims for idle tenants<br/>sleeps WORKER_POLL_INTERVAL only when idle, reconnects with backoff<br/>SIGTERM: stop claiming, wait up to DISPATCH_DEADLINE_SECONDS + 5"]
+    CLAIM["_claim_batch<br/>only tenants with no task in flight, at most the free slots<br/>per-tenant limit, round-robin, FOR UPDATE SKIP LOCKED<br/>lease WORKER_LEASE_SECONDS"]
+    DISPATCH["_dispatch_tenant, _dispatch_row and _post<br/>one task per tenant on a bounded thread pool, HTTP only<br/>WORKER_DISPATCH_CONCURRENCY, default 8, rows of a tenant serial<br/>no redirects followed, DISPATCH_DEADLINE_SECONDS default 15"]
+    FINISH["_finish_row via _collect, on the connection-owning thread<br/>success: dispatched = 1<br/>failure: backoff 30, 120, 600, 3600 s<br/>fenced by claimed_until"]
     RELEASE["_release_row<br/>untried rows of a failed tenant"]
     DLQRETRY["retry_dlq_batch<br/>replays pending TRANSIENT rows<br/>no code path writes TRANSIENT today"]
-    PRUNE["prune_dlq<br/>deletes DUPLICATE rows older than 90 days<br/>at most once an hour"]
+    PRUNE["prune_dlq<br/>deletes DUPLICATE and UNSUPPORTED rows older than 90 days<br/>at most once an hour"]
 
-    ALEMBIC["alembic upgrade head<br/>revisions 0001 to 0009<br/>DATABASE_URL"]
+    ALEMBIC["alembic upgrade head<br/>revisions 0001 to 0011<br/>DATABASE_URL"]
     PROVISION["provision.py<br/>sync default org signing secret<br/>set the billing_app password"]
 
     PGORG[("org<br/>api_key_sha256, stripe_webhook_secret<br/>downstream_url, active")]
     PGLEDGER[("ledger<br/>PK org_id and transaction_id<br/>amount_cents, status, payload")]
     PGOUTBOX[("outbox<br/>dispatched, attempts, next_attempt_at<br/>claimed_until, last_error")]
-    PGDLQ[("dlq<br/>reason, status, retry_count<br/>max_retries, next_retry_at, claimed_at")]
+    PGDLQ[("dlq<br/>reason, status, retry_count<br/>max_retries, next_retry_at, claimed_at<br/>unique partial indexes for DUPLICATE and UNSUPPORTED")]
     PGRLS["Row-level security<br/>policies on ledger, outbox, dlq<br/>keyed on app.org_id"]
     ROLE["Role billing_app<br/>NOSUPERUSER, NOBYPASSRLS<br/>SELECT only on org"]
 
-    R200["200 OK with outcome<br/>POSTED, VOID, LIFECYCLE<br/>DLQ_INVALID, DLQ_DUPLICATE"]
+    R200["200 OK with outcome<br/>POSTED, VOID, LIFECYCLE<br/>DLQ_INVALID, DLQ_DUPLICATE, UNSUPPORTED"]
+    RSLOW["Connection closed by Caddy<br/>no status: header or body read too slow"]
     R400["400 Invalid or missing<br/>Stripe signature"]
     R401["401 missing or invalid key<br/>403 tenant key on /metrics"]
     R413["413 Request body too large"]
@@ -92,12 +94,14 @@ flowchart TB
     CLIENT -->|"HTTPS with X-Api-Key"| CADDY
     PROM -->|"GET /metrics with the operator key"| CADDY
     CADDY -->|"body over 1 MiB"| R413
+    CADDY -->|"headers not done in 10 s, body not done in 30 s"| RSLOW
     CADDY -->|"reverse_proxy billing:8000"| BODYCAP
     BODYCAP -->|"Content-Length or counted bytes over the cap"| R413
     BODYCAP -->|"within the cap"| OBS
     OBS -->|"POST /webhook/stripe routes"| PARSE
     OBS -->|"ops and metrics routes"| AUTH
     OBS -->|"GET /health"| HEALTH
+    OBS -->|"GET /docs, /redoc, /openapi.json"| DOCS
     OBS -.->|"counters and histogram"| METRICS
 
     PARSE -->|"envelope invalid"| R422
@@ -112,7 +116,7 @@ flowchart TB
     ORGSEC -->|"secret found"| SIG
     SIG -->|"signature mismatch"| R400
     SIG -->|"signature verified"| PROC
-    PROC -->|"validation failed: INVALID"| WDLQ
+    PROC -->|"INVALID: validation failed. UNSUPPORTED: well-formed event of a type not recorded"| WDLQ
     PROC -->|"valid event"| TX
     TX -->|"SET LOCAL app.org_id"| PGRLS
     TX --> INS
@@ -122,7 +126,7 @@ flowchart TB
     INS -->|"new event"| R200
     INS -->|"OperationalError"| R503
     WDLQ -->|"INSERT dlq row"| PGDLQ
-    WDLQ -->|"rejected event is still answered 200"| R200
+    WDLQ -->|"rejected or unsupported event is still answered 200"| R200
     WDLQ -->|"INVALID event and the DLQ write failed"| R503
 
     AUTH -->|"getconn and org lookup"| POOL
@@ -147,21 +151,21 @@ flowchart TB
     POOL -->|"connects with APP_DATABASE_URL, billing_app in compose"| ROLE
 
     WLOOP -->|"connects with APP_DATABASE_URL, billing_app in compose"| ROLE
-    WLOOP -->|"drain_batch"| CLAIM
+    WLOOP -->|"poll: claim for idle tenants"| CLAIM
     CLAIM -->|"UPDATE claimed_until"| PGOUTBOX
     CLAIM -->|"downstream_url per tenant"| PGORG
-    CLAIM -->|"claimed rows, serial, no transaction open"| DISPATCH
-    DISPATCH -->|"POST with X-Event-Type, X-Transaction-Id, X-Org-Id"| DOWN
+    CLAIM -->|"one task per newly claimed tenant, submitted to the pool"| DISPATCH
+    DISPATCH -->|"POST with X-Event-Type, X-Transaction-Id, X-Org-Id, percent-encoded if not printable ASCII"| DOWN
     DISPATCH -->|"no URL configured"| LOGONLY
-    DISPATCH -->|"2xx, or the error text"| FINISH
-    DISPATCH -->|"tenant already failed in this batch"| RELEASE
+    DISPATCH -->|"2xx or the error text, collected without blocking"| FINISH
+    DISPATCH -->|"tenant already failed in this batch, or stopping"| RELEASE
     FINISH -->|"dispatched = 1, or attempts + 1 and next_attempt_at"| PGOUTBOX
     RELEASE -->|"clear own claimed_until"| PGOUTBOX
     WLOOP -->|"after every drain"| DLQRETRY
     DLQRETRY -->|"claim pending or stale retrying rows"| PGDLQ
     DLQRETRY -->|"replay with from_retry=True"| PROC
     WLOOP -->|"hourly"| PRUNE
-    PRUNE -->|"DELETE DUPLICATE rows older than 90 days"| PGDLQ
+    PRUNE -->|"DELETE DUPLICATE and UNSUPPORTED rows older than 90 days"| PGDLQ
 
     ALEMBIC -->|"create and alter tables"| PGORG
     ALEMBIC --> PGLEDGER
@@ -195,12 +199,12 @@ flowchart TB
     classDef ok fill:#0f3d1a,stroke:#56d364,color:#e6edf3,stroke-width:3px
     classDef bad fill:#3b1d1d,stroke:#f85149,color:#e6edf3
     class STRIPE,CLIENT,PROM,DOWN,LOGONLY,CADDY ext
-    class STARTUP,BODYCAP,OBS,PARSE,LIMWEB,INGEST,ORGSEC,SIG,PROC,TX,INS,WDLQ,POOL,AUTH,LIMOPS,SUMMARY,DLQE,DLQR,METRICS,HEALTH app
+    class STARTUP,DOCS,BODYCAP,OBS,PARSE,LIMWEB,INGEST,ORGSEC,SIG,PROC,TX,INS,WDLQ,POOL,AUTH,LIMOPS,SUMMARY,DLQE,DLQR,METRICS,HEALTH app
     class WLOOP,CLAIM,DISPATCH,FINISH,RELEASE,DLQRETRY,PRUNE wrk
     class ALEMBIC,PROVISION mig
     class PGORG,PGLEDGER,PGOUTBOX,PGDLQ,PGRLS,ROLE db
     class R200 ok
-    class R400,R401,R413,R422,R429,R503 bad
+    class R400,R401,R413,R422,R429,R503,RSLOW bad
 ```
 
 ### What the diagram says that the code makes easy to miss
@@ -215,6 +219,33 @@ flowchart TB
 - **A rejected event is still answered 200.** Validation failures and duplicates are
   written to `dlq` and returned as `DLQ_INVALID` or `DLQ_DUPLICATE`. Only a database
   failure returns 503, so that Stripe retries.
+- **A Stripe event type the ledger does not record is `UNSUPPORTED`, not an error.** A
+  well-formed event of another type (for example `charge.succeeded`) is answered 200 with
+  outcome `UNSUPPORTED` and stored in `dlq` with status `resolved`: it is not counted in
+  `dlq_depth`, is not retried, and is pruned with the `DUPLICATE` rows after 90 days. An
+  event with a supported type and a bad body is still `INVALID`. An event id must be
+  printable ASCII, 1 to 255 characters, or the event is `INVALID`.
+- **A replayed signed payload leaves one row.** Unique partial indexes (migrations 0010
+  and 0011) allow at most one `DUPLICATE` and one `UNSUPPORTED` row per
+  `(org_id, transaction_id)`; the insert uses `ON CONFLICT DO NOTHING`, and the answer is
+  still `DLQ_DUPLICATE`.
+- **Slow clients are cut at the edge.** Caddy closes a connection whose headers take over
+  10 s or whose body takes over 30 s, and drops idle connections after 2 minutes.
+- **The interactive API docs are off by default.** `/docs`, `/redoc` and `/openapi.json`
+  exist only when `BILLING_ENV=dev` and the ingress is bound to loopback.
+- **Start-up notices belong to the API.** The placeholder-secret warning, the
+  unauthenticated-endpoints warning and the secrets fingerprint are logged from the
+  application lifespan, so the worker, which imports `ledger.py`, does not print them.
+- **The worker dispatches tenants in parallel and keeps going.** `run_loop` owns a
+  `_Dispatcher` that lives across polls. Each poll, on the thread that owns the database
+  connection, records the tasks that have finished (never waiting for one that has not),
+  claims rows only for tenants with no task in flight, at most as many tenants as there
+  are free slots (`WORKER_DISPATCH_CONCURRENCY`), and submits one task per tenant to the
+  thread pool. Rows of one tenant stay in order, the threads only do HTTP, and a tenant
+  whose downstream is slow holds one slot, not the whole worker. A tenant whose first
+  dispatch fails gives its remaining rows back untried. On SIGTERM the worker stops
+  claiming, waits up to `DISPATCH_DEADLINE_SECONDS + 5` for tasks in flight, records
+  their outcomes and releases the rows it did not send.
 - **413 comes from two places.** Caddy refuses a body over 1 MiB; the ASGI middleware
   repeats the same cap for traffic that does not pass through Caddy (the compose file
   also publishes `127.0.0.1:8000`).
@@ -227,7 +258,7 @@ flowchart TB
 - **The DLQ retry loop is wired but idle.** `retry_dlq_batch` only picks up rows with
   reason `TRANSIENT`, and nothing in the ingest path writes that reason today. `DUPLICATE`
   and `INVALID` rows have `max_retries = 0`; they are replayed by hand through
-  `POST /dlq/{dlq_id}/retry`.
+  `POST /dlq/{dlq_id}/retry`, and a `resolved` row (`UNSUPPORTED`) answers 409.
 - **Prometheus is not shipped.** `/metrics` is ready to be scraped with the operator key
   in an `X-Api-Key` header, but `docker-compose.yml` has no Prometheus service.
 - **There is no PostHog code.** The repository folder carries the name; the downstream is
@@ -246,7 +277,7 @@ flowchart LR
     BASE["Implemented system<br/>see the Implemented diagram"]
 
     P1["Order 1, next<br/>Stripe test-mode integration<br/>NOT IMPLEMENTED"]
-    P1A["Run stripe listen --forward-to<br/>http://localhost:8000/webhook/stripe/org_id<br/>with --events limited to the five supported types"]
+    P1A["Run stripe listen --forward-to<br/>http://localhost:8000/webhook/stripe/org_id<br/>optionally with --events limited to the five supported types"]
     P1B["Register the signing secret that<br/>stripe listen prints as the org stripe_webhook_secret"]
     P1C["Save captured test-mode payloads<br/>under fixtures/stripe/<br/>and record the outcomes"]
 
@@ -323,10 +354,11 @@ and `test_ledger.py`, so run them in sequence, not in parallel branches.
   captured from a test-mode account are the only check that those shapes match what
   Stripe sends.
 - **How.** `stripe listen --forward-to http://localhost:8000/webhook/stripe/<org_id>`
-  against the published loopback port, with `--events` listing the five supported types.
-  Without `--events`, the CLI forwards every event type. Every type outside `EventType`
-  fails Pydantic validation, is answered 200 and lands in the DLQ as `INVALID`, which
-  inflates `dlq_depth`. The CLI prints its own `whsec_` signing secret; it goes into
+  against the published loopback port. Without `--events`, the CLI forwards every event
+  type. A type outside `EventType` is answered 200 with outcome `UNSUPPORTED` and stored as
+  a resolved `dlq` row, which does not count in `dlq_depth`. `--events` with the five
+  supported types keeps those rows out of the table and is a convenience, not a
+  requirement. The CLI prints its own `whsec_` signing secret; it goes into
   `org.stripe_webhook_secret` for the tenant used for the test, not into the default org.
 - **Depends on.** The Stripe CLI and a Stripe account in test mode. Neither is part of
   this repository.
@@ -347,8 +379,9 @@ and `test_ledger.py`, so run them in sequence, not in parallel branches.
 - **Why.** Both objects report money under different field names than an invoice
   (`amount_total` on a Checkout session, `amount` or `amount_received` on a
   PaymentIntent), and both can have no customer, for example a guest checkout. Today
-  `StripeObject.customer` is required and must start with `cus_`, so those events would be
-  dead-lettered as `INVALID`.
+  these types are answered 200 and stored as `UNSUPPORTED`. Once they are in `EventType`
+  they reach validation, where `StripeObject.customer` is required and must start with
+  `cus_`, so a customer-less event would be dead-lettered as `INVALID`.
 - **Constraint to resolve first.** The `ledger_amount_matches_kind` CHECK (revision 0007)
   allows a NULL amount only for `customer.subscription.%` types. A new type without an
   amount needs a revision that widens the CHECK; a new type with an amount does not.
