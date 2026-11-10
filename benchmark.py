@@ -114,7 +114,7 @@ def _reset(conn) -> None:
 def _work_connection():
     """The connection the measured paths run on — the same role the service uses.
 
-    This matters to the number. Since Phase 13.7 the service connects as `billing_app`,
+    This matters to the number. The service connects as `billing_app` (migration 0006),
     a non-superuser, so every transaction it opens also issues SET LOCAL app.org_id and
     every statement is filtered through the row-level security policies on ledger, outbox
     and dlq. Measuring on the owner connection instead skips both: a superuser bypasses
