@@ -29,7 +29,16 @@ colour marks the component:
 | Teal | `migrate` container, one-shot, runs as the database owner |
 | Green | PostgreSQL 16: tables (cylinders), row-level security and the restricted role |
 | Thick green border | Success response |
-| Red | Error response |
+| Red | Error response. The label says how it is recorded, or `NOT RECORDED`. Recorded is defined below and does not mean alerted |
+
+**What "recorded" means on a red node.** The application writes one `http_request` log
+line for the response, carrying `status`, `error_class` and `error_type`, and adds one to
+`http_errors_total{status,error_class,error_type}`. Caddy writes one JSON access line on its
+stdout, with the same class and type where it can name them. Recorded does not mean
+alerted: the service only writes the line and moves the counter. Prometheus is not in
+`docker-compose.yml`, so no alert fires and nobody is paged until something outside this
+repository scrapes `/metrics` and evaluates a rule. The class and type come from a fixed
+table in `ledger.py`, never from the request.
 
 ```mermaid
 flowchart TB
@@ -39,12 +48,12 @@ flowchart TB
     DOWN["Tenant downstream endpoint<br/>org.downstream_url, else DOWNSTREAM_URL"]
     LOGONLY["Log line only<br/>no URL and WORKER_LOG_ONLY=true"]
 
-    CADDY["Caddy 2<br/>TLS for CADDY_DOMAIN<br/>request_body max_size 1MiB<br/>timeouts: read_header 10s, read_body 30s, idle 2m"]
+    CADDY["Caddy 2<br/>TLS for CADDY_DOMAIN<br/>request_body max_size 1MiB<br/>timeouts: read_header 10s, read_body 30s, idle 2m<br/>access log: JSON lines on stdout, request headers removed"]
 
     STARTUP["Import time and start-up<br/>import: pool, _rls_status, tenancy mode logged<br/>_bootstrap only if APP_DATABASE_URL equals DATABASE_URL<br/>_lifespan: _log_api_startup_notices, then _enforce_no_demo_credentials"]
     DOCS["/docs, /redoc, /openapi.json<br/>served only when BILLING_ENV=dev and ingress is loopback<br/>otherwise 404"]
     BODYCAP["_BodySizeCap, ASGI<br/>MAX_REQUEST_BODY_BYTES, default 1 MiB"]
-    OBS["_observability middleware<br/>http_requests_total<br/>http_request_duration_seconds"]
+    OBS["_Observability, pure ASGI, outermost middleware<br/>http_requests_total and http_request_duration_seconds<br/>one http_request log line per response<br/>status 400 and above: error_class, error_type, http_errors_total<br/>an exception no handler catches is recorded as 500, then re-raised"]
     PARSE["FastAPI body parse<br/>StripeWebhookPayload: id, type, data"]
     LIMWEB["slowapi limit<br/>RATE_LIMIT_WEBHOOK, default 100/minute<br/>keyed by client IP"]
     INGEST["_ingest_webhook<br/>org_id must match the tenant id pattern"]
@@ -82,27 +91,35 @@ flowchart TB
     ROLE["Role billing_app<br/>NOSUPERUSER, NOBYPASSRLS<br/>SELECT only on org"]
 
     R200["200 OK with outcome<br/>POSTED, VOID, LIFECYCLE<br/>DLQ_INVALID, DLQ_DUPLICATE, UNSUPPORTED"]
-    RSLOW["Connection closed by Caddy<br/>no status: header or body read too slow"]
-    R400["400 Invalid or missing<br/>Stripe signature"]
-    R401["401 missing or invalid key<br/>403 tenant key on /metrics"]
-    R413["413 Request body too large"]
-    R422["422 validation error<br/>input not echoed"]
-    R429["429 Too Many Requests"]
-    R503["503 Database unavailable<br/>Retry-After: 1"]
+    RSLOW["Connection closed by Caddy at read_header 10s, no status<br/>NOT RECORDED: no response, no access line, nothing at the default log level (measured)"]
+    R499["499 from Caddy: body not done in 30 s, or client closed the request<br/>recorded by Caddy only: access line with status 499, no class and no type<br/>Caddy error routes do not run for 499 (measured)"]
+    R502["502 from Caddy: billing:8000 unreachable<br/>recorded by Caddy: access line, class=dependency, type=upstream_unavailable<br/>no application line: the request never reached it"]
+    R400["400 Invalid or missing Stripe signature<br/>recorded: log line and http_errors_total<br/>class=authentication, type=invalid_signature or unknown_tenant<br/>malformed org_id: class=validation, type=malformed_tenant_id<br/>same response body for all three"]
+    R401["401 missing or invalid key, 403 tenant key on /metrics<br/>recorded: log line and http_errors_total<br/>401: class=authentication, type=missing_api_key or invalid_api_key<br/>403: class=authorization, type=operator_key_required"]
+    R404["404 route not found, or DLQ entry not found<br/>recorded: log line and http_errors_total<br/>class=not_found, type=route_not_found or dlq_entry_not_found"]
+    R409["409 DLQ entry already resolved<br/>recorded: log line and http_errors_total<br/>class=conflict, type=dlq_already_resolved"]
+    R413["413 Request body too large<br/>recorded by the app: log line and http_errors_total<br/>class=size_limit, type=body_too_large<br/>from Caddy: access line with the same class and type"]
+    R422["422 validation error, input not echoed<br/>recorded: log line and http_errors_total<br/>class=validation, type=request_validation for the body<br/>type=invalid_query for query or path parameters"]
+    R429["429 Too Many Requests<br/>recorded: log line and http_errors_total<br/>class=rate_limit, type=rate_limited or auth_failure_budget"]
+    R500["500 unhandled exception<br/>recorded: log line and http_errors_total<br/>class=internal, type=unhandled_exception"]
+    R503["503 Database unavailable, Retry-After: 1<br/>recorded: log line and http_errors_total<br/>class=dependency, type=database_unavailable, pool_exhausted or ingest_db_failure<br/>also a db_unavailable ERROR line and webhook_events_total DB_ERROR on webhook paths"]
 
     STRIPE -->|"HTTPS POST with Stripe-Signature"| CADDY
     CLIENT -->|"HTTPS with X-Api-Key"| CADDY
     PROM -->|"GET /metrics with the operator key"| CADDY
     CADDY -->|"body over 1 MiB"| R413
-    CADDY -->|"headers not done in 10 s, body not done in 30 s"| RSLOW
-    CADDY -->|"reverse_proxy billing:8000"| BODYCAP
+    CADDY -->|"headers not done in 10 s"| RSLOW
+    CADDY -->|"body not done in 30 s, or the client closed the request"| R499
+    CADDY -->|"billing:8000 unreachable"| R502
+    CADDY -->|"reverse_proxy billing:8000"| OBS
+    OBS -->|"every request passes through, and so does every response"| BODYCAP
     BODYCAP -->|"Content-Length or counted bytes over the cap"| R413
-    BODYCAP -->|"within the cap"| OBS
-    OBS -->|"POST /webhook/stripe routes"| PARSE
-    OBS -->|"ops and metrics routes"| AUTH
-    OBS -->|"GET /health"| HEALTH
-    OBS -->|"GET /docs, /redoc, /openapi.json"| DOCS
-    OBS -.->|"counters and histogram"| METRICS
+    BODYCAP -->|"POST /webhook/stripe routes, within the cap"| PARSE
+    BODYCAP -->|"ops and metrics routes"| AUTH
+    BODYCAP -->|"GET /health"| HEALTH
+    BODYCAP -->|"GET /docs, /redoc, /openapi.json"| DOCS
+    DOCS -->|"outside a dev run the route does not exist"| R404
+    OBS -.->|"http_requests_total, http_errors_total, histogram"| METRICS
 
     PARSE -->|"envelope invalid"| R422
     PARSE -->|"envelope valid"| LIMWEB
@@ -110,6 +127,7 @@ flowchart TB
     LIMWEB -->|"within the limit"| INGEST
     INGEST -->|"malformed org_id"| R400
     INGEST -->|"getconn"| POOL
+    INGEST -->|"an exception no handler catches"| R500
     INGEST -->|"tenant lookup"| ORGSEC
     ORGSEC -->|"SELECT stripe_webhook_secret"| PGORG
     ORGSEC -->|"unknown or inactive org, same body as a bad signature"| R400
@@ -145,6 +163,8 @@ flowchart TB
     DLQE -->|"keyset page, limit up to 1000"| PGDLQ
     DLQR -->|"read entry, mark resolved or count a retry"| PGDLQ
     DLQR -->|"replay with from_retry=True"| PROC
+    DLQR -->|"id not found for this tenant"| R404
+    DLQR -->|"entry is resolved"| R409
     METRICS -->|"dlq_depth and dlq_total gauges"| PGDLQ
     METRICS -->|"outbox_pending gauge"| PGOUTBOX
     POOL -->|"503 on pool wait timeout or dead connection"| R503
@@ -190,7 +210,7 @@ flowchart TB
     %% legend mig: migrate container, one-shot as the database owner
     %% legend db: PostgreSQL 16 tables, row-level security and the restricted role
     %% legend ok: Success response
-    %% legend bad: Error response
+    %% legend bad: Error response. Recorded means a log line plus a http_errors_total sample (Caddy, an access line). It does not alert anyone, because Prometheus is not in the stack. NOT RECORDED means neither exists
     classDef ext fill:#1f2a37,stroke:#8da2b8,color:#e6edf3
     classDef app fill:#262c36,stroke:#c9d1d9,color:#e6edf3
     classDef wrk fill:#3a2236,stroke:#db61a2,color:#e6edf3
@@ -204,7 +224,7 @@ flowchart TB
     class ALEMBIC,PROVISION mig
     class PGORG,PGLEDGER,PGOUTBOX,PGDLQ,PGRLS,ROLE db
     class R200 ok
-    class R400,R401,R413,R422,R429,R503,RSLOW bad
+    class R400,R401,R404,R409,R413,R422,R429,R499,R500,R502,R503,RSLOW bad
 ```
 
 ### What the diagram says that the code makes easy to miss
@@ -229,8 +249,15 @@ flowchart TB
   and 0011) allow at most one `DUPLICATE` and one `UNSUPPORTED` row per
   `(org_id, transaction_id)`; the insert uses `ON CONFLICT DO NOTHING`, and the answer is
   still `DLQ_DUPLICATE`.
-- **Slow clients are cut at the edge.** Caddy closes a connection whose headers take over
-  10 s or whose body takes over 30 s, and drops idle connections after 2 minutes.
+- **Slow clients are cut at the edge, and the two cuts leave different traces.** Caddy
+  closes a connection whose headers take over 10 s without sending any response, and
+  writes nothing about it at the default log level (measured against `caddy:2-alpine`,
+  v2.11.9; at debug level the only lines are the TLS handshake). A body that takes over
+  30 s gets a `499` and one access line with `status: 499`, `bytes_read` below the
+  `Content-Length` and a duration of about 30 s, but no class or type: Caddy's error routes
+  do not run for 499. A client that hangs up mid-body also gets `499`, after however long
+  it took, so duration is what tells the two apart. Idle connections are dropped after 2
+  minutes.
 - **The interactive API docs are off by default.** `/docs`, `/redoc` and `/openapi.json`
   exist only when `BILLING_ENV=dev` and the ingress is bound to loopback.
 - **Start-up notices belong to the API.** The placeholder-secret warning, the
@@ -248,7 +275,33 @@ flowchart TB
   their outcomes and releases the rows it did not send.
 - **413 comes from two places.** Caddy refuses a body over 1 MiB; the ASGI middleware
   repeats the same cap for traffic that does not pass through Caddy (the compose file
-  also publishes `127.0.0.1:8000`).
+  also publishes `127.0.0.1:8000`). The application's 413 used to leave no
+  `http_requests_total` sample and no `http_request` line, because the observability layer
+  sat inside the cap. It is now the outermost layer, so a refused body is counted like any
+  other response, labelled `unmatched` because it is refused before routing.
+- **Every response with status 400 or above leaves one class and one type.** The 400, 401,
+  403, 404, 405, 409, 413, 422, 429, 500 and 503 the application can send each map to a
+  type in one table in `ledger.py`; an unhandled exception passes through the middleware on
+  its way to uvicorn and is recorded as a 500 before it is re-raised. A response with no
+  type is recorded as `unclassified_4xx` or `unclassified_5xx`, and a test fails if any
+  known path ends there. The three causes of the same `400` body (bad signature, unknown
+  tenant, malformed tenant id) are told apart only in the log and the metric, which belong
+  to the operator, so the response does not become a tenant-enumeration oracle.
+- **Caddy marks only the errors it makes itself.** `413` and `502` pass through its error
+  routes, which append the same class and type to the access line. A `4xx` or `5xx` the
+  application returns is a normal proxied response: Caddy logs its status, and the
+  application's own line carries the class and type. The access log removes the request
+  headers entirely, because Caddy's default writes `X-Api-Key` and `Stripe-Signature` in
+  plaintext (measured).
+- **What is not recorded.** All three were measured.
+  - A client that holds a connection open and never finishes its headers (`read_header`
+    10 s): Caddy sends no response and writes no line.
+  - A client that hangs up while the body is still arriving: the application has no
+    response to count, so there is no `http_request` line and no counter.
+  - A request that is not valid HTTP: uvicorn answers `400` itself and writes its own
+    `Invalid HTTP request received` warning. That response never reaches the application,
+    so it has no `http_request` line, no class, no type and no `http_requests_total`
+    sample.
 - **503 has three sources.** The pool wait timeout (`_PoolBusy`), a dead connection
   (`psycopg2.OperationalError` or `InterfaceError`, handled by `_database_unavailable`),
   and the ingest path's own `RuntimeError`.

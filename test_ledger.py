@@ -5085,6 +5085,356 @@ finally:
 
 
 # =============================================================================
+# C6-30: every error response is recorded with a class and a type
+#     Seven red nodes in the architecture diagram did not say whether the error was
+#     recorded, and measuring them found two holes: a 413 never reached the observability
+#     middleware (it sat inside the body cap: http_requests_total delta 0, no http_request
+#     line) and neither did a 500 from an unhandled exception (ServerErrorMiddleware builds
+#     that response outside every BaseHTTPMiddleware). The middleware is now pure ASGI and
+#     the outermost layer. Each error path below is driven through the real app and must
+#     move http_errors_total{status,error_class,error_type} by exactly one, move
+#     http_requests_total by one, and leave exactly one http_request line with the same
+#     class and type. None may land in the unclassified fallback.
+# =============================================================================
+print("\n── C6-30: error responses carry error_class and error_type ──────────────")
+
+import ast as _ast_630  # noqa: E402
+from prometheus_client import REGISTRY as _REG_630  # noqa: E402
+
+
+class _Lines630(logging.Handler):
+    """Collects the http_request records the middleware emits."""
+
+    def __init__(self):
+        super().__init__(logging.INFO)
+        self.records = []
+
+    def emit(self, record):
+        if getattr(record, "event", None) == "http_request":
+            self.records.append(record)
+
+
+def _req_630(method, path, status):
+    return _REG_630.get_sample_value("http_requests_total",
+                                     {"method": method, "path": path, "status": str(status)}) or 0
+
+
+def _err_630(status, error_class, error_type):
+    return _REG_630.get_sample_value(
+        "http_errors_total",
+        {"status": str(status), "error_class": error_class, "error_type": error_type}) or 0
+
+
+def _err_samples_630():
+    """{(status, class, type): value} for every http_errors_total series."""
+    return {(s.labels["status"], s.labels["error_class"], s.labels["error_type"]): s.value
+            for m in L._HTTP_ERRORS.collect() for s in m.samples if s.name == "http_errors_total"}
+
+
+_lines_630 = _Lines630()
+logging.getLogger("ledger").addHandler(_lines_630)
+_seen_types_630: set = set()
+
+
+def _probe_630(label, send, status, error_class, error_type, method, path):
+    """Send one request and check what it left behind."""
+    _lines_630.records.clear()
+    _before_630 = _err_samples_630()
+    _req_before = _req_630(method, path, status)
+    _r = send()
+    _after_630 = _err_samples_630()
+    _moved = {k: _after_630.get(k, 0) - _before_630.get(k, 0) for k in _after_630
+              if _after_630.get(k, 0) != _before_630.get(k, 0)}
+    _want = (str(status), error_class, error_type)
+    chk(f"{label}: answered {status}", _r.status_code == status, f"got {_r.status_code}")
+    chk(f"{label}: http_errors_total{{{status},{error_class},{error_type}}} +1, nothing else moved",
+        _moved == {_want: 1}, str(_moved))
+    chk(f"{label}: http_requests_total{{{method},{path},{status}}} +1",
+        _req_630(method, path, status) - _req_before == 1,
+        str(_req_630(method, path, status) - _req_before))
+    _recs = _lines_630.records
+    chk(f"{label}: exactly one http_request line, with status, error_class and error_type",
+        len(_recs) == 1 and (_recs[0].status, getattr(_recs[0], "error_class", None),
+                             getattr(_recs[0], "error_type", None)) == (status, error_class, error_type),
+        str([(r.status, getattr(r, "error_class", None), getattr(r, "error_type", None))
+             for r in _recs]))
+    _seen_types_630.add(error_type)
+
+
+c630 = fresh_conn()
+with c630.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES "
+               "('c630_t','c630_t','whsec_c630')")
+    _c.execute("INSERT INTO dlq (org_id, transaction_id, reason, raw_payload, status) "
+               "VALUES ('default','evt_c630_done','INVALID','{}','resolved') RETURNING id")
+    _resolved_id_630 = _c.fetchone()[0]
+
+_orig_630 = (L._pool, L.BILLING_API_KEY, L._ANY_ORG_KEYS, L._lookup_org_by_key)
+L._pool = _MockPool(c630)
+L._limiter.reset()
+_cl630 = TestClient(L.app, raise_server_exceptions=False)
+try:
+    # --- 400: the same body for three causes, three different types in the record ----
+    _b, _h = _signed(fake_event(eid="evt_c630_sig"), "whsec_the_wrong_secret")
+    _probe_630("bad signature", lambda: _cl630.post("/webhook/stripe/c630_t", content=_b, headers=_h),
+               400, "authentication", "invalid_signature", "POST", "/webhook/stripe/{org_id}")
+    _probe_630("unknown tenant",
+               lambda: _cl630.post("/webhook/stripe/c630_nobody", content=_b, headers=_h),
+               400, "authentication", "unknown_tenant", "POST", "/webhook/stripe/{org_id}")
+    _probe_630("malformed tenant id",
+               lambda: _cl630.post("/webhook/stripe/bad.id", content=_b, headers=_h),
+               400, "validation", "malformed_tenant_id", "POST", "/webhook/stripe/{org_id}")
+    _bad_sig = _cl630.post("/webhook/stripe/c630_t", content=_b, headers=_h)
+    _unknown = _cl630.post("/webhook/stripe/c630_nobody", content=_b, headers=_h)
+    chk("…and the caller cannot tell them apart: same body for a bad signature and an unknown tenant",
+        _bad_sig.text == _unknown.text and _bad_sig.status_code == _unknown.status_code,
+        f"{_bad_sig.text!r} vs {_unknown.text!r}")
+
+    # --- 401 / 403 / 429 on the auth path --------------------------------------------
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS = "c630_operator_key", False
+    L._limiter.reset()
+    _probe_630("no key", lambda: _cl630.get("/ledger/summary"),
+               401, "authentication", "missing_api_key", "GET", "/ledger/summary")
+    _probe_630("wrong key", lambda: _cl630.get("/ledger/summary", headers={"X-Api-Key": "nope"}),
+               401, "authentication", "invalid_api_key", "GET", "/ledger/summary")
+    _probe_630("wrong key on /metrics",
+               lambda: _cl630.get("/metrics", headers={"X-Api-Key": "nope"}),
+               401, "authentication", "invalid_api_key", "GET", "/metrics")
+    L._limiter.reset()
+    _budget_630 = int(L.RATE_LIMIT_AUTH_FAILURES.split("/")[0])
+    for _i in range(_budget_630):
+        _cl630.get("/ledger/summary", headers={"X-Api-Key": f"spend{_i}"})
+    _probe_630("failed-auth budget spent",
+               lambda: _cl630.get("/ledger/summary", headers={"X-Api-Key": "one-more"}),
+               429, "rate_limit", "auth_failure_budget", "GET", "/ledger/summary")
+    L._limiter.reset()
+    L._ANY_ORG_KEYS, L._lookup_org_by_key = True, lambda conn, key: "c630_t"
+    _probe_630("tenant key on /metrics",
+               lambda: _cl630.get("/metrics", headers={"X-Api-Key": "a-tenant-key"}),
+               403, "authorization", "operator_key_required", "GET", "/metrics")
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS, L._lookup_org_by_key = _orig_630[1], _orig_630[2], _orig_630[3]
+
+    # --- 429 from slowapi's per-route limit -------------------------------------------
+    L._limiter.reset()
+    _ops_limit_630 = int(L.RATE_LIMIT_OPS.split("/")[0])
+    for _i in range(_ops_limit_630):
+        _cl630.get("/ledger/summary")
+    _probe_630("per-route rate limit", lambda: _cl630.get("/ledger/summary"),
+               429, "rate_limit", "rate_limited", "GET", "/ledger/summary")
+    L._limiter.reset()
+
+    # --- 413 and the 422s -------------------------------------------------------------
+    _probe_630("body over the cap",
+               lambda: _cl630.post("/webhook/stripe", content=b"x" * (L.MAX_REQUEST_BODY_BYTES + 1),
+                                   headers={"Content-Type": "application/json"}),
+               413, "size_limit", "body_too_large", "POST", "unmatched")
+    _probe_630("envelope missing fields",
+               lambda: _cl630.post("/webhook/stripe", json={}),
+               422, "validation", "request_validation", "POST", "/webhook/stripe")
+    _probe_630("body that is not JSON",
+               lambda: _cl630.post("/webhook/stripe", content=b"{not json",
+                                   headers={"Content-Type": "application/json"}),
+               422, "validation", "request_validation", "POST", "/webhook/stripe")
+    _probe_630("query parameter of the wrong type",
+               lambda: _cl630.get("/dlq/entries?limit=abc"),
+               422, "validation", "invalid_query", "GET", "/dlq/entries")
+    _probe_630("limit below 1", lambda: _cl630.get("/dlq/entries?limit=0"),
+               422, "validation", "invalid_query", "GET", "/dlq/entries")
+    _probe_630("unknown status filter", lambda: _cl630.get("/dlq/entries?status=bogus"),
+               422, "validation", "invalid_query", "GET", "/dlq/entries")
+    _probe_630("path parameter of the wrong type", lambda: _cl630.post("/dlq/abc/retry"),
+               422, "validation", "invalid_query", "POST", "/dlq/{dlq_id}/retry")
+
+    # --- 404 / 405 / 409 --------------------------------------------------------------
+    _probe_630("unknown dlq id", lambda: _cl630.post("/dlq/987654321/retry"),
+               404, "not_found", "dlq_entry_not_found", "POST", "/dlq/{dlq_id}/retry")
+    _probe_630("resolved dlq entry", lambda: _cl630.post(f"/dlq/{_resolved_id_630}/retry"),
+               409, "conflict", "dlq_already_resolved", "POST", "/dlq/{dlq_id}/retry")
+    _probe_630("route that does not exist", lambda: _cl630.get("/c630/no/such/route"),
+               404, "not_found", "route_not_found", "GET", "unmatched")
+    _probe_630("wrong method", lambda: _cl630.get("/webhook/stripe"),
+               405, "validation", "method_not_allowed", "GET", "/webhook/stripe")
+
+    # --- 503 x3 and 500 ---------------------------------------------------------------
+    class _DeadPool630:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def getconn(self):
+            raise self._exc
+
+        def putconn(self, conn):
+            pass
+
+    L._pool = _DeadPool630(psycopg2.OperationalError("c630: server closed the connection"))
+    _probe_630("database connection lost", lambda: _cl630.get("/ledger/summary"),
+               503, "dependency", "database_unavailable", "GET", "/ledger/summary")
+    L._pool = _DeadPool630(L._PoolBusy())
+    _probe_630("pool exhausted", lambda: _cl630.get("/ledger/summary"),
+               503, "dependency", "pool_exhausted", "GET", "/ledger/summary")
+    L._pool = _MockPool(c630)
+    with patch("stripe.Webhook.construct_event"), \
+         patch("ledger.process_stripe_event", side_effect=RuntimeError("c630: DB write failed")):
+        _probe_630("ingest write failed",
+                   lambda: _cl630.post("/webhook/stripe", json=fake_event(eid="evt_c630_db")),
+                   503, "dependency", "ingest_db_failure", "POST", "/webhook/stripe")
+    with patch("stripe.Webhook.construct_event"), \
+         patch("ledger.process_stripe_event", side_effect=ValueError("c630: not handled anywhere")):
+        _probe_630("unhandled exception in a handler",
+                   lambda: _cl630.post("/webhook/stripe", json=fake_event(eid="evt_c630_500")),
+                   500, "internal", "unhandled_exception", "POST", "/webhook/stripe")
+
+    # --- coverage of the taxonomy itself ----------------------------------------------
+    chk("every type in the taxonomy was driven through the real app above",
+        _seen_types_630 == set(L._ERROR_TYPES), str(sorted(set(L._ERROR_TYPES) ^ _seen_types_630)))
+    _unclassified = {k: v for k, v in _err_samples_630().items() if k[1] == "unclassified"}
+    chk("no known error path ended in the unclassified fallback", _unclassified == {},
+        str(_unclassified))
+    _classes_630 = {"authentication", "authorization", "validation", "size_limit", "rate_limit",
+                    "not_found", "conflict", "dependency", "internal"}
+    chk("every type maps to one of the nine classes", set(L._ERROR_TYPES.values()) <= _classes_630,
+        str(set(L._ERROR_TYPES.values()) - _classes_630))
+
+    # --- the fallback is visible when a path has no type ------------------------------
+    from fastapi import HTTPException as _HTTPException_630  # noqa: E402
+
+    def _teapot_630():
+        raise _HTTPException_630(status_code=418, detail="untyped")
+
+    def _gone_630():
+        raise _HTTPException_630(status_code=500, detail="untyped")
+
+    _routes_630 = [L.app.add_api_route("/c630-untyped-4xx", _teapot_630) or L.app.router.routes[-1],
+                   L.app.add_api_route("/c630-untyped-5xx", _gone_630) or L.app.router.routes[-1]]
+    try:
+        _probe_630("a 4xx raised with no type", lambda: _cl630.get("/c630-untyped-4xx"),
+                   418, "unclassified", "unclassified_4xx", "GET", "/c630-untyped-4xx")
+        _probe_630("a 5xx raised with no type", lambda: _cl630.get("/c630-untyped-5xx"),
+                   500, "unclassified", "unclassified_5xx", "GET", "/c630-untyped-5xx")
+    finally:
+        for _rt in _routes_630:
+            L.app.router.routes.remove(_rt)
+    _seen_types_630.discard("unclassified_4xx")
+    _seen_types_630.discard("unclassified_5xx")
+
+    # --- cardinality: nothing the caller controls reaches a label ----------------------
+    _hostile = "evil" + "A" * 200 + "<script>"
+    _cl630.post(f"/webhook/stripe/{_hostile}", content=_b, headers=_h)
+    _cl630.get(f"/{_hostile}/route")
+    _label_text = " ".join(f"{k[0]} {k[1]} {k[2]}" for k in _err_samples_630())
+    chk("a hostile path and tenant id appear in no http_errors_total label",
+        "evil" not in _label_text and "script" not in _label_text, _label_text[:200])
+    _allowed_types = set(L._ERROR_TYPES) | {"unclassified_4xx", "unclassified_5xx"}
+    chk("every error_type label ever recorded comes from the fixed set",
+        {k[2] for k in _err_samples_630()} <= _allowed_types,
+        str({k[2] for k in _err_samples_630()} - _allowed_types))
+
+    # --- the middleware on its own: the two shapes a TestClient cannot produce ---------
+    import asyncio as _asyncio_630  # noqa: E402
+
+    _scope_630 = {"type": "http", "method": "GET", "path": "/c630-direct", "headers": [],
+                  "client": ("203.0.113.7", 4321)}
+
+    async def _recv_630():
+        return {"type": "http.disconnect"}
+
+    async def _send_630(message):
+        pass
+
+    async def _no_response_630(scope, receive, send):
+        return None
+
+    async def _raises_630(scope, receive, send):
+        raise ValueError("c630: escaped every handler")
+
+    _lines_630.records.clear()
+    _pre_630 = (_req_630("GET", "unmatched", 200), sum(_err_samples_630().values()))
+    _asyncio_630.run(L._Observability(_no_response_630)(dict(_scope_630), _recv_630, _send_630))
+    chk("a request that ends with no response and no exception records nothing",
+        not _lines_630.records and sum(_err_samples_630().values()) == _pre_630[1], "")
+    _before_exc = _err_630(500, "internal", "unhandled_exception")
+    _raised_630 = None
+    try:
+        _asyncio_630.run(L._Observability(_raises_630)(dict(_scope_630), _recv_630, _send_630))
+    except ValueError as _e:
+        _raised_630 = _e
+    chk("an exception that escapes the app is recorded as a 500 and re-raised for uvicorn's log",
+        isinstance(_raised_630, ValueError)
+        and _err_630(500, "internal", "unhandled_exception") - _before_exc == 1
+        and len(_lines_630.records) == 1 and _lines_630.records[0].status == 500,
+        f"raised={_raised_630!r} lines={len(_lines_630.records)}")
+    _lines_630.records.clear()
+    _asyncio_630.run(L._Observability(_no_response_630)({"type": "lifespan"}, _recv_630, _send_630))
+    chk("a non-HTTP scope (lifespan) passes through untouched", not _lines_630.records)
+
+    # --- structure: no error can be raised without a type -------------------------------
+    _tree_630 = _ast_630.parse(open(L.__file__, encoding="utf-8").read())
+    _bare_630, _typed_630, _bad_630 = [], 0, []
+    for _node in _ast_630.walk(_tree_630):
+        if isinstance(_node, _ast_630.Call) and isinstance(_node.func, _ast_630.Name):
+            if _node.func.id == "HTTPException":
+                _bare_630.append(_node.lineno)
+            elif _node.func.id == "_ApiError":
+                _typed_630 += 1
+                _lit = _node.args[2] if len(_node.args) > 2 else None
+                _forwarded = isinstance(_lit, _ast_630.Name) and _lit.id == "error_type"
+                if not _forwarded and not (isinstance(_lit, _ast_630.Constant)
+                                           and _lit.value in L._ERROR_TYPES):
+                    _bad_630.append(_node.lineno)
+            elif _node.func.id == "_auth_failed":
+                _lit = _node.args[2] if len(_node.args) > 2 else None
+                if not (isinstance(_lit, _ast_630.Constant) and _lit.value in L._ERROR_TYPES):
+                    _bad_630.append(_node.lineno)
+    chk("ledger.py never constructs a bare HTTPException (the line numbers, if it does)",
+        _bare_630 == [], str(_bare_630))
+    chk("every _ApiError and _auth_failed call names a type that is in the taxonomy",
+        _typed_630 >= 10 and _bad_630 == [], f"{_typed_630} _ApiError calls, bad lines {_bad_630}")
+finally:
+    L._pool, L.BILLING_API_KEY, L._ANY_ORG_KEYS, L._lookup_org_by_key = _orig_630
+    L._limiter.reset()
+    logging.getLogger("ledger").removeHandler(_lines_630)
+    c630.close()
+
+
+# =============================================================================
+# C6-31: the ingress writes an access log that cannot leak a credential, and marks
+#     the errors it produces itself with the application's class and type names
+#     Caddy had no log directive, so a 413 or a 502 left no line. Its default log writes
+#     every request header except Authorization and Cookie: measured live, X-Api-Key and
+#     Stripe-Signature came out in plaintext, and a request with a Host that matches no
+#     site went through a second, unfiltered logger. The Caddyfile is checked as text here
+#     (this suite does not start Caddy); the behaviour was measured against the real
+#     caddy:2-alpine image, and the evidence is described in the README and docs/testing.md.
+# =============================================================================
+print("\n── C6-31: Caddyfile access log, header filter, error class and type ─────")
+
+import re as _re_631  # noqa: E402
+
+_caddy_631 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Caddyfile"),
+                  encoding="utf-8").read()
+_caddy_code_631 = "\n".join(_ln for _ln in _caddy_631.splitlines() if not _ln.strip().startswith("#"))
+_filters_631 = _re_631.findall(r"format filter \{\s*wrap json\s*request>headers delete\s*\}",
+                               _caddy_code_631)
+chk("the site log writes JSON to stdout", _re_631.search(
+    r"log \{\s*output stdout\s*format filter", _caddy_code_631) is not None)
+chk("the site log AND the default logger delete request>headers (X-Api-Key, Stripe-Signature)",
+    len(_filters_631) == 2, f"{len(_filters_631)} filter blocks")
+_pairs_631 = _re_631.findall(
+    r"handle_errors (\d+)\s*\{\s*log_append error_class (\w+)\s*log_append error_type (\w+)\s*\}",
+    _caddy_code_631)
+chk("Caddy marks the errors it produces itself: 413 and 502",
+    {p[0] for p in _pairs_631} == {"413", "502"}, str(_pairs_631))
+chk("a class and type Caddy shares with the application match the application's table",
+    all(L._ERROR_TYPES.get(_t, _c) == _c for _s, _c, _t in _pairs_631)
+    and ("413", "size_limit", "body_too_large") in _pairs_631,
+    str(_pairs_631))
+chk("every class Caddy uses is one of the application's classes",
+    {_c for _s, _c, _t in _pairs_631} <= _classes_630, str(_pairs_631))
+chk("the timeouts that cut slow clients are unchanged",
+    "read_header 10s" in _caddy_code_631 and "read_body   30s" in _caddy_code_631)
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
