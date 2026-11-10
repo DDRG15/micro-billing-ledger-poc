@@ -5,7 +5,8 @@
 #     They are for code quality checks during development.
 #
 # Usage — the ruff check and bandit module lists match .github/workflows/lint.yml, so a local run and CI
-#     disagree only when one of them is out of date:
+#     disagree only when one of them is out of date. CI runs those two and nothing else from
+#     this file; `ruff format` and `mypy` are tools to run on demand, not gates:
 #   ruff check ledger.py worker.py provision.py send_test_webhook.py disposable_db.py test_ledger.py benchmark.py scripts/build_architecture_viewer.py e2e/check_run.py e2e/downstream.py e2e/loadgen.py  # lint
 #   ruff format ledger.py                                                 # format
 #   mypy ledger.py                                                        # type check
@@ -21,4 +22,8 @@ mypy==1.10.0
 
 # bandit — security-focused linter. Scans for hardcoded passwords, unsafe calls,
 #     SQL injection patterns, and other OWASP Top 10 vulnerabilities in Python code.
+#     CI runs it with -ll (medium severity and above). The one SQL finding in ledger.py, on
+#     the DLQ listing query, is a false positive and carries a justified `# nosec B608`.
+#     docs/testing.md has the recipe that shows bandit still detects shell=True, eval and
+#     concatenated SQL.
 bandit==1.7.8

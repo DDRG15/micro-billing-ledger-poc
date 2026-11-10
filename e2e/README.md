@@ -6,8 +6,9 @@ in production. The unit-level suite (`test_ledger.py`) proves each mechanism; th
 harness checks that they hold together.
 
 Everything runs under a separate Compose project (`billing-e2e`), with its own
-volumes and freshly generated secrets. It uses the same host ports as the normal stack
-(80, 443, 8000, 5432), so stop that one first.
+volumes and freshly generated secrets. `make_env.sh` sets `BILLING_ENV=production`, so the
+API runs with the demo-credential refusal active, as a real deployment does. The harness
+uses the same host ports as the normal stack (80, 443, 8000, 5432), so stop that one first.
 
 ## Files
 
@@ -18,7 +19,8 @@ volumes and freshly generated secrets. It uses the same host ports as the normal
 | `compose.override.yml` | Adds the `downstream` receiver and points the worker at it |
 | `downstream.py` | The receiver: logs every delivery; can fail, stall, trickle or redirect |
 | `loadgen.py` | Sends signed `invoice.paid` events from N concurrent clients |
-| `check_run.py` | After a run: every event answered 200 is in the ledger once and was delivered |
+| `check_run.py` | After a run: counts events answered 200 but missing from the ledger, events in the ledger more than once, and deliveries received downstream (with duplicates) |
+| `recv/` | Created by `make_env.sh`, git-ignored: the receiver's `mode` file and its `received.log` |
 
 ## Run it
 
