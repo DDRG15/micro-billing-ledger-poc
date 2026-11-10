@@ -6,7 +6,7 @@
 #
 # Usage — the ruff check and bandit module lists match .github/workflows/lint.yml, so a local run and CI
 #     disagree only when one of them is out of date:
-#   ruff check ledger.py worker.py provision.py send_test_webhook.py disposable_db.py test_ledger.py benchmark.py  # lint
+#   ruff check ledger.py worker.py provision.py send_test_webhook.py disposable_db.py test_ledger.py benchmark.py scripts/build_architecture_viewer.py  # lint
 #   ruff format ledger.py                                                 # format
 #   mypy ledger.py                                                        # type check
 #   bandit -r ledger.py worker.py provision.py send_test_webhook.py disposable_db.py -ll  # security scan
