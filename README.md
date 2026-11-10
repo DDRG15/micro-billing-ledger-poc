@@ -571,7 +571,7 @@ events as `INVALID` entries. Replay them with `POST /dlq/{id}/retry`; each settl
 | Parameter | Behavior |
 |---|---|
 | `status` | Omit for all statuses, or select `pending`, `retrying`, `resolved`, `exhausted`, or `actionable`. `actionable` includes pending, retrying and exhausted entries. Any other value returns 422. |
-| `before_id` | Keyset cursor: return entries with `id < before_id`, ordered by descending ID. Pass the response's `next_before_id` for the next page. |
+| `before_id` | Keyset cursor: return entries with `id < before_id`, ordered by descending ID. Pass the response's `next_before_id` for the next page. No entry appears twice; an entry whose insert commits after the walk has passed its ID shows up on the next walk from the top. |
 | `limit` | Default 50; values below 1 return 422; values above 1,000 are capped at 1,000. |
 
 The response contains `entries`, `count`, and `next_before_id`. A full page returns its

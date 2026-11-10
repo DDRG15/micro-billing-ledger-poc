@@ -2482,7 +2482,9 @@ def dlq_entries(request: Request, limit: int = 50, status: Optional[str] = None,
       before_id  keyset cursor: entries with a smaller id. The response's
                  next_before_id is the value for the next page, null on the last one.
                  Keyset, not OFFSET: a row written between two pages cannot shift the
-                 next page and make an entry appear twice or never.
+                 next page, so no entry appears twice. Ids are assigned at insert and
+                 committed later, so an entry whose transaction commits after the walk
+                 has passed its id is not in this walk; the next walk from the top shows it.
       limit      1..1000, default 50.
 
     Each entry carries its retry state: status, retry_count, max_retries,
