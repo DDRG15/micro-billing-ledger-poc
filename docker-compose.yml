@@ -57,7 +57,7 @@ services:
       retries: 10
 
   # ---------------------------------------------------------------------------
-  # migrate — runs alembic upgrade head before the API starts (Phase 10)
+  # migrate — runs alembic upgrade head before the API starts
   # ---------------------------------------------------------------------------
   migrate:
     logging: *capped-logs

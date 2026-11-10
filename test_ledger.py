@@ -17,7 +17,7 @@ can run it with a plain Python install.
 import io          # Used to wrap stdout for UTF-8 output on Windows
 import json        # Used to verify raw_payload round-trips correctly
 import hashlib     # A10: hash API keys the way the org registry stores them
-import logging     # Phase 12: build LogRecords to assert the JSON formatter's output
+import logging     # build LogRecords to assert the JSON formatter's output
 import os          # A6: manipulate env vars to exercise the *_FILE secret sources
 import sys         # stdout override for Windows UTF-8 encoding
 import time        # Used in benchmark timing
@@ -448,7 +448,7 @@ chk("DLQEntry builds with valid data",          entry.transaction_id == "evt_tes
 chk("DLQEntry reason is enum value",            entry.reason == L.DLQReason.DUPLICATE)
 
 db_row = entry.to_db()
-# org_id leads the tuple as of Phase 13 — column order must match the dlq INSERT.
+# org_id leads the tuple since multi-tenancy was added — column order must match the dlq INSERT.
 chk("DLQEntry.to_db() is 9-tuple (org_id first)", len(db_row) == 9)
 chk("to_db() org_id leads",                     db_row[0] == L.DEFAULT_ORG_ID)
 chk("to_db() transaction_id follows org_id",    db_row[1] == "evt_test_001")
@@ -1058,9 +1058,9 @@ worker_conn3.close()
 
 
 # =============================================================================
-# PHASE 10: ALEMBIC MIGRATION TESTS
+# ALEMBIC MIGRATION TESTS
 # =============================================================================
-print("\n── Phase 10: Alembic migrations ─────────────────────────────────────────")
+print("\n── Alembic migrations ───────────────────────────────────────────────────")
 
 import subprocess
 
@@ -1151,9 +1151,9 @@ conn_mig.close()
 
 
 # =============================================================================
-# PHASE 11: DLQ RETRY TESTS
+# DLQ RETRY TESTS
 # =============================================================================
-print("\n── Phase 11: DLQ retry ──────────────────────────────────────────────────")
+print("\n── DLQ retry ────────────────────────────────────────────────────────────")
 
 
 conn_r = fresh_conn()
@@ -1241,12 +1241,12 @@ conn_r.close()
 
 
 # =============================================================================
-# PHASE 11b: HIGH-1 FIX — POST /dlq/{id}/retry resolves on success
+# HIGH-1 FIX — POST /dlq/{id}/retry resolves on success
 # Verifies that the manual retry endpoint correctly recognises "POSTED" as a
 # success outcome and marks the DLQ entry 'resolved', not 'exhausted'.
 # (The old code checked for "SUCCESS" which process_stripe_event never returns.)
 # =============================================================================
-print("\n── Phase 11b: manual retry endpoint resolves on POSTED (HIGH-1 fix) ────")
+print("\n── Manual retry endpoint resolves on POSTED (HIGH-1 fix) ───────────────")
 
 manual_conn = fresh_conn()
 original_pool_manual = L._pool
@@ -1755,7 +1755,7 @@ sec_conn.close()
 
 
 # =============================================================================
-# A9: TENANT ISOLATION AT THE IDEMPOTENCY GUARD (Phase 13)
+# A9: TENANT ISOLATION AT THE IDEMPOTENCY GUARD
 # transaction_id IS the idempotency guard. Stripe event ids are unique within an
 #     account, not across accounts, so two tenants can legitimately present the same
 #     id. With transaction_id as the sole primary key the second tenant's event would
@@ -2644,13 +2644,13 @@ chk("metrics default is still 60/minute", L.RATE_LIMIT_METRICS == "60/minute",
 
 
 # =============================================================================
-# PHASE 12a: STRUCTURED JSON LOGGING
+# STRUCTURED JSON LOGGING
 # Plain text is unparseable exactly when it matters. "Which transaction_id failed,
 #     how often, how slow" becomes a regex over a human sentence that changes the
 #     next time someone rewords a log line. One JSON object per line makes those
 #     fields queryable, and consumers read keys rather than prose.
 # =============================================================================
-print("\n── Phase 12a: structured JSON logging ──────────────────────────────────")
+print("\n── Structured JSON logging ─────────────────────────────────────────────")
 
 _json_fmt = L.JsonLogFormatter()
 
@@ -2714,9 +2714,9 @@ chk("non-serializable extra degrades to string instead of raising",
 
 
 # =============================================================================
-# PHASE 12b: PROMETHEUS /metrics
+# PROMETHEUS /metrics
 # =============================================================================
-print("\n── Phase 12b: Prometheus /metrics endpoint ─────────────────────────────")
+print("\n── Prometheus /metrics endpoint ────────────────────────────────────────")
 
 metrics_conn = fresh_conn()
 original_pool_metrics = L._pool
