@@ -4644,6 +4644,137 @@ finally:
 
 
 # =============================================================================
+# C6-27: a replayed event leaves one DUPLICATE row, not one per replay
+#     A signed payload stays valid for Stripe's 300 s tolerance, so replaying it as fast
+#     as the webhook rate limit allowed appended a DUPLICATE row per request, each a full
+#     copy of the payload. The answer is unchanged (DLQ_DUPLICATE, 200); the audit trail
+#     is now one row per (org_id, transaction_id), enforced by a unique index
+#     (migration 0010) with ON CONFLICT DO NOTHING on the insert paths.
+# =============================================================================
+print("\n── C6-27: replays keep one DUPLICATE row per (org, event) ───────────────")
+
+c627 = fresh_conn()
+_dups_627 = lambda org, tid: _q1(  # noqa: E731
+    c627, "SELECT COUNT(*) FROM dlq WHERE reason='DUPLICATE' AND org_id=%s AND transaction_id=%s",
+    (org, tid))
+
+_ev627 = fake_event(eid="evt_c627_replay")
+_errlog_627 = []
+
+
+class _ErrGrab627(logging.Handler):
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            _errlog_627.append(record.getMessage()[:120])
+
+
+_eg627 = _ErrGrab627()
+L._log.addHandler(_eg627)
+try:
+    _outcomes_627 = [L.process_stripe_event(c627, _ev627)["outcome"] for _ in range(10)]
+finally:
+    L._log.removeHandler(_eg627)
+chk("10 submissions of one event → POSTED once, DLQ_DUPLICATE for the other 9",
+    _outcomes_627 == ["POSTED"] + ["DLQ_DUPLICATE"] * 9, str(_outcomes_627))
+chk("…without an ERROR log per replay (a swallowed unique violation would log each one)",
+    not _errlog_627, str(_errlog_627[:2]))
+chk("…but only ONE DUPLICATE row", _dups_627(L.DEFAULT_ORG_ID, "evt_c627_replay") == 1,
+    str(_dups_627(L.DEFAULT_ORG_ID, "evt_c627_replay")))
+
+_batch_627 = L.process_stripe_event_batch(
+    c627, [_ev627, _ev627, fake_event(eid="evt_c627_b2"), fake_event(eid="evt_c627_b2")])
+chk("batch: replays of known and same-batch events are still DLQ_DUPLICATE",
+    [r["outcome"] for r in _batch_627] == ["DLQ_DUPLICATE", "DLQ_DUPLICATE", "POSTED", "DLQ_DUPLICATE"],
+    str(_batch_627))
+chk("…and add no second row for the known event, one for the new one",
+    _dups_627(L.DEFAULT_ORG_ID, "evt_c627_replay") == 1 and _dups_627(L.DEFAULT_ORG_ID, "evt_c627_b2") == 1)
+
+# Concurrent replays: the unique index is what holds under a race, not a SELECT first.
+_errs_627 = []
+_barrier_627 = threading.Barrier(6)
+
+
+def _replay_627():
+    try:
+        _cn = L._bootstrap()
+        _barrier_627.wait()
+        L.process_stripe_event(_cn, _ev627)
+        _cn.close()
+    except Exception as _exc:  # noqa: BLE001
+        _errs_627.append(repr(_exc))
+
+
+_ths_627 = [threading.Thread(target=_replay_627) for _ in range(6)]
+for _t in _ths_627:
+    _t.start()
+for _t in _ths_627:
+    _t.join()
+chk("6 concurrent replays raise nothing and still leave one DUPLICATE row",
+    not _errs_627 and _dups_627(L.DEFAULT_ORG_ID, "evt_c627_replay") == 1,
+    f"{_errs_627} rows={_dups_627(L.DEFAULT_ORG_ID, 'evt_c627_replay')}")
+
+# Over HTTP, the actual attack: one captured signed body, sent repeatedly.
+_SEC_C627 = "whsec_c627_signing_secret"
+for _o in ("c627a", "c627b"):
+    with c627.cursor() as _c:
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+                   (_o, _o, _SEC_C627))
+_orig_pool_627 = L._pool
+L._pool = _MockPool(c627)
+L._limiter.reset()
+try:
+    _cl627 = TestClient(L.app, raise_server_exceptions=False)
+    _body627 = json.dumps(_fixture("invoice.paid", "evt_c627_http"))
+    _res627 = [_post_raw(_cl627, "/webhook/stripe/c627a", _body627, _SEC_C627) for _ in range(6)]
+    chk("a captured body replayed 6 times: 200 each, POSTED then DLQ_DUPLICATE x5",
+        [r.status_code for r in _res627] == [200] * 6
+        and [r.json().get("outcome") for r in _res627] == ["POSTED"] + ["DLQ_DUPLICATE"] * 5,
+        str([(r.status_code, r.text[:60]) for r in _res627]))
+    chk("…leaving one DUPLICATE row for tenant c627a", _dups_627("c627a", "evt_c627_http") == 1,
+        str(_dups_627("c627a", "evt_c627_http")))
+    _rb = [_post_raw(_cl627, "/webhook/stripe/c627b", _body627, _SEC_C627) for _ in range(3)]
+    chk("the same id under tenant c627b is its own event: POSTED, then one DUPLICATE row",
+        [r.json().get("outcome") for r in _rb] == ["POSTED", "DLQ_DUPLICATE", "DLQ_DUPLICATE"]
+        and _dups_627("c627b", "evt_c627_http") == 1 and _dups_627("c627a", "evt_c627_http") == 1,
+        str([r.text[:60] for r in _rb]))
+    _lst = _cl627.get("/dlq/entries").json()["entries"]
+    chk("…and /dlq/entries (default tenant) shows the replayed event once",
+        sum(1 for e in _lst if e["transaction_id"] == "evt_c627_replay" and e["reason"] == "DUPLICATE") == 1)
+finally:
+    L._pool = _orig_pool_627
+    L._limiter.reset()
+
+# Migration 0010 de-duplicates what already exists before building the index.
+_own = [*_ALEMBIC]
+_env627 = {**os.environ, "DATABASE_URL": L.DATABASE_URL}
+_down627 = subprocess.run([*_own, "downgrade", "0009"], capture_output=True, text=True, env=_env627)
+chk("alembic downgrade 0009 exits 0 and drops the unique index",
+    _down627.returncode == 0
+    and _q1(c627, "SELECT COUNT(*) FROM pg_indexes WHERE indexname='uq_dlq_one_duplicate_per_event'") == 0,
+    _down627.stderr.strip()[-300:])
+with c627.cursor() as _c:
+    _c.execute("TRUNCATE dlq RESTART IDENTITY")
+    for _tid, _n in (("evt_c627_m1", 3), ("evt_c627_m2", 2)):
+        for _i in range(_n):
+            _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status) "
+                       "VALUES (%s,'DUPLICATE',%s,'pending')", (_tid, json.dumps({"n": _i})))
+    _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload) "
+               "VALUES ('evt_c627_m1','INVALID','{}'), ('evt_c627_m1','INVALID','{}')")
+_up627 = subprocess.run([*_own, "upgrade", "head"], capture_output=True, text=True, env=_env627)
+chk("alembic upgrade head exits 0 over existing duplicate rows", _up627.returncode == 0,
+    _up627.stderr.strip()[-300:])
+_left627 = _qall(c627, "SELECT transaction_id, count(*), min(raw_payload) FROM dlq "
+                       "WHERE reason='DUPLICATE' GROUP BY 1 ORDER BY 1")
+chk("…one DUPLICATE row left per event, the oldest",
+    _left627 == [("evt_c627_m1", 1, '{"n": 0}'), ("evt_c627_m2", 1, '{"n": 0}')], str(_left627))
+chk("…and INVALID rows (not subject to the index) are untouched",
+    _q1(c627, "SELECT COUNT(*) FROM dlq WHERE reason='INVALID'") == 2)
+chk("…and the unique index exists again",
+    _q1(c627, "SELECT COUNT(*) FROM pg_indexes WHERE indexname='uq_dlq_one_duplicate_per_event'") == 1)
+c627.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

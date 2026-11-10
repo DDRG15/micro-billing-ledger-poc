@@ -1015,6 +1015,22 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
             ON dlq(status, next_retry_at)
             WHERE status = 'pending'
         """)
+        # uq_dlq_one_duplicate_per_event (migration 0010): at most one DUPLICATE row per
+        #     (org_id, transaction_id). Existing copies are removed before the index is
+        #     built, only when the index is absent, so a restart does not rescan the table.
+        cur.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_class
+                               WHERE relname = 'uq_dlq_one_duplicate_per_event') THEN
+                    DELETE FROM dlq a USING dlq b
+                    WHERE a.reason = 'DUPLICATE' AND b.reason = 'DUPLICATE'
+                      AND a.org_id = b.org_id AND a.transaction_id = b.transaction_id
+                      AND a.id > b.id;
+                    CREATE UNIQUE INDEX uq_dlq_one_duplicate_per_event
+                        ON dlq (org_id, transaction_id) WHERE reason = 'DUPLICATE';
+                END IF;
+            END $$
+        """)
         # idx_dlq_stale_claim — covers the reclaim half of the retry_dlq_batch WHERE
         # clause: status='retrying' AND claim older than the timeout. Mirrors 0003.
         cur.execute("""
@@ -1305,7 +1321,8 @@ def process_stripe_event(
 
 def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> bool:
     """
-    Append a DLQ row. Returns True if it was written, False if it was not. Never raises:
+    Append a DLQ row. Returns True if it was written (or was already held, for a DUPLICATE),
+    False if it was not. Never raises:
     whether a lost DLQ row is fatal depends on what else holds the event, and only the
     caller knows that.
 
@@ -1326,7 +1343,11 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> bool:
             cur.execute(
                 "INSERT INTO dlq (org_id, transaction_id, reason, raw_payload, received_at,"
                 " status, retry_count, max_retries, next_retry_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                # A DUPLICATE row already held for this event (uq_dlq_one_duplicate_per_event)
+                #     makes the repeat a no-op: a replayed signed payload used to append
+                #     one row per request. The caller still answers DLQ_DUPLICATE.
+                " ON CONFLICT DO NOTHING",
                 entry.to_db(),
             )
         return True
@@ -1772,7 +1793,9 @@ def process_stripe_event_batch(
                     cur,
                     "INSERT INTO dlq"
                     " (org_id, transaction_id, reason, raw_payload, received_at,"
-                    "  status, retry_count, max_retries, next_retry_at) VALUES %s",
+                    "  status, retry_count, max_retries, next_retry_at) VALUES %s"
+                    # One DUPLICATE row per event, also within a single batch.
+                    " ON CONFLICT DO NOTHING",
                     all_dlq,
                     page_size=page_size,
                 )
