@@ -3160,7 +3160,8 @@ def health() -> JSONResponse:
 #
 # Bypasses the HTTP stack entirely to measure pure ledger throughput.
 #     Run with: python ledger.py --silent --events 10000
-#     This is what the TPS numbers in the README are based on.
+#     A quick local check. benchmark.py is the reproducible measurement: it covers the
+#     single-event, batch and HTTP paths and prints the environment it ran on.
 # ===========================================================================
 
 def _run_headless_benchmark(n: int = 10_000) -> None:
@@ -3168,8 +3169,8 @@ def _run_headless_benchmark(n: int = 10_000) -> None:
     Drives process_stripe_event() directly — no HTTP, no console I/O.
     Connects to PostgreSQL via DATABASE_URL. Each fake event gets a random ID
     so no duplicates — we're measuring insert throughput, not idempotency overhead.
-    PostgreSQL TPS is lower than SQLite in-memory (~1,000-3,000 vs ~15,000) because
-    of network round-trips and WAL fsync on the server side. That's the correct tradeoff.
+    Each event is a separate transaction, so the figure is bounded by round trips to
+    the server and its commit fsync; it describes the machine it ran on, nothing more.
     """
     import random
     import string

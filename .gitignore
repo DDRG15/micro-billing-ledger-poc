@@ -11,10 +11,11 @@ __pycache__/
 *.pyc
 *.pyo
 
-# SQLite database files — these are runtime data, not source code.
-#     billing_ledger.db is created automatically on first run by _bootstrap().
-#     The WAL and SHM sidecar files are SQLite's write-ahead log and shared memory files.
-#     None of these should be in version control — they contain live transaction data.
+# File-based database files — runtime data, not source code.
+#     The service stores everything in PostgreSQL; a *.db file in a checkout comes from
+#     a local tool or an old run. The -wal and -shm files are SQLite's write-ahead log
+#     and shared-memory sidecars. They can hold transaction data, so none of them
+#     belong in version control.
 *.db
 *.db-wal
 *.db-shm
