@@ -155,7 +155,8 @@ def valid_event(event_id: str) -> dict:
         "id": event_id,
         "type": "invoice.paid",
         "data": {"object": {
-            "customer": "cus_abc123", "amount_paid": 4900, "currency": "usd",
+            "id": f"in_{event_id}", "customer": "cus_abc123", "amount_paid": 4900,
+            "currency": "usd",
         }},
         "request": {"idempotency_key": f"idem_{event_id}"},
     }
@@ -207,8 +208,8 @@ def main() -> None:
         post_webhook(args.url, {
             "id": f"evt_failed_{suffix}",
             "type": "invoice.payment_failed",
-            "data": {"object": {"customer": "cus_abc123", "amount_paid": 0,
-                                "amount_due": 7500, "currency": "usd"}},
+            "data": {"object": {"id": f"in_failed_{suffix}", "customer": "cus_abc123",
+                                "amount_paid": 0, "amount_due": 7500, "currency": "usd"}},
         }, "VOID expected, recorded at 7500")
         ran_any = True
 

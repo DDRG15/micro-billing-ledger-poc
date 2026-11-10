@@ -148,6 +148,7 @@ def fake_event(
     amount: int = 4900,
     currency: str = "usd",
     include_request: bool = True,
+    object_id: str = "",
 ) -> dict:
     """
     Factory function for fake Stripe events. Produces structurally valid payloads
@@ -155,11 +156,20 @@ def fake_event(
     test specific failure modes (e.g., currency="USD" to test uppercase rejection).
     customer default "cus_123" passes min_length=4 AND the cus_ prefix check.
     amount default 4900 passes ge=0 AND the nonzero invoice check.
+    object_id is data.object.id, which every Stripe object carries and the ledger keys
+    payments on (migration 0012). By default it is derived from the event id, so distinct
+    events stand for distinct invoices; pass the same object_id to two events to make
+    them announce one invoice. A hash, not the id itself, so an event id under test (255
+    characters, control characters) cannot make the invoice id the thing that fails.
     """
+    if not object_id:
+        _prefix = "sub_" if etype.startswith("customer.subscription.") else "in_"
+        object_id = _prefix + hashlib.sha256(str(eid).encode("utf-8", "replace")).hexdigest()[:24]
     event = {
         "id": eid,
         "type": etype,
         "data": {"object": {
+            "id":          object_id,
             "customer":    customer,
             "amount_paid": amount,
             "currency":    currency,
@@ -261,6 +271,7 @@ ev_amount_fallback = {
     "id": "evt_amount_fallback",
     "type": "invoice.paid",
     "data": {"object": {
+        "id":          "in_fallback",
         "customer":    "cus_fallback",
         "amount_paid": None,
         "amount":      3000,
@@ -275,6 +286,7 @@ ev_no_amount = {
     "id": "evt_no_amount",
     "type": "invoice.paid",
     "data": {"object": {
+        "id":          "in_no_amount",
         "customer":    "cus_no_amount",
         "amount_paid": None,
         "amount":      None,
@@ -312,7 +324,7 @@ conn = fresh_conn()
 ev_no_id = {
     "id": "",
     "type": "invoice.paid",
-    "data": {"object": {"customer": "cus_123", "amount_paid": 5000, "currency": "usd"}},
+    "data": {"object": {"id": "in_no_id", "customer": "cus_123", "amount_paid": 5000, "currency": "usd"}},
 }
 r = L.process_stripe_event(conn, ev_no_id)
 chk("empty id → DLQ_INVALID",                   r["outcome"] == "DLQ_INVALID")
@@ -320,7 +332,7 @@ chk("empty id → DLQ_INVALID",                   r["outcome"] == "DLQ_INVALID")
 ev_no_type = {
     "id": "evt_no_type",
     "type": "",
-    "data": {"object": {"customer": "cus_123", "amount_paid": 5000, "currency": "usd"}},
+    "data": {"object": {"id": "in_no_type", "customer": "cus_123", "amount_paid": 5000, "currency": "usd"}},
 }
 r = L.process_stripe_event(conn, ev_no_type)
 chk("empty type → DLQ_INVALID",                 r["outcome"] == "DLQ_INVALID")
@@ -484,12 +496,23 @@ le = L.LedgerEntry(
     idempotency_key="idem_evt_le_001",
     payload='{"id": "evt_le_001"}',
     created_at=1234567890.0,  # coerced to datetime by Pydantic v2
+    invoice_id="in_le_001",
 )
 chk("LedgerEntry builds with valid data",       le.transaction_id == "evt_le_001")
 chk("LedgerEntry status is LedgerStatus",       le.status == L.LedgerStatus.POSTED)
 
 db_row = le.to_db()
-chk("LedgerEntry.to_db() is 10-tuple (org_id first)", len(db_row) == 10)
+# The tuple feeds an INSERT whose column list is _LEDGER_COLUMNS; the two must stay the
+#     same width, or a value lands in the wrong column. invoice_id (migration 0012) is last.
+_ledger_cols = [c.strip() for c in L._LEDGER_COLUMNS.strip("()").split(",")]
+chk("LedgerEntry.to_db() is an 11-tuple matching _LEDGER_COLUMNS (org_id first)",
+    len(db_row) == 11 and len(_ledger_cols) == 11 and _ledger_cols[0] == "org_id",
+    f"{len(db_row)} values, {len(_ledger_cols)} columns")
+chk("to_db() invoice_id is last, under the invoice_id column",
+    db_row[10] == "in_le_001" and _ledger_cols[10] == "invoice_id")
+chk("both ledger INSERT statements (single event, batch) name exactly _LEDGER_COLUMNS",
+    L._LEDGER_COLUMNS in L._LEDGER_INSERT_ONE and L._LEDGER_COLUMNS in L._LEDGER_INSERT_MANY
+    and L._LEDGER_INSERT_ONE.count("%s") == 11)
 chk("to_db() org_id leads",                     db_row[0] == L.DEFAULT_ORG_ID)
 chk("to_db() event_type is string not enum",    db_row[2] == "invoice.paid")
 chk("to_db() status is string not enum",        db_row[6] == "POSTED")
@@ -588,7 +611,7 @@ chk("…recorded at 0, not refused",
 ev_zero_failed = {
     "id": "evt_zero_failed",
     "type": "invoice.payment_failed",
-    "data": {"object": {"customer": "cus_abc123", "amount_paid": 0, "currency": "usd"}},
+    "data": {"object": {"id": "in_zero_failed", "customer": "cus_abc123", "amount_paid": 0, "currency": "usd"}},
 }
 r = L.process_stripe_event(conn7, ev_zero_failed)
 chk("invoice.payment_failed with amount=0 → DLQ_INVALID",
@@ -637,6 +660,7 @@ ev_double_bad = {
     "id": "evt_double_bad",
     "type": "invoice.paid",
     "data": {"object": {
+        "id":          "in_double_bad",
         "customer":    "notacustomer",
         "amount_paid": 0,
         "currency":    "usd",
@@ -1189,7 +1213,7 @@ chk("retry_dlq_batch returns 0 on empty retryable queue", count_empty == 0,
 valid_payload = {
     "id": "evt_retry_test_001",
     "type": "invoice.paid",
-    "data": {"object": {"customer": "cus_retry001", "amount_paid": 5000, "currency": "usd"}},
+    "data": {"object": {"id": "in_retry001", "customer": "cus_retry001", "amount_paid": 5000, "currency": "usd"}},
     "request": {"idempotency_key": "idem_retry_001"},
 }
 transient_db = L.DLQEntry(
@@ -1256,7 +1280,7 @@ manual_client = TestClient(L.app)
 valid_manual_payload = {
     "id": "evt_manual_retry_001",
     "type": "invoice.paid",
-    "data": {"object": {"customer": "cus_manual001", "amount_paid": 5000, "currency": "usd"}},
+    "data": {"object": {"id": "in_manual001", "customer": "cus_manual001", "amount_paid": 5000, "currency": "usd"}},
     "request": {"idempotency_key": "idem_manual_001"},
 }
 t_manual = L.DLQEntry(
@@ -1366,7 +1390,7 @@ amt_conn = fresh_conn()
 ev_failed_due = {
     "id": "evt_amt_failed",
     "type": "invoice.payment_failed",
-    "data": {"object": {"customer": "cus_amt01", "amount_paid": 0,
+    "data": {"object": {"id": "in_amt01", "customer": "cus_amt01", "amount_paid": 0,
                         "amount_due": 7500, "currency": "usd"}},
 }
 r_amt = L.process_stripe_event(amt_conn, ev_failed_due)
@@ -1380,7 +1404,7 @@ chk("failed invoice recorded at amount_due, not amount_paid=0",
 ev_paid_both = {
     "id": "evt_amt_paid",
     "type": "invoice.paid",
-    "data": {"object": {"customer": "cus_amt02", "amount_paid": 3000,
+    "data": {"object": {"id": "in_amt02", "customer": "cus_amt02", "amount_paid": 3000,
                         "amount_due": 9999, "currency": "usd"}},
 }
 L.process_stripe_event(amt_conn, ev_paid_both)
@@ -1392,7 +1416,7 @@ chk("paid invoice recorded at amount_paid, not amount_due",
 ev_no_amount = {
     "id": "evt_amt_none",
     "type": "invoice.paid",
-    "data": {"object": {"customer": "cus_amt03", "currency": "usd"}},
+    "data": {"object": {"id": "in_amt03", "customer": "cus_amt03", "currency": "usd"}},
 }
 chk("event with no amount field at all → DLQ_INVALID, never $0",
     L.process_stripe_event(amt_conn, ev_no_amount)["outcome"] == "DLQ_INVALID")
@@ -1403,7 +1427,7 @@ chk("no phantom $0 row was written",
 ev_zero_due = {
     "id": "evt_amt_zero",
     "type": "invoice.payment_failed",
-    "data": {"object": {"customer": "cus_amt04", "amount_paid": 0,
+    "data": {"object": {"id": "in_amt04", "customer": "cus_amt04", "amount_paid": 0,
                         "amount_due": 0, "currency": "usd"}},
 }
 chk("failed invoice with amount_due=0 → DLQ_INVALID",
@@ -2225,9 +2249,9 @@ if _rls_ready:
             c.execute("INSERT INTO org (org_id,name,stripe_webhook_secret) VALUES (%s,%s,'w') "
                       "ON CONFLICT (org_id) DO NOTHING", (_t, _t))
             c.execute("INSERT INTO ledger (org_id,transaction_id,event_type,customer_id,"
-                      "amount_cents,currency,status,idempotency_key,payload) "
-                      "VALUES (%s,%s,'invoice.paid','cus_x',100,'usd','POSTED','k','{}')",
-                      (_t, f"evt_{_t}"))
+                      "amount_cents,currency,status,idempotency_key,payload,invoice_id) "
+                      "VALUES (%s,%s,'invoice.paid','cus_x',100,'usd','POSTED','k','{}',%s)",
+                      (_t, f"evt_{_t}", f"in_{_t}"))
         c.execute("COMMIT")
 
     _app = _pg.connect(_APP_DSN)
@@ -2272,10 +2296,11 @@ if _rls_ready:
         c.execute("SET LOCAL app.org_id = 'rls_a'")
         _refused = False
         try:
+            # invoice_id set, so the only rule this row breaks is the tenant policy.
             c.execute("INSERT INTO ledger (org_id,transaction_id,event_type,customer_id,"
-                      "amount_cents,currency,status,idempotency_key,payload) "
+                      "amount_cents,currency,status,idempotency_key,payload,invoice_id) "
                       "VALUES ('rls_b','evt_forged','invoice.paid','cus_x',1,'usd',"
-                      "'POSTED','k','{}')")
+                      "'POSTED','k','{}','in_forged')")
         except _pg.Error:
             _refused = True
         finally:
@@ -3066,12 +3091,24 @@ _SUB_TYPES = ("customer.subscription.created", "customer.subscription.updated",
               "customer.subscription.deleted")
 
 
-def _fixture(event_type: str, new_id: str = "") -> dict:
-    """A Stripe fixture as a dict; new_id gives it a fresh event id for a second use."""
+def _fixture(event_type: str, new_id: str = "", invoice_id: str = "") -> dict:
+    """A Stripe fixture as a dict; new_id gives it a fresh event id for a second use.
+
+    A second use is a second payment, so an invoice fixture given a new event id also gets
+    a fresh invoice id, derived from new_id: the ledger counts one POSTED row per invoice
+    (migration 0012), and reusing the fixture's invoice under a new event id is exactly the
+    duplicate payment it refuses. invoice_id overrides that, which is how a test makes two
+    events announce one invoice.
+    """
     with open(os.path.join(_FIXTURE_DIR, event_type + ".json"), "rb") as _f:
         _ev = json.loads(_f.read())
     if new_id:
         _ev["id"] = new_id
+        if event_type.startswith("invoice."):
+            _ev["data"]["object"]["id"] = invoice_id or (
+                "in_" + hashlib.sha256(new_id.encode("utf-8", "replace")).hexdigest()[:24])
+    elif invoice_id:
+        _ev["data"]["object"]["id"] = invoice_id
     return _ev
 
 
@@ -3157,17 +3194,19 @@ try:
         ("a subscription row WITH an amount", "customer.subscription.created", 500),
         ("an invoice row WITHOUT an amount",  "invoice.paid", None),
     ):
-        _rejected = False
+        _rejected = None
         try:
             with c64_conn.cursor() as _c:
+                # invoice_id set, so ledger_invoice_rows_name_their_invoice (0012) is
+                #     satisfied and the amount rule is the one under test.
                 _c.execute(
                     "INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, "
-                    "amount_cents, currency, status, idempotency_key, payload) "
-                    "VALUES ('default', %s, %s, 'cus_c64', %s, 'usd', 'POSTED', 'k', '{}')",
+                    "amount_cents, currency, status, idempotency_key, payload, invoice_id) "
+                    "VALUES ('default', %s, %s, 'cus_c64', %s, 'usd', 'POSTED', 'k', '{}', 'in_c64')",
                     (f"evt_c64_chk_{_etype}", _etype, _amt))
-        except psycopg2.errors.CheckViolation:
-            _rejected = True
-        chk(f"database rejects {_label}", _rejected)
+        except psycopg2.errors.CheckViolation as _cv:
+            _rejected = _cv.diag.constraint_name
+        chk(f"database rejects {_label}", _rejected == "ledger_amount_matches_kind", str(_rejected))
 
     # The backlog. Before this fix every real subscription event was dead-lettered, so a
     #     deployment that takes it holds DLQ entries an operator will replay. A replay
@@ -5432,6 +5471,530 @@ chk("every class Caddy uses is one of the application's classes",
 chk("the timeouts that cut slow clients are unchanged",
     "read_header 10s" in _caddy_code_631 and "read_body   30s" in _caddy_code_631)
 
+
+# =============================================================================
+# C6-32: a payment is counted once per invoice, not once per event that announces it
+#     The ledger's key was the Stripe EVENT id. Stripe announces one paid invoice with
+#     several events (invoice.paid, invoice.payment_succeeded, payment_intent.succeeded,
+#     charge.succeeded), and does not promise one invoice.paid per invoice: two
+#     invoice.paid events with different ids for one invoice became two POSTED rows, two
+#     outbox deliveries and the amount summed twice, on the single and the batch path.
+#     Migration 0012 keys the payment: ledger.invoice_id, a unique index allowing one
+#     POSTED row per (org_id, invoice_id), and a CHECK that keeps a POSTED or VOID row from
+#     leaving invoice_id NULL. The second event is answered 200 as DUPLICATE_PAYMENT, writes
+#     no ledger row and no outbox row, and leaves one resolved DLQ row as the trace.
+#     The companion events below (payment_intent.succeeded, charge.succeeded) are built in
+#     the shape Stripe documents; the invoice events come from fixtures/stripe/.
+# =============================================================================
+print("\n── C6-32: one POSTED row per invoice, whatever announces the payment ─────")
+
+import itertools as _it_632  # noqa: E402
+
+c632 = fresh_conn()
+
+
+def _companions_632(inv: str, tag: str, amount: int = 1000, cus: str = "cus_c632") -> dict:
+    """The four events one paid invoice produces, all naming the same invoice/payment."""
+    paid = _fixture("invoice.paid", f"evt_c632_{tag}_paid", invoice_id=inv)
+    paid["data"]["object"].update(amount_paid=amount, amount_due=amount, customer=cus)
+    succ = json.loads(json.dumps(paid))
+    succ["id"], succ["type"] = f"evt_c632_{tag}_succ", "invoice.payment_succeeded"
+    _env = {"object": "event", "api_version": "2026-10-28", "created": 1762790400,
+            "livemode": False, "request": {"id": None, "idempotency_key": None}}
+    pi = dict(_env, id=f"evt_c632_{tag}_pi", type="payment_intent.succeeded", data={"object": {
+        "id": f"pi_c632_{tag}", "object": "payment_intent", "amount": amount,
+        "amount_received": amount, "currency": "usd", "customer": cus, "status": "succeeded"}})
+    ch = dict(_env, id=f"evt_c632_{tag}_ch", type="charge.succeeded", data={"object": {
+        "id": f"ch_c632_{tag}", "object": "charge", "amount": amount, "amount_captured": amount,
+        "captured": True, "paid": True, "currency": "usd", "customer": cus,
+        "payment_intent": f"pi_c632_{tag}", "status": "succeeded"}})
+    return {"paid": paid, "succ": succ, "pi": pi, "ch": ch}
+
+
+def _posted_632(conn, inv: str, org: str = L.DEFAULT_ORG_ID) -> tuple:
+    """(POSTED rows, summed cents) for one invoice of one tenant."""
+    return tuple(_qall(conn, "SELECT COUNT(*), COALESCE(SUM(amount_cents), 0) FROM ledger "
+                             "WHERE org_id=%s AND invoice_id=%s AND status='POSTED'", (org, inv))[0])
+
+
+def _outbox_632(conn, inv: str, org: str = L.DEFAULT_ORG_ID) -> int:
+    """Outbox rows (downstream deliveries) for one invoice of one tenant, any status."""
+    return _q1(conn, "SELECT COUNT(*) FROM outbox o JOIN ledger l USING (org_id, transaction_id) "
+                     "WHERE o.org_id=%s AND l.invoice_id=%s", (org, inv))
+
+
+def _dlq_632(conn, reason: str, org: str = L.DEFAULT_ORG_ID) -> list:
+    return _qall(conn, "SELECT transaction_id, status, max_retries FROM dlq "
+                       "WHERE org_id=%s AND reason=%s ORDER BY id", (org, reason))
+
+
+# ── (a) every order of the four events of one payment: one POSTED, the amount once ──
+_orders_632 = list(_it_632.permutations(["paid", "succ", "pi", "ch"]))
+_outs_a = []
+for _n, _order in enumerate(_orders_632):
+    _evs = _companions_632(f"in_c632_a{_n:02d}", f"a{_n:02d}")
+    _outs_a.append(tuple(L.process_stripe_event(c632, _evs[_k])["outcome"] for _k in _order))
+    # Stripe delivers at least once: every event again, in reverse.
+    for _k in reversed(_order):
+        L.process_stripe_event(c632, _evs[_k])
+_ok_a = all(_posted_632(c632, f"in_c632_a{_n:02d}") == (1, 1000) for _n in range(len(_orders_632)))
+chk(f"(a) all {len(_orders_632)} orders of invoice.paid + invoice.payment_succeeded + "
+    "payment_intent.succeeded + charge.succeeded → exactly 1 POSTED row of 1000 per invoice",
+    _ok_a, str([_posted_632(c632, f"in_c632_a{_n:02d}") for _n in range(3)]))
+chk("(a) …the invoice.paid is POSTED wherever it falls, the other three UNSUPPORTED",
+    all(_o[_order.index("paid")] == "POSTED"
+        and sorted(_o[i] for i in range(4) if _order[i] != "paid") == ["UNSUPPORTED"] * 3
+        for _o, _order in zip(_outs_a, _orders_632)), str(_outs_a[:2]))
+chk("(a) …summed over every invoice, the ledger holds 24 × 1000, not more",
+    _q1(c632, "SELECT SUM(amount_cents) FROM ledger WHERE status='POSTED' "
+              "AND invoice_id LIKE 'in_c632_a%%'") == 24 * 1000)
+chk("(a) …and the outbox delivers each payment once",
+    all(_outbox_632(c632, f"in_c632_a{_n:02d}") == 1 for _n in range(len(_orders_632)))
+    and _q1(c632, "SELECT COUNT(*) FROM outbox") == 24)
+
+# ── (b) two invoice.paid events, different ids, one invoice ──────────────────
+c632 = fresh_conn()
+_b1 = _fixture("invoice.paid", "evt_c632_b1", invoice_id="in_c632_b")
+_b2 = _fixture("invoice.paid", "evt_c632_b2", invoice_id="in_c632_b")
+# The second announcement need not be byte-identical: a different amount must not be
+#     added either, because the invoice is paid once.
+_b2["data"]["object"].update(amount_paid=1500, paid_out_of_band=True)
+_errlog_632 = []
+_grab_632 = type("G632", (logging.Handler,), {"emit": lambda self, r: _errlog_632.append(
+    (r.levelno, r.getMessage()[:160], getattr(r, "event", None)))})()
+L._log.addHandler(_grab_632)
+try:
+    _rb1 = L.process_stripe_event(c632, _b1)
+    _rb2 = L.process_stripe_event(c632, _b2)
+finally:
+    L._log.removeHandler(_grab_632)
+chk("(b) first invoice.paid → POSTED, second (new event id, same invoice) → DUPLICATE_PAYMENT",
+    (_rb1["outcome"], _rb2["outcome"]) == ("POSTED", "DUPLICATE_PAYMENT"), f"{_rb1} {_rb2}")
+chk("(b) …the answer names the invoice and the event that already holds the payment",
+    "in_c632_b" in (_rb2["reason"] or "") and "evt_c632_b1" in (_rb2["reason"] or ""), str(_rb2))
+chk("(b) …one POSTED row, at the first event's amount (1000), not 1000 + 1500",
+    _posted_632(c632, "in_c632_b") == (1, 1000), str(_posted_632(c632, "in_c632_b")))
+chk("(b) …no ledger row at all for the second event",
+    _q1(c632, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_c632_b2'") == 0)
+chk("(b) …one outbox row: the payment is delivered downstream once",
+    _outbox_632(c632, "in_c632_b") == 1 and _q1(c632, "SELECT COUNT(*) FROM outbox") == 1)
+chk("(b) …the trace: one DLQ row, reason DUPLICATE_PAYMENT, resolved, never retried",
+    _dlq_632(c632, "DUPLICATE_PAYMENT") == [("evt_c632_b2", "resolved", 0)],
+    str(_dlq_632(c632, "DUPLICATE_PAYMENT")))
+chk("(b) …holding the second event's full payload",
+    _stored_json(c632, "SELECT raw_payload FROM dlq WHERE transaction_id=%s", ("evt_c632_b2",))
+    .get("data", {}).get("object", {}).get("amount_paid") == 1500)
+chk("(b) …and a WARNING ledger_duplicate_payment naming both events",
+    any(_lv == logging.WARNING and _ev == "ledger_duplicate_payment"
+        and "evt_c632_b2" in _m and "evt_c632_b1" in _m for _lv, _m, _ev in _errlog_632),
+    str(_errlog_632))
+_again_632 = [L.process_stripe_event(c632, _b2)["outcome"] for _ in range(3)]
+chk("(b) redelivering the second event: DUPLICATE_PAYMENT each time, still one trace row",
+    _again_632 == ["DUPLICATE_PAYMENT"] * 3 and len(_dlq_632(c632, "DUPLICATE_PAYMENT")) == 1,
+    str(_again_632))
+chk("(b) redelivering the first event is still DLQ_DUPLICATE: the event key wins",
+    L.process_stripe_event(c632, _b1)["outcome"] == "DLQ_DUPLICATE")
+chk("(b) a different invoice of the same customer is its own payment → POSTED",
+    L.process_stripe_event(c632, _fixture("invoice.paid", "evt_c632_b3",
+                                          invoice_id="in_c632_b_other"))["outcome"] == "POSTED")
+
+# Over HTTP, signed the way Stripe signs, as a tenant.
+_SEC_C632 = "whsec_c632_signing_secret"
+with c632.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES ('c632h','c632h',%s)",
+               (_SEC_C632,))
+_orig_pool_632 = L._pool
+_orig_key_632 = (L.BILLING_API_KEY, L._ANY_ORG_KEYS)
+L._pool = _MockPool(c632)
+L._limiter.reset()
+try:
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS = "", False
+    _cl632 = TestClient(L.app, raise_server_exceptions=False)
+    _hs = [_post_raw(_cl632, "/webhook/stripe/c632h", json.dumps(_ev), _SEC_C632) for _ev in (
+        _fixture("invoice.paid", "evt_c632_h1", invoice_id="in_c632_h"),
+        _fixture("invoice.paid", "evt_c632_h2", invoice_id="in_c632_h"))]
+    chk("(b) HTTP: both answered 200, POSTED then DUPLICATE_PAYMENT",
+        [r.status_code for r in _hs] == [200, 200]
+        and [r.json().get("outcome") for r in _hs] == ["POSTED", "DUPLICATE_PAYMENT"],
+        str([(r.status_code, r.text[:90]) for r in _hs]))
+    chk("(b) HTTP: one POSTED row and one outbox row for the tenant's invoice",
+        _posted_632(c632, "in_c632_h", "c632h")[0] == 1 and _outbox_632(c632, "in_c632_h", "c632h") == 1)
+    _m632 = _cl632.get("/metrics").text
+    chk("(b) webhook_events_total carries a DUPLICATE_PAYMENT outcome (the alerting counter)",
+        'webhook_events_total{outcome="DUPLICATE_PAYMENT"}' in _m632)
+    _s632 = _cl632.get("/ledger/summary").json()
+    # Default org's dlq holds two rows: the DUPLICATE_PAYMENT trace (resolved) and the
+    #     DUPLICATE row of the b1 redelivery above, which is written 'pending' as DUPLICATE
+    #     rows always are. Only that one is in dlq_depth.
+    _pend632 = _q1(c632, "SELECT COUNT(*) FROM dlq WHERE org_id='default' "
+                         "AND status IN ('pending','retrying','exhausted')")
+    chk("(b) /ledger/summary (default org): POSTED 2 (two invoices), and the trace row is "
+        "not in dlq_depth", _s632["ledger"].get("POSTED") == 2 and _s632["dlq_total"] == 2
+        and _s632["dlq_depth"] == _pend632 == 1
+        and _q1(c632, "SELECT status FROM dlq WHERE reason='DUPLICATE_PAYMENT' "
+                      "AND org_id='default'") == "resolved", str(_s632))
+    _did = _q1(c632, "SELECT id FROM dlq WHERE reason='DUPLICATE_PAYMENT' AND org_id='default'")
+    chk("(b) manual retry of a DUPLICATE_PAYMENT row → 409: resolved is terminal",
+        _cl632.post(f"/dlq/{_did}/retry").status_code == 409)
+finally:
+    L._pool = _orig_pool_632
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS = _orig_key_632
+    L._limiter.reset()
+
+# ── (c) the race: distinct events of one invoice, at the same moment ─────────
+_N_632 = 8
+
+
+def _race_632(dsn: str, org: str, inv: str, tag: str) -> tuple:
+    """_N_632 threads, each its own connection, each a different event for `inv`.
+    Even-numbered threads use the single-event path, odd ones the batch path."""
+    _barrier = threading.Barrier(_N_632)
+    _outs, _errs = [], []
+
+    def _one(i: int) -> None:
+        try:
+            _cn = psycopg2.connect(dsn)
+            _cn.autocommit = True
+            try:
+                _ev = _fixture("invoice.paid", f"evt_c632_{tag}_{i}", invoice_id=inv)
+                _barrier.wait()
+                if i % 2:
+                    _outs.append(L.process_stripe_event_batch(_cn, [_ev], org_id=org)[0]["outcome"])
+                else:
+                    _outs.append(L.process_stripe_event(_cn, _ev, org_id=org)["outcome"])
+            finally:
+                _cn.close()
+        except Exception as _exc:  # noqa: BLE001
+            _errs.append(repr(_exc)[:200])
+
+    _ths = [threading.Thread(target=_one, args=(i,)) for i in range(_N_632)]
+    for _t in _ths:
+        _t.start()
+    for _t in _ths:
+        _t.join()
+    return sorted(_outs), _errs
+
+
+c632 = fresh_conn()
+_race_rows = []
+for _r in range(5):
+    _inv = f"in_c632_race{_r}"
+    _outs, _errs = _race_632(L.DATABASE_URL, L.DEFAULT_ORG_ID, _inv, f"race{_r}")
+    _race_rows.append((_outs, _errs, _posted_632(c632, _inv), _outbox_632(c632, _inv)))
+chk(f"(c) 5 rounds × {_N_632} concurrent events for one invoice: no exception, "
+    "1 POSTED + 7 DUPLICATE_PAYMENT each round",
+    all(not _e and _o == ["DUPLICATE_PAYMENT"] * 7 + ["POSTED"] for _o, _e, _p, _x in _race_rows),
+    str([(_o, _e[:1]) for _o, _e, _p, _x in _race_rows][:2]))
+chk("(c) …one POSTED row of 1000 and one outbox row per invoice",
+    all(_p == (1, 1000) and _x == 1 for _o, _e, _p, _x in _race_rows), str(_race_rows[:1]))
+chk("(c) …and 7 trace rows per invoice",
+    len(_dlq_632(c632, "DUPLICATE_PAYMENT")) == 5 * (_N_632 - 1))
+
+# The same race as billing_app, under row-level security: the classification query runs in
+#     the tenant's scope and must still see the row that won.
+with c632.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES ('c632r','c632r','w')")
+_outs, _errs = _race_632(_APP_DSN, "c632r", "in_c632_rls", "rls")
+chk("(c) as billing_app with RLS enforced: 1 POSTED + 7 DUPLICATE_PAYMENT, no exception",
+    not _errs and _outs == ["DUPLICATE_PAYMENT"] * 7 + ["POSTED"], f"{_outs} {_errs[:1]}")
+chk("(c) …one POSTED row and one outbox row for the tenant",
+    _posted_632(c632, "in_c632_rls", "c632r") == (1, 1000)
+    and _outbox_632(c632, "in_c632_rls", "c632r") == 1)
+
+# ── (d) the batch path and the DLQ replay paths ──────────────────────────────
+c632 = fresh_conn()
+_dA = _fixture("invoice.paid", "evt_c632_dA", invoice_id="in_c632_dX")
+_dB = _fixture("invoice.paid", "evt_c632_dB", invoice_id="in_c632_dX")
+_dF = _fixture("invoice.payment_failed", "evt_c632_dF", invoice_id="in_c632_dX")
+_dC = _fixture("invoice.paid", "evt_c632_dC", invoice_id="in_c632_dY")
+_bd = L.process_stripe_event_batch(c632, [_dA, _dB, _dA, _dF, _dC])
+chk("(d) batch [paid A, paid B (same invoice), A again, failed, paid C (other invoice)] → "
+    "POSTED, DUPLICATE_PAYMENT, DLQ_DUPLICATE, VOID, POSTED",
+    [r["outcome"] for r in _bd] == ["POSTED", "DUPLICATE_PAYMENT", "DLQ_DUPLICATE", "VOID", "POSTED"],
+    str([r["outcome"] for r in _bd]))
+chk("(d) …the batch's answer names the event that holds the payment",
+    "evt_c632_dA" in (_bd[1]["reason"] or ""), str(_bd[1]))
+chk("(d) …one POSTED row per invoice, outbox rows for A, the failure and C only",
+    _posted_632(c632, "in_c632_dX") == (1, 1000) and _posted_632(c632, "in_c632_dY") == (1, 1000)
+    and sorted(r[0] for r in _qall(c632, "SELECT transaction_id FROM outbox"))
+    == ["evt_c632_dA", "evt_c632_dC", "evt_c632_dF"])
+chk("(d) …trace rows: DUPLICATE_PAYMENT for B (resolved), DUPLICATE for A's repeat",
+    _dlq_632(c632, "DUPLICATE_PAYMENT") == [("evt_c632_dB", "resolved", 0)]
+    and [r[0] for r in _dlq_632(c632, "DUPLICATE")] == ["evt_c632_dA"])
+_bd2 = L.process_stripe_event_batch(c632, [
+    _fixture("invoice.paid", "evt_c632_dD", invoice_id="in_c632_dX"), _dB])
+chk("(d) a later batch: a new event for the paid invoice and B again → both DUPLICATE_PAYMENT",
+    [r["outcome"] for r in _bd2] == ["DUPLICATE_PAYMENT", "DUPLICATE_PAYMENT"]
+    and _posted_632(c632, "in_c632_dX") == (1, 1000)
+    and len(_dlq_632(c632, "DUPLICATE_PAYMENT")) == 2, str(_bd2))
+L.process_stripe_event(c632, _fixture("invoice.paid", "evt_c632_dZ1", invoice_id="in_c632_dZ"))
+chk("(d) single path first, batch second: the batch event → DUPLICATE_PAYMENT",
+    L.process_stripe_event_batch(c632, [_fixture("invoice.paid", "evt_c632_dZ2",
+                                                 invoice_id="in_c632_dZ")])[0]["outcome"]
+    == "DUPLICATE_PAYMENT" and _posted_632(c632, "in_c632_dZ")[0] == 1)
+
+# Replay: a DLQ entry that holds another invoice.paid for an invoice that is now POSTED.
+#     Such an entry exists when the event was dead-lettered earlier (INVALID before a
+#     validator fix, TRANSIENT from an async source) and the payment reached the ledger
+#     under a different event meanwhile.
+_rep_ev = _fixture("invoice.paid", "evt_c632_dR", invoice_id="in_c632_dX")
+with c632.cursor() as _c:
+    _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status, max_retries) "
+               "VALUES ('evt_c632_dR','INVALID',%s,'pending',0) RETURNING id", (json.dumps(_rep_ev),))
+    _rep_id = _c.fetchone()[0]
+_dlq_before = _q1(c632, "SELECT COUNT(*) FROM dlq")
+L._pool = _MockPool(c632)
+L._limiter.reset()
+try:
+    _rr = TestClient(L.app, raise_server_exceptions=False).post(f"/dlq/{_rep_id}/retry")
+finally:
+    L._pool = _orig_pool_632
+    L._limiter.reset()
+chk("(d) manual DLQ replay of that entry → 200, outcome DUPLICATE_PAYMENT, entry resolved",
+    _rr.status_code == 200 and _rr.json().get("outcome") == "DUPLICATE_PAYMENT"
+    and _q1(c632, "SELECT status FROM dlq WHERE id=%s", (_rep_id,)) == "resolved", _rr.text[:200])
+chk("(d) …no second POSTED row, no outbox row, and no new DLQ row for the replay",
+    _posted_632(c632, "in_c632_dX") == (1, 1000)
+    and _q1(c632, "SELECT COUNT(*) FROM outbox WHERE transaction_id='evt_c632_dR'") == 0
+    and _q1(c632, "SELECT COUNT(*) FROM dlq") == _dlq_before)
+L._write_dlq(c632, L.DLQEntry(transaction_id="evt_c632_dT", reason=L.DLQReason.TRANSIENT,
+                              raw_payload=_fixture("invoice.paid", "evt_c632_dT",
+                                                   invoice_id="in_c632_dY")))
+L._write_dlq(c632, L.DLQEntry(transaction_id="evt_c632_dN", reason=L.DLQReason.TRANSIENT,
+                              raw_payload=_fixture("invoice.paid", "evt_c632_dN",
+                                                   invoice_id="in_c632_dNEW")))
+_att = L.retry_dlq_batch(c632)
+chk("(d) retry_dlq_batch: the replay for a paid invoice resolves without a second POSTED row",
+    _att == 2 and _q1(c632, "SELECT status FROM dlq WHERE transaction_id='evt_c632_dT'") == "resolved"
+    and _posted_632(c632, "in_c632_dY") == (1, 1000), f"attempted={_att}")
+chk("(d) …and the replay for an unpaid invoice is POSTED (the guard is per invoice, not blanket)",
+    _q1(c632, "SELECT status FROM dlq WHERE transaction_id='evt_c632_dN'") == "resolved"
+    and _posted_632(c632, "in_c632_dNEW") == (1, 1000))
+
+# ── (e) tenants: the same invoice id under two tenants is two payments ────────
+c632 = fresh_conn()
+with c632.cursor() as _c:
+    for _o in ("c632t1", "c632t2"):
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,'w')", (_o, _o))
+_e1 = _fixture("invoice.paid", "evt_c632_e1", invoice_id="in_c632_shared")
+_oe = [L.process_stripe_event(c632, _e1, org_id="c632t1")["outcome"],
+       L.process_stripe_event(c632, _e1, org_id="c632t2")["outcome"],
+       L.process_stripe_event(c632, _fixture("invoice.paid", "evt_c632_e2",
+                              invoice_id="in_c632_shared"), org_id="c632t1")["outcome"]]
+_be = L.process_stripe_event_batch(c632, [
+    _fixture("invoice.paid", "evt_c632_e3", invoice_id="in_c632_shared"),
+    _fixture("invoice.paid", "evt_c632_e4", invoice_id="in_c632_shared2")], org_id="c632t2")
+chk("(e) same event and invoice id under t1 and t2 → POSTED in each; a second event in t1 → "
+    "DUPLICATE_PAYMENT", _oe == ["POSTED", "POSTED", "DUPLICATE_PAYMENT"], str(_oe))
+chk("(e) …a new event for the shared invoice in t2's batch → DUPLICATE_PAYMENT, its own trace",
+    [r["outcome"] for r in _be] == ["DUPLICATE_PAYMENT", "POSTED"]
+    and [r[0] for r in _dlq_632(c632, "DUPLICATE_PAYMENT", "c632t1")] == ["evt_c632_e2"]
+    and [r[0] for r in _dlq_632(c632, "DUPLICATE_PAYMENT", "c632t2")] == ["evt_c632_e3"],
+    str([r["outcome"] for r in _be]))
+chk("(e) …one POSTED row per tenant for the shared invoice, never zero, never two",
+    _posted_632(c632, "in_c632_shared", "c632t1") == (1, 1000)
+    and _posted_632(c632, "in_c632_shared", "c632t2") == (1, 1000))
+
+# ── (g) VOID: every failed attempt is a fact; only POSTED is money ───────────
+c632 = fresh_conn()
+
+
+def _failed_632(eid: str, inv: str, attempt: int, amount: int = 1000) -> dict:
+    _ev = _fixture("invoice.payment_failed", eid, invoice_id=inv)
+    _ev["data"]["object"].update(attempt_count=attempt, amount_due=amount)
+    return _ev
+
+
+_og = [L.process_stripe_event(c632, _failed_632("evt_c632_g1", "in_c632_g", 1))["outcome"],
+       L.process_stripe_event(c632, _failed_632("evt_c632_g2", "in_c632_g", 2))["outcome"],
+       L.process_stripe_event(c632, _fixture("invoice.paid", "evt_c632_gP",
+                                             invoice_id="in_c632_g"))["outcome"]]
+chk("(g) attempt 1 fails, attempt 2 fails, then the invoice is paid → VOID, VOID, POSTED",
+    _og == ["VOID", "VOID", "POSTED"], str(_og))
+chk("(g) …two VOID rows and one POSTED row, all naming the invoice",
+    _qall(c632, "SELECT status, COUNT(*) FROM ledger WHERE invoice_id='in_c632_g' "
+                "GROUP BY 1 ORDER BY 1") == [("POSTED", 1), ("VOID", 2)])
+chk("(g) …revenue for the invoice is the POSTED amount once (1000), not 3000",
+    _posted_632(c632, "in_c632_g") == (1, 1000))
+chk("(g) …downstream gets each failure and the payment once: 3 outbox rows",
+    _outbox_632(c632, "in_c632_g") == 3)
+chk("(g) redelivery of attempt 1's event → DLQ_DUPLICATE, no third VOID",
+    L.process_stripe_event(c632, _failed_632("evt_c632_g1", "in_c632_g", 1))["outcome"]
+    == "DLQ_DUPLICATE"
+    and _q1(c632, "SELECT COUNT(*) FROM ledger WHERE invoice_id='in_c632_g' AND status='VOID'") == 2)
+# Stripe: "manual payment attempts after the first attempt do not affect the retry
+#     schedule", so two real manual failures carry the same attempt_count. Both are facts.
+chk("(g) two failures with the same attempt_count and different events → two VOID rows "
+    "(attempt_count is not an attempt's identity)",
+    [L.process_stripe_event(c632, _failed_632(f"evt_c632_gm{i}", "in_c632_gm", 1))["outcome"]
+     for i in (1, 2)] == ["VOID", "VOID"])
+chk("(g) payment first, a late failure event after → VOID recorded, POSTED still 1",
+    L.process_stripe_event(c632, _fixture("invoice.paid", "evt_c632_gl1",
+                                          invoice_id="in_c632_gl"))["outcome"] == "POSTED"
+    and L.process_stripe_event(c632, _failed_632("evt_c632_gl2", "in_c632_gl", 1))["outcome"] == "VOID"
+    and _posted_632(c632, "in_c632_gl") == (1, 1000))
+L._pool = _MockPool(c632)
+L._limiter.reset()
+try:
+    _sg = TestClient(L.app, raise_server_exceptions=False).get("/ledger/summary").json()
+finally:
+    L._pool = _orig_pool_632
+    L._limiter.reset()
+chk("(g) /ledger/summary counts rows per status and exposes no amount to add up",
+    _sg["ledger"] == {"POSTED": 2, "VOID": 5}
+    and not any("amount" in _k for _k in _sg), str(_sg))
+
+# The rule behind the index: a POSTED or VOID row must name its invoice, in the model…
+_noid = _fixture("invoice.paid", "evt_c632_noid")
+del _noid["data"]["object"]["id"]
+_subid = _fixture("invoice.paid", "evt_c632_subid", invoice_id="sub_c632_not_an_invoice")
+_failnoid = _fixture("invoice.payment_failed", "evt_c632_failnoid")
+_failnoid["data"]["object"]["id"] = None
+chk("an invoice event with no data.object.id → DLQ_INVALID (it could not be deduplicated)",
+    L.process_stripe_event(c632, _noid)["outcome"] == "DLQ_INVALID")
+chk("…nor with an id that is not an invoice id, nor a null one on a failed invoice",
+    L.process_stripe_event(c632, _subid)["outcome"] == "DLQ_INVALID"
+    and L.process_stripe_event(c632, _failnoid)["outcome"] == "DLQ_INVALID")
+# …and in the database, for any writer that bypasses the model.
+for _st, _et, _amt in (("POSTED", "invoice.paid", 100), ("VOID", "invoice.payment_failed", 100)):
+    _cn = None
+    try:
+        with c632.cursor() as _c:
+            _c.execute("INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, "
+                       "amount_cents, currency, status, idempotency_key, payload) "
+                       "VALUES ('default', %s, %s, 'cus_c632', %s, 'usd', %s, 'k', '{}')",
+                       (f"evt_c632_raw_{_st}", _et, _amt, _st))
+    except psycopg2.errors.CheckViolation as _cv:
+        _cn = _cv.diag.constraint_name
+    chk(f"the database refuses a {_st} row with no invoice_id (it would escape the unique index)",
+        _cn == "ledger_invoice_rows_name_their_invoice", str(_cn))
+_uv = None
+try:
+    with c632.cursor() as _c:
+        _c.execute("INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, "
+                   "amount_cents, currency, status, idempotency_key, payload, invoice_id) "
+                   "VALUES ('default', 'evt_c632_raw_dup', 'invoice.paid', 'cus_c632', 1, 'usd', "
+                   "'POSTED', 'k', '{}', 'in_c632_g')")
+except psycopg2.errors.UniqueViolation as _e:
+    _uv = _e.diag.constraint_name
+chk("the database refuses a second POSTED row for an invoice from any writer",
+    _uv == "uq_ledger_one_posted_per_invoice", str(_uv))
+
+# LIFECYCLE rows: no amount, no invoice, in no total.
+_before_sum = _q1(c632, "SELECT SUM(amount_cents) FROM ledger WHERE status='POSTED'")
+_lc = [L.process_stripe_event(c632, _fixture(_t, f"evt_c632_lc_{_i}"))["outcome"]
+       for _i, _t in enumerate(_SUB_TYPES)]
+chk("LIFECYCLE: subscription events → LIFECYCLE, stored with amount NULL and invoice_id NULL",
+    _lc == ["LIFECYCLE"] * 3
+    and _q1(c632, "SELECT COUNT(*) FROM ledger WHERE status='LIFECYCLE' "
+                  "AND amount_cents IS NULL AND invoice_id IS NULL") == 3, str(_lc))
+chk("LIFECYCLE: the POSTED total is unchanged by them, and a SUM over every row ignores them",
+    _q1(c632, "SELECT SUM(amount_cents) FROM ledger WHERE status='POSTED'") == _before_sum
+    and _q1(c632, "SELECT SUM(amount_cents) FROM ledger WHERE status='LIFECYCLE'") is None)
+
+# Retention: trace rows age out like DUPLICATE and UNSUPPORTED.
+with c632.cursor() as _c:
+    _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status, max_retries, received_at) "
+               "VALUES ('evt_c632_old', 'DUPLICATE_PAYMENT', '{}', 'resolved', 0, "
+               "NOW() - interval '100 days')")
+chk("prune_dlq deletes an aged DUPLICATE_PAYMENT row",
+    L.prune_dlq(c632, retention_days=90) == 1
+    and _q1(c632, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_c632_old'") == 0)
+
+# ── (f) migration 0012: backfill, refusal over a double count, downgrade ──────
+c632 = fresh_conn()
+_env632 = {**os.environ, "DATABASE_URL": L.DATABASE_URL}
+
+
+def _alembic_632(*args) -> "subprocess.CompletedProcess":
+    return subprocess.run([*_ALEMBIC, *args], capture_output=True, text=True, env=_env632)
+
+
+def _has_col_632() -> bool:
+    return _q1(c632, "SELECT COUNT(*) FROM information_schema.columns "
+                     "WHERE table_name='ledger' AND column_name='invoice_id'") == 1
+
+
+def _schema_632() -> tuple:
+    return (_has_col_632(),
+            _q1(c632, "SELECT COUNT(*) FROM pg_indexes WHERE indexname IN "
+                      "('uq_ledger_one_posted_per_invoice','uq_dlq_one_duplicate_payment_per_event')"),
+            _q1(c632, "SELECT COUNT(*) FROM pg_constraint "
+                      "WHERE conname='ledger_invoice_rows_name_their_invoice'"))
+
+
+_d1 = _alembic_632("downgrade", "0011")
+chk("(f) alembic downgrade 0011 exits 0 and removes the column, both indexes and the CHECK",
+    _d1.returncode == 0 and _schema_632() == (False, 0, 0), _d1.stderr.strip()[-300:])
+
+
+def _pl_632(eid: str, etype: str, obj_id) -> str:
+    _o = {"customer": "cus_c632m", "amount_paid": 1000}
+    if obj_id is not None:
+        _o["id"] = obj_id
+    return json.dumps({"id": eid, "type": etype, "data": {"object": _o}})
+
+
+_seed_632 = [  # (org, event id, type, amount, status, payload)
+    ("default", "evt_m_paid", "invoice.paid", 1000, "POSTED", _pl_632("evt_m_paid", "invoice.paid", "in_m1")),
+    ("default", "evt_m_fail", "invoice.payment_failed", 1000, "VOID",
+     _pl_632("evt_m_fail", "invoice.payment_failed", "in_m1")),
+    ("default", "evt_m_sub", "customer.subscription.created", None, "LIFECYCLE",
+     _pl_632("evt_m_sub", "customer.subscription.created", "sub_m1")),
+    ("default", "evt_m_noid", "invoice.paid", 1000, "POSTED", _pl_632("evt_m_noid", "invoice.paid", None)),
+    ("default", "evt_m_numid", "invoice.paid", 1000, "POSTED", _pl_632("evt_m_numid", "invoice.paid", 12345)),
+    ("default", "evt_m_notjson", "invoice.paid", 1000, "POSTED", "not json at all"),
+    ("c632m", "evt_m_paid", "invoice.paid", 1000, "POSTED", _pl_632("evt_m_paid", "invoice.paid", "in_m1")),
+]
+with c632.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES ('c632m','c632m','w')")
+    for _row in _seed_632:
+        _c.execute("INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, amount_cents, "
+                   "currency, status, idempotency_key, payload) VALUES (%s,%s,%s,'cus_c632m',%s,'usd',%s,'k',%s)",
+                   _row)
+_u1 = _alembic_632("upgrade", "head")
+chk("(f) alembic upgrade head over existing rows exits 0", _u1.returncode == 0,
+    _u1.stderr.strip()[-300:])
+_bf = dict(((r[0], r[1]), r[2]) for r in _qall(c632, "SELECT org_id, transaction_id, invoice_id FROM ledger"))
+chk("(f) backfill: invoice rows (POSTED and VOID, both tenants) get data.object.id",
+    _bf[("default", "evt_m_paid")] == "in_m1" and _bf[("default", "evt_m_fail")] == "in_m1"
+    and _bf[("c632m", "evt_m_paid")] == "in_m1", str(_bf))
+chk("(f) backfill: a subscription row stays NULL (its object is not an invoice)",
+    _bf[("default", "evt_m_sub")] is None)
+chk("(f) backfill: no id, a non-string id or a payload that is not JSON → NULL, no abort",
+    _bf[("default", "evt_m_noid")] is None and _bf[("default", "evt_m_numid")] is None
+    and _bf[("default", "evt_m_notjson")] is None, str(_bf))
+chk("(f) the index and the trace index exist, the CHECK exists and is NOT VALID (old rows kept)",
+    _schema_632() == (True, 2, 1)
+    and _q1(c632, "SELECT convalidated FROM pg_constraint "
+                  "WHERE conname='ledger_invoice_rows_name_their_invoice'") is False)
+chk("(f) a backfilled row guards its invoice: a new event for in_m1 → DUPLICATE_PAYMENT",
+    L.process_stripe_event(c632, _fixture("invoice.paid", "evt_m_new", invoice_id="in_m1"))["outcome"]
+    == "DUPLICATE_PAYMENT")
+_d2 = _alembic_632("downgrade", "-1")
+chk("(f) alembic downgrade -1 exits 0 and removes what 0012 added",
+    _d2.returncode == 0 and _schema_632() == (False, 0, 0), _d2.stderr.strip()[-300:])
+chk("(f) …keeping every ledger row and the DUPLICATE_PAYMENT trace row",
+    _q1(c632, "SELECT COUNT(*) FROM ledger") == len(_seed_632)
+    and _q1(c632, "SELECT COUNT(*) FROM dlq WHERE reason='DUPLICATE_PAYMENT'") == 1)
+# A database that already counts one invoice twice: the upgrade refuses, changes nothing.
+with c632.cursor() as _c:
+    _c.execute("INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, amount_cents, "
+               "currency, status, idempotency_key, payload) VALUES ('default','evt_m_paid_again',"
+               "'invoice.paid','cus_c632m',1000,'usd','POSTED','k',%s)",
+               (_pl_632("evt_m_paid_again", "invoice.paid", "in_m1"),))
+_u2 = _alembic_632("upgrade", "head")
+chk("(f) over two POSTED rows for one invoice, the upgrade fails and names the invoice",
+    _u2.returncode != 0 and "Cannot upgrade to 0012" in _u2.stderr and "default/in_m1" in _u2.stderr,
+    _u2.stderr.strip()[-300:])
+chk("(f) …and changes nothing: no column, still at revision 0011",
+    _schema_632() == (False, 0, 0) and "0011" in _alembic_632("current").stdout)
+with c632.cursor() as _c:
+    _c.execute("DELETE FROM ledger WHERE transaction_id='evt_m_paid_again'")
+_u3 = _alembic_632("upgrade", "head")
+chk("(f) once a human removes the extra row, upgrade head succeeds",
+    _u3.returncode == 0 and _schema_632() == (True, 2, 1), _u3.stderr.strip()[-300:])
+c632.close()
 
 # =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
