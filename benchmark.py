@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 """
-benchmark.py — measure the three ingest paths, reproducibly.
+benchmark.py — measure ingest throughput on the machine and database it runs against.
 
 WHY THIS EXISTS
-    The throughput figures in README.md came from a single manual run that nobody could
-    repeat. A number you cannot reproduce is a claim, not a measurement, and the first
-    person to try it on different hardware finds out. This script re-measures every
-    figure the README states, prints the environment it measured on, and is the only
-    thing those numbers are allowed to come from.
+    Throughput depends on the hardware, the PostgreSQL build and the connection path, so
+    a figure measured elsewhere describes that elsewhere. This script runs the three ingest
+    paths on the machine that runs it and prints the environment it measured on, so every
+    number it prints is attributable to that environment. Run it on your own hardware
+    before you quote a figure.
 
 WHAT IT MEASURES
-    1. single-event  process_stripe_event() in a loop. One BEGIN + 2 INSERTs + COMMIT
-                     per event: four synchronous round trips, so this is bounded by
-                     network latency to PostgreSQL, not by CPU or by Pydantic.
-    2. batch         process_stripe_event_batch(). execute_values collapses N inserts
-                     into ceil(N/page_size) statements, so the same work costs a
-                     fraction of the round trips.
+    1. single-event  process_stripe_event() in a loop. Each event runs one _tx(): BEGIN,
+                     SET LOCAL app.org_id, the ledger INSERT, the outbox INSERT, COMMIT.
+                     That is five synchronous round trips to PostgreSQL per event.
+    2. batch         process_stripe_event_batch(). One BEGIN, one SET LOCAL, then one
+                     bulk INSERT per table through execute_values. Each bulk INSERT sends
+                     ceil(N/page_size) statements, so the round-trip count scales with
+                     N/page_size instead of N.
     3. http          POST /webhook/stripe against a running service, signed exactly as
-                     Stripe signs. This is the only end-to-end number: it includes
-                     uvicorn, Pydantic, HMAC verification, the connection pool and the
-                     rate limiter. The README had no figure for this path at all.
+                     Stripe signs. This is the only path that crosses uvicorn, Pydantic,
+                     HMAC verification, the connection pool and the rate limiter.
 
-    The gap between (1) and (3) is the HTTP stack's cost. The gap between (1) and (2) is
-    why the batch endpoint exists.
+    The ratio between (1) and (2) shows what collapsing per-event round trips is worth.
+    The ratio between (1) and (3) shows what the HTTP stack adds on top of the database
+    work.
+
+    When APP_DATABASE_URL is set, the two database paths run as that role, which is the role
+    the service deploys as. When it is unset, they run as DATABASE_URL's role. If that role
+    is a superuser, row-level security is bypassed, the banner prints "RLS INERT", and the
+    figures omit the cost of tenant isolation. The HTTP path runs as whatever role the target
+    service uses.
 
 RATE LIMITING
     /webhook/stripe allows 100/minute by default, which would make an HTTP benchmark
@@ -30,18 +37,31 @@ RATE LIMITING
 
         RATE_LIMIT_WEBHOOK=100000/minute uvicorn ledger:app --port 8000
 
-    On the demo credentials the service refuses to start unless the run is declared
-    dev (BILLING_ENV=dev, see .env.example), and it must run on the same _bench
-    database this script resets.
+    On demo credentials the service refuses to start unless BILLING_ENV=dev and
+    INGRESS_BIND_ADDR is a loopback address (see .env.example). In --url mode the server
+    must read the same DATABASE_URL this script uses, or the reset and the load land on
+    different databases.
 
     The script detects a 429 and tells you, rather than reporting a throughput number
     that is really just the limit.
 
+DATABASE
+    Before each path the script TRUNCATEs ledger, outbox and dlq on the database named by
+    DATABASE_URL, which defaults to billing_bench. disposable_db refuses any database whose
+    name does not end in _test or _bench, so the reset cannot reach a database created for
+    something else.
+
 USAGE
-    python benchmark.py                       # all three, 2000 events each
+    python benchmark.py                       # all three: 2000 per DB path, 600 over HTTP
     python benchmark.py --events 5000
+    python benchmark.py --events 5000 --http-events 1500 --concurrency 16
     python benchmark.py --skip-http           # DB paths only, no running service needed
     python benchmark.py --url http://localhost:8000
+
+    Importing this file imports ledger, which runs its schema bootstrap (CREATE TABLE IF
+    NOT EXISTS and ALTER statements) against DATABASE_URL before any argument is parsed.
+    So --help also needs PostgreSQL reachable at DATABASE_URL, and it applies that schema
+    to the database it connects to.
 """
 
 import argparse
