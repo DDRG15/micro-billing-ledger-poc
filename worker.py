@@ -38,6 +38,8 @@ import os
 import signal
 import sys
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from typing import Generator, List, Optional
 
@@ -149,6 +151,24 @@ def _tx(
 # Dispatch
 # ---------------------------------------------------------------------------
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: surface the 3xx as an HTTPError, i.e. a failed dispatch.
+
+    urllib follows 301/302/303 on a POST by re-issuing it as a GET with no body. The
+    redirect target's 200 then read as success: the row was marked dispatched with no
+    error while the receiver got an empty GET — reproduced against the compose stack, a
+    paid event "delivered" that never arrived, with nothing in outbox_pending, last_error
+    or the logs. A 3xx is now a failure the row backs off from, with the status recorded.
+    Not following also keeps a downstream from steering the worker to another host.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] = None) -> None:
     """
     Forward a single outbox row to its tenant's downstream system.
@@ -164,9 +184,6 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] =
     """
     target = destination or DOWNSTREAM_URL
     if target:
-        import urllib.request
-        import urllib.error
-
         data = row["payload"].encode()
         req = urllib.request.Request(
             target,
@@ -180,7 +197,7 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] =
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 — URL is operator-supplied DOWNSTREAM_URL, not user input
+            with _NO_REDIRECT_OPENER.open(req, timeout=10) as resp:  # nosec B310 — URL is operator-supplied DOWNSTREAM_URL, not user input
                 status = resp.status
         except urllib.error.HTTPError as exc:
             status = exc.code

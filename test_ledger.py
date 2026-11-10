@@ -3886,6 +3886,56 @@ chk("a malformed Content-Length is refused before reading", _r.status_code in (4
 
 
 # =============================================================================
+# C6-15: a redirecting downstream is a failed dispatch, not a delivered one
+#     urllib followed a 302 on the POST as a body-less GET, and the target's 200 marked
+#     the row dispatched with no error: a paid event "delivered" that never arrived.
+# =============================================================================
+print("\n── C6-15: downstream 3xx → dispatch fails, nothing follows the redirect ─")
+
+import http.server as _hs_615  # noqa: E402
+import threading as _th_615  # noqa: E402
+
+_hits_615 = []
+
+
+class _Redirector615(_hs_615.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        _hits_615.append(("POST", self.path))
+        self.send_response(302)
+        self.send_header("Location", "/sink")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        _hits_615.append(("GET", self.path))
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+_srv_615 = _hs_615.HTTPServer(("127.0.0.1", 0), _Redirector615)
+_th_615.Thread(target=_srv_615.serve_forever, daemon=True).start()
+try:
+    _err_615 = None
+    try:
+        W._dispatch_row({"id": 1, "payload": "{}", "event_type": "invoice.paid",
+                         "transaction_id": "evt_c615", "org_id": "default"},
+                        f"http://127.0.0.1:{_srv_615.server_port}/hook")
+    except RuntimeError as _e:
+        _err_615 = str(_e)
+    chk("a 302 from the downstream raises (the row backs off), naming the status",
+        _err_615 is not None and "302" in _err_615, str(_err_615))
+    chk("…and the worker never follows it with a body-less GET",
+        _hits_615 == [("POST", "/hook")], str(_hits_615))
+finally:
+    _srv_615.shutdown()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
