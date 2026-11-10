@@ -400,8 +400,12 @@ These are engineering controls, not a compliance programme.
 - **Five Stripe event types are recorded:** `invoice.paid`, `invoice.payment_failed` and
   `customer.subscription.created`, `.updated` and `.deleted`. Other types are answered
   `200` and stored as `UNSUPPORTED`. The fixtures in `fixtures/stripe/` are built from
-  Stripe's API reference; the system has not yet received events from a real Stripe
-  account.
+  Stripe's API reference. The service has also received events from a Stripe sandbox
+  (test mode, API version `2026-10-28`), forwarded by `stripe listen` and generated with
+  `stripe trigger` for `invoice.paid`, `invoice.payment_failed` and the three subscription
+  events: 73 events, all answered `200`, 10 recorded in the ledger (4 `POSTED`, 1 `VOID`,
+  5 `LIFECYCLE`) and 63 stored as `UNSUPPORTED`, none lost or recorded twice. It has not
+  received live-mode traffic.
 - **One shared API key per tenant.** No user accounts, roles or key-rotation flow, and no
   log of who read what.
 - **Tenants are added with SQL**, and a tenant's Stripe signing secret is stored in plain
