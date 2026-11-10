@@ -17,6 +17,25 @@
 #   this is expected for localhost. For local dev you can also access
 #   the API directly on http://localhost:8000 (billing port is still exposed).
 
+# Global server timeouts.
+#     Scenario: Caddy's defaults leave header and body reads unbounded, so a client that
+#     opens a connection and sends one byte every few seconds (slowloris) holds a
+#     connection and its goroutine indefinitely; enough of them exhaust file descriptors
+#     and the 100/minute rate limiter never sees a completed request to count.
+#     Consequence: the ingress stops answering Stripe. Decision: cut a client that has
+#     not finished its headers in 10 s or its body in 30 s (the body cap is 1 MiB), and
+#     drop idle keep-alive connections after 2 minutes. Stripe's deliveries are small and
+#     fast; 30 s for the body is generous for them.
+{
+    servers {
+        timeouts {
+            read_header 10s
+            read_body   30s
+            idle        2m
+        }
+    }
+}
+
 {$CADDY_DOMAIN} {
     # Forward all traffic to the billing FastAPI container.
     #     The billing service is NOT exposed to the internet directly —

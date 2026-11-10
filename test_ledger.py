@@ -4526,6 +4526,44 @@ chk("BILLING_ENV=production → 404",
 
 
 # =============================================================================
+# C6-25: the ingress cuts slow clients (slowloris) with server timeouts
+#     Caddy's defaults leave header and body reads unbounded: a client dribbling one byte
+#     every few seconds holds a connection indefinitely, and the per-IP rate limiter
+#     never sees a finished request to count. The Caddyfile now sets global
+#     read_header / read_body / idle timeouts. The suite cannot run Caddy, so this checks
+#     the declaration (the Caddyfile was separately accepted by `caddy validate`).
+# =============================================================================
+print("\n── C6-25: Caddyfile declares header, body and idle timeouts ─────────────")
+
+import re as _re_625  # noqa: E402
+
+_caddy_625 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "Caddyfile"),
+                  encoding="utf-8").read()
+_code_625 = "\n".join(_l.split("#", 1)[0] for _l in _caddy_625.splitlines())
+_m_625 = _re_625.search(r"^\{\s*servers\s*\{\s*timeouts\s*\{(?P<body>[^}]*)\}", _code_625,
+                        _re_625.M | _re_625.S)
+chk("a global `servers { timeouts { ... } }` block exists",
+    _m_625 is not None, _code_625[:200])
+
+
+def _secs_625(name: str):
+    if not _m_625:
+        return None
+    m = _re_625.search(rf"^\s*{name}\s+(\d+)(ms|s|m)\b", _m_625.group("body"), _re_625.M)
+    if not m:
+        return None
+    return int(m.group(1)) * {"ms": 0.001, "s": 1, "m": 60}[m.group(2)]
+
+
+_rh_625, _rb_625, _idle_625 = _secs_625("read_header"), _secs_625("read_body"), _secs_625("idle")
+chk("read_header is set and at most 15 s", _rh_625 is not None and _rh_625 <= 15, str(_rh_625))
+chk("read_body is set and at most 60 s", _rb_625 is not None and _rb_625 <= 60, str(_rb_625))
+chk("idle is set and at most 5 min", _idle_625 is not None and _idle_625 <= 300, str(_idle_625))
+chk("the timeouts sit in the global block, ahead of the site block",
+    bool(_m_625) and _m_625.start() < _code_625.index("{$CADDY_DOMAIN}"))
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
