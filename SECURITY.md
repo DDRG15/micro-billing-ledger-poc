@@ -4,8 +4,8 @@
 
 This is a **proof of concept**, not production software. It is published to demonstrate
 specific architectural decisions — idempotent inserts at the database constraint, the
-Transactional Outbox pattern, and dead-letter handling. Read the *Production Gap
-Checklist* in [README.md](README.md) before considering any of it for real traffic.
+Transactional Outbox pattern, and dead-letter handling. Read the *Limitations* section in
+[README.md](README.md) before considering any of it for real traffic.
 
 That said, the controls it does implement are meant to work, and a report that one of
 them does not is worth sending.
@@ -36,6 +36,20 @@ API key on the operational endpoints (`/ledger/summary`, `/dlq/entries`,
 `/dlq/{id}/retry`, `/metrics`). Per-client rate limiting keyed on `X-Forwarded-For`
 trusted only from the proxy's own address. TLS and security headers at the proxy.
 The container runs as a non-root user.
+
+**Request size, speed and surface.** A request body over 1 MiB is refused with `413`, at
+Caddy and again in the application (`MAX_REQUEST_BODY_BYTES`) for traffic that does not
+pass through Caddy; the application counts bytes as they arrive, so an unauthenticated
+body cannot grow the process past the cap. Caddy closes a connection whose headers take
+longer than 10 s or whose body takes longer than 30 s, and drops idle connections after
+2 minutes. Failed authentications are counted per client and answered `429` after
+`RATE_LIMIT_AUTH_FAILURES` (default 20 a minute) before any database lookup, so guessing a
+key costs the attacker the budget and costs the service no query. An event id must be
+printable ASCII of 1 to 255 characters; anything else is `INVALID`, because the id travels
+into a delivery header and into log lines. `/docs`, `/redoc` and `/openapi.json` are served
+only in a declared local dev run and answer `404` everywhere else. A signed payload that is
+replayed within Stripe's signature tolerance leaves one `DUPLICATE` or one `UNSUPPORTED`
+row per event, not one per request (unique partial indexes, migrations 0010 and 0011).
 
 **Tenant isolation (partial).** `ledger`, `outbox` and `dlq` carry `org_id`, and the
 ledger primary key is `(org_id, transaction_id)` so the idempotency guard is per-tenant —
@@ -68,7 +82,12 @@ there is no PostHog adapter.
 The worker selects eligible candidates per tenant, then ranks them round-robin before
 applying the batch limit; the rotation continues across claims, so more backlogged
 tenants than batch slots still each get a turn. Claims commit before HTTP; `claimed_until` keeps other workers
-off a claimed row until the lease expires. Each result commits separately. Dispatch
+off a claimed row until the lease expires. Each result commits separately. Tenants are
+delivered to concurrently on a bounded thread pool (`WORKER_DISPATCH_CONCURRENCY`),
+rows of one tenant stay in order, and a tenant whose downstream is slow or dead holds one
+slot, not the worker. A delivery has a total deadline (`DISPATCH_DEADLINE_SECONDS`, 15 s)
+and follows no redirect, so a downstream can neither stall the worker indefinitely nor
+steer it to another host with a `3xx`. Dispatch
 failures back off for 30, 120, 600 and then 3,600 seconds, repeating the final delay
 without an attempt limit. Backed-off and leased rows are excluded from selection. These
 are availability controls: a tenant's failing backlog does not fill every later batch.
@@ -113,8 +132,8 @@ migration step and to no process serving traffic.
 aggregated across tenants, plus `billing_secrets_info` for the operator's secrets. When
 authentication is configured, only the operator key (`BILLING_API_KEY`) is accepted;
 a tenant key gets 403, and missing or unknown keys get 401. With no keys configured
-anywhere, the endpoint remains open in development mode. A18 tests operator access and
-tenant refusal through the application's real connection pool. A tenant's own queue
+anywhere, the endpoint remains open in development mode. The test suite checks operator
+access and tenant refusal through the application's real connection pool. A tenant's own queue
 counts are available through `/ledger/summary`.
 
 One limit remains: `rls_inert` is a
@@ -149,6 +168,8 @@ or the `billing_app` bootstrap password — unless two declarations both hold:
 docker-compose defaults `BILLING_ENV` to `dev` and the ingress to `127.0.0.1`, so a fresh
 clone starts and nothing beyond the machine can reach it. The refusal names each
 offending setting, never its value (`docker compose logs billing | grep demo_credentials`).
+The start-up warnings about placeholder credentials come from the API process only; the
+worker, which imports the same module but serves no HTTP, does not print them.
 
 Known limit: the check reads `INGRESS_BIND_ADDR`, not the address uvicorn itself binds.
 Run outside compose, `BILLING_ENV=dev uvicorn ledger:app --host 0.0.0.0` passes it and

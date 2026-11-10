@@ -1,94 +1,90 @@
-# Micro-Billing-Ledger PoC
-### Idempotent Stripe Webhook Ingestion — PostgreSQL · Pydantic v2 · FastAPI
+# Micro-Billing-Ledger
 
 [![Tests](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/test.yml)
 [![Lint](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/lint.yml)
 [![Stack](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/stack.yml/badge.svg)](https://github.com/DDRG15/micro-billing-ledger-poc/actions/workflows/stack.yml)
 
-**Status: Proof of Concept.** This demonstrates specific architectural decisions — idempotent inserts, Transactional Outbox, SELECT FOR UPDATE SKIP LOCKED — in a working system. It is not production software. The Production Gap Checklist at the bottom of this file is now fully closed; what remains genuinely out of scope is listed there as *Not attempted*, with the reason.
+A backend service that receives payment events from Stripe, records each one in a
+PostgreSQL ledger exactly once, and forwards it to another system. Stripe sends the same
+event more than once when it is unsure a delivery arrived, and servers restart and
+databases fail at bad moments, so the hard requirement is that a payment event is never
+lost and never counted twice. Several customers ("tenants") can share one deployment
+without seeing each other's data.
 
-**Stack:** Python 3.12–3.13 · FastAPI · Pydantic v2 · psycopg2 · PostgreSQL 16 · Docker Compose  
-**Tests:** 486 passed / 0 failed — recorded 2026-11-09 against PostgreSQL 16; database integration tests plus targeted test doubles\
-**Throughput:** 4,143 TPS batch · 112 TPS over HTTP at 16 concurrent clients (p50 112ms) · 24 TPS per-event · all reproducible via `python benchmark.py`, measured against the restricted role the service actually deploys as
+**Status:** proof of concept. It is built and tested to behave correctly under failure,
+but it has not carried real traffic, and the [limitations](#limitations) are listed below.
+**Stack:** Python 3.12 and 3.13 · FastAPI · Pydantic v2 · PostgreSQL 16 · Docker Compose ·
+Caddy. **Tests:** 612 checks in one script, plus a separate end-to-end failure harness.
 
 ---
 
-## The Problem
+## How it works
 
-Stripe delivers webhooks with **at-least-once** guarantees. If your ingestion layer looks like this, you are double-counting revenue:
-
-```python
-# WRONG — classic race window
-if not db.exists(event_id):
-    db.insert(event)          # another thread just did this 2ms ago
-    revenue_ledger.credit()   # ghost payment: credited twice, exists in DB, not in reality
+```mermaid
+flowchart LR
+    S["Stripe"] -->|"signed webhook"| C["Caddy<br/>TLS, size and time limits"]
+    C --> A["API (ledger.py)<br/>verify, validate, record"]
+    A -->|"one transaction"| DB[("PostgreSQL<br/>ledger + outbox")]
+    A -.->|"rejected or repeated events"| D[("dead-letter queue")]
+    DB --> W["Worker (worker.py)<br/>claim, deliver, record result"]
+    W -->|"HTTP POST"| T["Tenant's downstream system"]
 ```
 
-Two concurrent retries pass the `exists()` check before either commits. The result is a **Ghost Payment** — a ledger row that exists in your database but doesn't correspond to a real financial event. Recovery requires manual forensics.
+1. **Receive.** Stripe posts an event to Caddy, the web server in front of the service.
+   Caddy handles HTTPS, refuses bodies over 1 MiB and cuts clients that send too slowly.
+2. **Verify and validate.** The API checks Stripe's signature using the tenant's own
+   signing secret, then validates the event: known type, a customer id, an amount, a
+   three-letter currency.
+3. **Record once.** In a single database transaction the API inserts the event into the
+   `ledger` table and a "to deliver" note into the `outbox` table. The ledger's primary
+   key is `(org_id, transaction_id)`, so a second copy of the same event is refused by
+   the database itself, and the API answers `200` with `DLQ_DUPLICATE`.
+4. **Keep what was rejected.** Invalid events, repeats and event types the ledger does
+   not record are stored in the `dlq` table with the full payload. Stripe still gets a
+   `200`, because asking it to resend a bad event would not fix it. If the database
+   cannot take the event, the API answers `503` and Stripe retries later.
+5. **Deliver.** A separate worker process reads the outbox, posts each event to the
+   tenant's `downstream_url`, and marks it delivered. Failures wait and retry; nothing
+   is dropped.
+6. **Operate.** Authenticated endpoints show counts, list and replay dead-lettered
+   events, and expose Prometheus metrics.
+
+Terms used above and below:
+
+- **Idempotency:** handling the same event twice has the same effect as handling it once.
+  Here the database's unique key enforces it, with no application lock.
+- **Transactional outbox:** the event and its "to deliver" note are written in the same
+  database transaction, so one cannot exist without the other.
+- **Dead-letter queue (DLQ):** a table holding events the system set aside, with enough
+  detail for a person to look at them or replay them.
+- **Row-level security (RLS):** PostgreSQL filters every query by tenant, so a query that
+  forgets its own tenant filter returns nothing instead of everything.
+- **Lease:** a time-limited claim on a piece of work. A worker that crashes loses its
+  lease when it expires, and another worker picks the work up.
+
+The full request path, every component and every failure response are drawn in
+[docs/architecture.md](docs/architecture.md), which GitHub renders. The same diagrams are
+available as an interactive viewer, [docs/architecture.html](docs/architecture.html): hover
+or focus a node to see what flows into it (blue) and out of it (amber). GitHub shows HTML
+files as source, so download the file and open it in a browser.
 
 ---
 
-## Quick Start
+## Quick start
 
-**Prerequisites:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) · Python 3.12 or 3.13
+You need Docker with Compose, and Python 3 for the test script. Nothing else is installed
+on the host.
 
 ```bash
-# 1. Configure environment — the dev defaults work as-is
-cp .env.example .env
-# Every compose variable also has a built-in dev default, so the stack still
-# starts without this file. Copy it anyway: it is where you change the values
-# marked *** CHANGE *** before anything is reachable from a network.
-
-# 2. Start PostgreSQL and create the database the test suite runs on. The suite
-#    TRUNCATEs every tenant table, so it refuses (exit code 2) any database whose
-#    name does not end in _test or _bench — including `billing`, the one compose
-#    creates for the stack.
-docker compose up -d --wait postgres
-docker compose exec postgres createdb -U postgres billing_test
-
-# 3. Install Python dependencies
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-
-# 4. Apply migrations to the test database. Required before the suite: the
-#    row-level security policies and the restricted `billing_app` role exist only in
-#    migration 0006, and the tests that prove isolation connect as that role.
-#    Set DATABASE_URL inline, not with export: an exported DATABASE_URL also reaches
-#    `docker compose up` and points the migrate container at localhost.
-#    (PowerShell: $env:DATABASE_URL="..."; alembic upgrade head; Remove-Item Env:DATABASE_URL)
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/billing_test alembic upgrade head
-
-# 5. Run the full test suite — live PostgreSQL. With no DATABASE_URL set it uses
-#    billing_test on localhost:5432.
-python test_ledger.py
-
-# 6. Start the full stack (postgres + migrate + billing + worker + caddy)
-docker compose up
-# Confirm the database is enforcing tenant isolation, not just declaring it:
-docker compose logs billing | grep -E "rls_enforced|rls_inert"
-
-# — OR — run the API standalone without the full stack. It connects as the owner
-#   unless APP_DATABASE_URL points at billing_app, and says so at startup. On the
-#   demo credentials it refuses to start unless the run is declared dev; the check
-#   reads INGRESS_BIND_ADDR (default 127.0.0.1), not uvicorn's --host, so keep
-#   uvicorn on its default loopback bind when you declare dev.
-BILLING_ENV=dev uvicorn ledger:app --port 8000
-
-# 7. Teardown — stop containers and remove volumes
-docker compose down          # keeps pgdata volume (data survives)
-docker compose down -v       # wipes pgdata volume (full clean slate)
+cp .env.example .env        # optional: compose has the same dev defaults built in
+docker compose up -d        # PostgreSQL, migrations, API, worker, Caddy
+docker compose ps           # wait until billing shows "healthy"
 ```
 
-### Send test webhooks
-
-`POST /webhook/stripe` verifies an HMAC-SHA256 signature on **every** request, including
-when `STRIPE_WEBHOOK_SECRET` is still the placeholder. That is deliberate — an endpoint
-that accepts unsigned requests whenever it is misconfigured fails silently, which is
-worse than rejecting everything. So a bare `curl -d '{...}'` correctly returns `400`.
-
-`send_test_webhook.py` signs requests the way Stripe does, using whatever secret the
-stack is actually running with. Standard library only — no venv, no Stripe account:
+Send signed test events. Stripe signs every request, and the service verifies the
+signature even with the placeholder secret, so a bare `curl` correctly gets `400`.
+`send_test_webhook.py` signs the way Stripe does, using the secret the stack runs with
+(standard library only, no Stripe account):
 
 ```bash
 python send_test_webhook.py --all
@@ -97,519 +93,138 @@ python send_test_webhook.py --all
 ```
 Valid invoice.paid:
   POSTED expected: HTTP 200  {"outcome":"POSTED","transaction_id":"evt_demo_...","reason":null}
-
 Same event twice - the idempotency guard fires on the second:
-  1st -> POSTED: HTTP 200        {"outcome":"POSTED",...}
-  2nd -> DLQ_DUPLICATE: HTTP 200 {"outcome":"DLQ_DUPLICATE","reason":"Already processed..."}
-
+  1st -> POSTED: HTTP 200  {"outcome":"POSTED",...}
+  2nd -> DLQ_DUPLICATE: HTTP 200  {"outcome":"DLQ_DUPLICATE",...}
 Invalid payload (currency 'xx' is not a real ISO 4217 code):
-  DLQ_INVALID expected: HTTP 200 {"outcome":"DLQ_INVALID","reason":"Pydantic validation failed: 1 errors"}
-
+  DLQ_INVALID expected: HTTP 200  {"outcome":"DLQ_INVALID",...}
 Failed invoice - amount lives in amount_due, not amount_paid:
   VOID expected, recorded at 7500: HTTP 200  {"outcome":"VOID",...}
-
-Ledger summary:
-  summary: HTTP 200  {"ledger":{"VOID":1,"POSTED":2},"dlq_depth":2,"dlq_total":2,"outbox_pending":1}
-
-Prometheus metrics:
-  metrics: HTTP 200
-      webhook_events_total{outcome="POSTED"} 2.0
-      webhook_events_total{outcome="DLQ_DUPLICATE"} 1.0
-      webhook_events_total{outcome="DLQ_INVALID"} 1.0
-      webhook_events_total{outcome="VOID"} 1.0
-      dlq_depth 2.0
-      dlq_total 2.0
-      outbox_pending 1.0
 ```
 
-Individual steps: `--duplicate`, `--invalid`, `--failed`, `--summary`, `--metrics`.
-Add `--url https://localhost` to go through Caddy instead of the direct port.
-
-The read endpoints need the API key (`dev_key_change_in_production` by default):
+(Abridged. `--all` also prints the ledger summary and the metrics.) Then look at the
+results with the API key from `.env.example`:
 
 ```bash
 curl -H "X-Api-Key: dev_key_change_in_production" http://localhost:8000/ledger/summary
 curl -H "X-Api-Key: dev_key_change_in_production" "http://localhost:8000/dlq/entries?limit=10"
+docker compose logs worker | grep dispatch       # the worker's delivery log lines
 ```
 
----
+The worker runs in log-only mode by default (`WORKER_LOG_ONLY=true`): it marks events
+delivered and logs them without calling anyone. Set `DOWNSTREAM_URL`, or a tenant's
+`org.downstream_url`, to send them to a real endpoint. `--url https://localhost` sends
+through Caddy instead of the direct port. `docker compose down -v` removes everything.
 
-## Architecture
+### Running the tests
 
-```mermaid
-flowchart TD
-    S[Stripe Webhook] -->|HTTPS :443| CA[Caddy\nTLS termination + security headers]
-    CA -->|HTTP :8000| H[FastAPI Handler]
-    H -->|dict payload| V{5-Layer Pydantic\nValidation Stack}
-
-    V -->|ValidationError| DI[DLQ — INVALID\nraw payload preserved]
-    V -->|Valid StripeEvent| P[process_stripe_event\nor\nprocess_stripe_event_batch]
-
-    P -->|BEGIN| TX[PostgreSQL Transaction]
-    TX -->|INSERT ... ON CONFLICT\nDO NOTHING| L[(ledger\nPK: org_id + transaction_id)]
-    TX -->|RETURNING transaction_id| R{Inserted?}
-
-    R -->|in RETURNING set — new event| O[(outbox\ndispatched=0)]
-    R -->|absent from RETURNING set — duplicate| DD[DLQ — DUPLICATE\naudit trail]
-
-    TX -->|COMMIT| C[HTTP 200 to Stripe]
-
-    O -->|short claim transaction\nSELECT FOR UPDATE SKIP LOCKED + lease| W[Worker Service\nclaim → dispatch → finish per row]
-    W -->|POST to that tenant's downstream_url| DS[Downstream System
-per tenant]
-    W -->|structured log when no destination is set| LOG[Log / Audit]
-
-    DI --> OPS[Ops — GET /dlq/entries]
-    DD --> OPS
-```
-
-### Why this handles concurrent load correctly
-
-`INSERT INTO ledger ... ON CONFLICT (org_id, transaction_id) DO NOTHING` is the **database-level serialization point** for each tenant. Five threads firing the same `event_id` for one tenant simultaneously all enter the transaction; PostgreSQL's composite PRIMARY KEY ensures exactly one INSERT wins; all others produce `rowcount=0` (single-event path) or are absent from the `RETURNING` set (batch path). No application lock is required.
-
----
-
-## Outbox Worker
-
-The Transactional Outbox pattern guarantees that a `ledger` row and its corresponding `outbox` row are written atomically. Without a drain loop, that guarantee is half-finished: events are recorded but never delivered downstream.
-
-`worker.py` is a standalone Docker service — not a thread inside the API process. An in-process thread shares the connection pool, dies with the web server, and cannot be restarted independently. A separate service has its own lifecycle, its own connection, and its own failure domain.
-
-The worker runs **claim → dispatch → finish**:
-
-1. **Claim:** a short transaction selects eligible rows per tenant with `FOR UPDATE SKIP LOCKED`, ranks them round-robin across tenants — within a rank, tenants rotate in `org_id` order starting after the last tenant this worker served, so with more backlogged tenants than batch slots each one still gets a slot in turn — and sets `claimed_until`. Rows already delivered, backing off, or under a live lease are excluded. The transaction commits before dispatch starts. `WORKER_LEASE_SECONDS` defaults to `WORKER_BATCH_SIZE * 10 + 60` seconds (1,060 seconds for the default batch of 100).
-2. **Dispatch:** HTTP calls run with no database transaction open and no row locks held. The HTTP timeout is 10 seconds per socket operation (connect, each read), not per row: a downstream that keeps sending bytes slowly can hold one dispatch longer, which is how a worker can outlive its lease.
-3. **Finish:** each row's result commits in its own transaction scoped to that row's tenant. Success sets `dispatched=1` and `dispatched_at`; failure increments `attempts`, records `last_error` (up to 500 characters), sets `next_attempt_at`, and clears the lease.
-
-The claim query uses per-tenant candidate selection before the batch limit:
-
-```sql
-WITH candidates AS (
-    SELECT c.id, c.org_id
-    FROM org g
-    CROSS JOIN LATERAL (
-        SELECT o.id, o.org_id
-        FROM outbox o
-        WHERE o.org_id = g.org_id AND o.dispatched = 0
-          AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= NOW())
-          AND (o.claimed_until IS NULL OR o.claimed_until < NOW())
-        ORDER BY o.id
-        LIMIT %(batch_size)s
-        FOR UPDATE SKIP LOCKED
-    ) c
-), picked AS (
-    SELECT id, org_id
-    FROM (SELECT id, org_id,
-                 ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
-          FROM candidates) r
-    ORDER BY rn, id
-    LIMIT %(batch_size)s
-)
-UPDATE outbox o
-SET claimed_until = NOW() + make_interval(secs => %(lease)s)
-FROM picked p
-JOIN org g ON g.org_id = p.org_id
-WHERE o.id = p.id
-RETURNING o.id, o.transaction_id, o.event_type, o.payload, o.org_id, o.attempts,
-          o.claimed_until, g.downstream_url;
-```
-
-**Dispatch retry:** failures back off for 30 → 120 → 600 → 3,600 seconds; subsequent failures repeat the 3,600-second delay. There is no attempt limit and the worker never abandons an undelivered row. Backed-off rows are ineligible until their retry time, allowing other tenants' eligible rows into later batches.
-
-**Lease fencing:** `claimed_until` is also the worker's fencing token. A failure updates delivery state only if the row is still undelivered and its lease value still matches that worker's claim. A late success is recorded whenever the row is still undelivered, even if another worker has reclaimed it. An update that does not apply emits `lease_lost`. A stale failure cannot clear another worker's lease or overwrite a delivered row's retry state.
-
-**Delivery is at-least-once.** A crash after dispatch but before the finish commit leaves the row eligible for redelivery once its lease expires. A worker that outlives its lease can overlap with a worker that reclaims the row. The downstream receiver must deduplicate by `transaction_id`; ingest idempotency does not deduplicate downstream side effects.
-
-**Downstream format:** the worker forwards the stored event payload as generic JSON over HTTP POST to each tenant's `org.downstream_url`, falling back to `DOWNSTREAM_URL`. It sends `Content-Type: application/json`, `X-Event-Type`, `X-Transaction-Id`, and `X-Org-Id`. There is no PostHog adapter or PostHog integration in this repository.
-
-**Fail-fast on misconfiguration:** if `DOWNSTREAM_URL` is empty and `WORKER_LOG_ONLY` is not `"true"`, the worker exits at startup with a structured error. The alternative — marking rows `dispatched=1` without forwarding them — is undetectable data loss.
-
-**Database reconnect:** `psycopg2.OperationalError` triggers a reconnect loop with a delay starting at 5 seconds and doubling to a 60-second cap. This is separate from per-row dispatch backoff. `SIGTERM` sets a stop flag; the worker finishes the current batch before leaving the run loop.
-
----
-
-## Security Controls
-
-**Stripe HMAC-SHA256 Signature Verification** — Every inbound webhook is authenticated via `stripe.Webhook.construct_event()` using the endpoint's signing secret. Unsigned or tampered requests return HTTP 400 before touching the database. Verification stays on even when `STRIPE_WEBHOOK_SECRET` is left at its placeholder: an endpoint that accepts unsigned requests whenever it is misconfigured fails silently, which is worse than rejecting everything.
-
-**API Key Authentication** — `/ledger/summary`, `/dlq/entries`, `/dlq/{id}/retry` and `/metrics` require an `X-Api-Key` header validated against the `BILLING_API_KEY` environment variable. Missing or invalid keys return HTTP 401. An empty `BILLING_API_KEY` disables the check entirely for local development, and the application logs a warning at startup when that happens — a fail-open default is defensible, a silent one is not.
-
-**Row-Level Security** — Tenant isolation is enforced by PostgreSQL, not only by the queries. `ledger`, `outbox` and `dlq` carry default-deny policies with `USING` **and** `WITH CHECK`, so a query that forgets its `org_id` predicate returns nothing rather than everything, and an `INSERT` naming another tenant is refused by the database. The service connects as `billing_app` — `NOSUPERUSER NOBYPASSRLS`, DML on those three tables, `SELECT` on the org registry, and nothing else — while the owner credential stays with the migration step, which is the only thing that needs DDL.
-
-The role is the part that matters, and it is the part that is easy to get wrong. A first attempt shipped the policies alone: they applied cleanly, appeared in `pg_policies`, and enforced nothing, because the application connected as a superuser and a superuser bypasses RLS regardless of `ENABLE` or `FORCE`. The full test suite passed — which was the alarm, not the result, since default-deny should have broken half the system. So the process now says out loud, at every boot, which of the two worlds it is in:
+The suite truncates tables, so it refuses any database whose name does not end in `_test`
+or `_bench`. Create one next to the stack's database and apply the migrations first:
 
 ```bash
-docker compose logs billing | grep -E "rls_enforced|rls_inert"
-# rls_enforced  db_user=billing_app  superuser=false  policies=3
-```
-
-`rls_inert` is not a warning about a future risk; it is the statement that isolation has gone back to depending on every query remembering its own predicate. `.github/workflows/stack.yml` fails the build if either container reports it.
-
-**These are engineering controls, not a compliance program.** They address request authenticity and access to operational data. They are not an ISMS, there is no audit trail of who read operational data, no formal risk assessment, and no external audit. See [SECURITY.md](SECURITY.md) for what this project deliberately does not attempt.
-
----
-
-## Infrastructure Resilience
-
-**Connection Pooling** — `psycopg2.pool.ThreadedConnectionPool(minconn=maxconn=DB_POOL_SIZE)` (default 20) replaces the single module-level connection. `minconn` and `maxconn` are deliberately equal: psycopg2 returns a connection to the idle pool only while `len(pool) < minconn` and closes every other one on release, so `minconn=1` made the pool retain exactly one connection and reopen the rest per request — see *Performance Benchmarks* for what that measured. Each request leases a connection via `getconn()` and returns it in a `finally` block via `putconn()`. No connection exhaustion under concurrent load; no leaked connections on exception paths.
-
-**Async/Sync Thread Dispatch** — All database-hitting routes — `POST /webhook/stripe`, `/ledger/summary`, `/dlq/entries` — are declared `def`, not `async def`. FastAPI runs synchronous routes in an external thread pool, so psycopg2's blocking calls never stall the asyncio event loop. The webhook handler reads the raw body from `request._body` (cached by Starlette when it parses the request) for HMAC verification — no `await` needed.
-
-**Rate Limiting** — `slowapi` enforces 100 req/min on `POST /webhook/stripe`, 20 req/min on `/ledger/summary`, `/dlq/entries` and `/dlq/{id}/retry`, and 60 req/min on `/metrics` (a scraper hits it every 15s), keyed by client IP. A webhook flood without rate limiting exhausts `maxconn=20` and drives `outbox_pending` unbounded. The 429 response instructs Stripe to back off; Stripe's own retry logic handles redelivery.
-
-Behind Caddy the app runs with `--proxy-headers` and trusts `X-Forwarded-For` **only from Caddy's address**, set via `FORWARDED_ALLOW_IPS` and pinned to a static container IP. The limiter therefore keys on the real client rather than the proxy, without letting the client choose its own key.
-
-The obvious shortcut here is wrong and worth stating plainly. `--forwarded-allow-ips=*` sets `always_trust=True` in uvicorn's `ProxyHeadersMiddleware`, which returns `x_forwarded_for_hosts[0]` — the leftmost, entirely caller-supplied entry. Any client can then rotate the header to mint a fresh bucket every 100 requests, or forge a specific customer's IP to poison theirs. Pinning to Caddy's address makes uvicorn walk the header from the right and stop at the first untrusted hop, which is the real client, because Caddy appends rather than overwrites.
-
-One version-specific trap: uvicorn 0.30.6 compares this value as an **exact string**, not a CIDR range. `172.28.0.0/16` matches nothing, silently disabling `X-Forwarded-For` and collapsing the limiter into a single global bucket — the failure looks like a fix. Hence a literal address plus a fixed `ipv4_address` in `docker-compose.yml`.
-
-Verified end to end, not just traced: two containers with distinct addresses hit Caddy, one exhausted its bucket to 429 keyed on its own IP while the other still passed, and a forged header from an untrusted peer no longer reset the limit. `.github/workflows/stack.yml` asserts the bypass stays closed.
-
-**Log Rotation** — `RotatingFileHandler(maxBytes=10MB, backupCount=5)` caps log storage at 50 MB. At 500 TPS under DLQ write failures, each logging a full raw payload as JSON, an unbounded log file fills a typical root partition in under an hour. The 5-file backup retains enough history for forensics without infinite growth.
-
-**Resource Limits** — `deploy.resources.limits: memory: 256M, cpus: 0.50` on the billing container. Without a memory ceiling, an OOM in the billing container can terminate the Docker host process. The hard limit ensures OOM kills the container in isolation.
-
-**Secrets Management** — All credentials are read from `.env` via `${VAR}` substitution in `docker-compose.yml`. No credential appears in source code. `.env.example` is the committed template with safe development defaults; `.env` is gitignored. Rotating a secret requires editing one file and restarting the affected service.
-
-**HTTPS / TLS** — Caddy sits in front of FastAPI as a reverse proxy. Set `CADDY_DOMAIN` in `.env` to a real domain; Caddy requests a Let's Encrypt certificate automatically — no `certbot`, no cron renewal job, no manual certificate rotation. Security headers enforced at the proxy: `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Strict-Transport-Security: max-age=31536000`, server fingerprint removed.
-
----
-
-## 5-Layer Validation Stack
-
-Every Stripe webhook passes through all five layers before touching the database. Any failure routes to DLQ with every field of the event Stripe sent — re-serialized, so complete but not byte-for-byte.
-
-```
-Layer 1 — Pydantic type coercion
-  EventType enum                unknown type string → DLQ_INVALID (at model creation)
-  StripeObject.customer         min_length=4 → rejects empty strings and short placeholders
-  StripeObject.currency         pattern=r"^[a-z]{3}$" → rejects uppercase, 2-char, non-ISO codes
-  StripeObject.amount_paid      ge=0 → rejects negative amounts at the Field level
-
-Layer 2 — StripeEvent.check_amount_present (needs the event type)
-  invoice.*                     one of amount_paid / amount_due / amount must be non-null
-  customer.subscription.*       no amount is read — Stripe's Subscription object has none
-
-Layer 3 — StripeEvent @model_validator (cross-field)
-  resolve_idempotency_key       request.idempotency_key, else the event id — also when Stripe
-                                sends request: null or idempotency_key: null (automatic events:
-                                renewals, retries), which used to return 422 / 500
-  check_invoice_amount_nonzero  invoice.payment_failed + $0 → DLQ_INVALID (nothing was owed);
-                                a $0 invoice.paid (coupon, free item) posts at 0
-  check_customer_id_format      customer must start with 'cus_' (structural Stripe API rule)
-
-Layer 4 — Business logic
-  _STATUS_MAP[event_type]       POSTED / VOID / LIFECYCLE per event type (type-safe dict)
-  INSERT ... ON CONFLICT        DB-level idempotency guard — the serialization point
-
-Layer 5 — DLQ routing
-  ValidationError  → DLQ_INVALID    (raw payload preserved, reason code structured)
-  ON CONFLICT hit  → DLQ_DUPLICATE  (Stripe retry audit trail, payload preserved)
+docker compose up -d --wait postgres
+docker compose exec postgres createdb -U postgres billing_test
+pip install -r requirements.txt
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/billing_test alembic upgrade head
+python test_ledger.py
 ```
 
 ---
 
-## Performance Benchmarks
+## What it guarantees
 
-Every number below comes from `python benchmark.py`, which is in the repository. Run it
-yourself; do not quote these figures for your own hardware.
+Each guarantee names the mechanism and the section of `test_ledger.py` that checks it
+(see [docs/testing.md](docs/testing.md) for the full list).
 
-The benchmark TRUNCATEs the ledger before every mode, so like the test suite it refuses
-any database whose name does not end in `_test` or `_bench`. Its default is
-`billing_bench`; create and migrate it the same way as `billing_test` in the Quick Start.
-In `--url` mode, start the server on that same database, or the reset lands on one
-database and the load on another.
-
-```
-python benchmark.py --events 5000 --http-events 1500 --concurrency 16
-```
-
-Measured on Windows 10 · Docker Desktop · Python 3.13.7 · PostgreSQL 16 in a container:
-
-| Path | Events | Time | Throughput | Latency |
-|---|---|---|---|---|
-| Single-event (`process_stripe_event`) | 5,000 | 204.6s | **24 TPS** | — |
-| Batch (`process_stripe_event_batch`) | 5,000 | 1.21s | **4,143 TPS** | — |
-| HTTP end-to-end (`POST /webhook/stripe`) | 1,500 | 13.3s | **112 TPS** | p50 112ms · p95 194ms · p99 2,152ms |
-
-The p99 is not a typo and is not smoothed away. It reproduces on every run while p95 stays
-under 200ms, so a small number of requests take roughly twenty times the median. It is
-recorded rather than trimmed because an unexplained tail is a finding, not a blemish —
-naming it is what makes it someone's next piece of work.
-
-**These figures are lower than the ones this table carried before, and row-level security
-is not the reason.** The obvious suspicion, once the service started connecting as a
-non-superuser, was that the RLS predicates and the extra `SET LOCAL` per transaction had
-cost this. Measured rather than assumed, on the same machine minutes apart:
-
-| Path | RLS inert (owner) | RLS enforced (`billing_app`) |
+| Guarantee | Mechanism | Checked by |
 |---|---|---|
-| Single-event | 21 TPS | 24 TPS |
-| Batch | 3,335 TPS | 4,018 TPS |
+| An event is never counted twice, even when five requests carry it at the same moment | `INSERT ... ON CONFLICT (org_id, transaction_id) DO NOTHING`; the database serializes the race | Phase 5 (five threads, one event id, one ledger row); A9 |
+| The ledger and the delivery queue never disagree | Ledger row and outbox row written in one transaction | The "Outbox written atomically" check |
+| An event the database could not store is retried by Stripe, not acknowledged | `503` with `Retry-After` on pool exhaustion or a dead connection; `503` when a rejected event could not even be written to the DLQ | C6-6, C6-20 |
+| A rejected event is kept in full, and a repeated one leaves a single row | Raw payload stored in `dlq`; unique partial indexes allow one `DUPLICATE` and one `UNSUPPORTED` row per event | C6-5, C6-27, C6-28 |
+| A delivery is retried until it succeeds, and never dropped | Lease, per-row result commit, backoff of 30, 120, 600 then 3,600 s with no attempt limit | Phase 7, C6-12 |
+| A broken downstream cannot starve the others or fake a success | Per-tenant tasks on a bounded thread pool; a 15 s dispatch deadline; a redirect counts as a failure; rows are handed back on shutdown | C6-15, C6-16, C6-17, C6-22, C6-29 |
+| Tenants cannot read or write each other's rows, even through a bug | Row-level security enforced for the restricted `billing_app` role; the tenant comes from the API key, never from a header | A9 to A16 |
+| Hostile input is bounded | 1 MiB body cap (Caddy and the app), slow-client timeouts at Caddy, event ids limited to printable ASCII, failed authentications rate-limited before the database lookup, interactive API docs off outside dev | C6-14, C6-19, C6-21, C6-24, C6-25, C6-26 |
+| The service will not run on published demo credentials unless the run is declared local | Start-up refusal unless `BILLING_ENV=dev` and the ingress is on loopback | C6-3 |
 
-Enforced came out *faster*, which only means the difference is smaller than the run-to-run
-noise on this machine — three repeat runs spanned 2,863–3,788 TPS on the batch path alone.
-The honest conclusion is that tenant isolation costs nothing measurable here, and that the
-older figures came from a differently loaded machine rather than a faster codebase. They
-were replaced instead of explained away, because a number nobody can reproduce is a claim.
-
-### Why single-event is bounded by round trips, not CPU
-
-```
-Per event: BEGIN + SET LOCAL + INSERT ledger + INSERT outbox + COMMIT
-5,000 events × ~5 synchronous round trips ≈ 205 seconds → 24 TPS
-```
-
-The bottleneck is not CPU, not Pydantic, not the constraint check — it is the count of
-synchronous round trips to PostgreSQL, each ending in a WAL fsync.
-
-### Why batch is 169× faster
-
-```
-5,000 events → 13 round trips total:
-  1  BEGIN
-  1  SET LOCAL app.org_id          (the tenant scope, once per transaction)
-  5  bulk ledger INSERTs  (execute_values, page_size=1000, RETURNING transaction_id)
-  5  bulk outbox INSERTs  (execute_values, page_size=1000)
-  1  COMMIT
-= 1.21 seconds elapsed → 4,143 TPS
-```
-
-The scope costs one round trip for the whole batch and one per single event, which is why
-it is invisible in the batch figure and lost in the noise in the single-event one.
-
-`execute_values` collapses N INSERT statements into `ceil(N / page_size)` multi-row
-statements. PostgreSQL does the same total work; the application makes far fewer network
-calls. `page_size=1000` is chosen because 9 ledger columns × 1,000 rows = 9,000 bind
-parameters, safely within PostgreSQL's 65,535-parameter statement limit.
-
-### What writing this benchmark found
-
-The HTTP figure did not exist before, and producing it exposed a defect the other two
-numbers could never have shown. Throughput **collapsed** as clients were added — 23 TPS
-at one client, 15 at two, then **1 TPS at four, with p50 latency of 4.2 seconds**.
-
-The cause was the connection pool. psycopg2 returns a connection to the idle pool only
-while `len(self._pool) < self.minconn`; every other release calls `conn.close()`. With
-`minconn=1, maxconn=20` the pool retained exactly one connection, so under concurrency
-each request opened a fresh PostgreSQL connection and closed it on release — and
-`_connect()` runs inside `getconn` while the pool lock is held, which serialized every
-caller. Setting `minconn == maxconn` fixed it:
-
-| Concurrency | Before | After |
-|---|---|---|
-| 1 | 23 TPS | 15 TPS |
-| 2 | 15 TPS | 22 TPS |
-| 4 | 1 TPS | **61 TPS** |
-| 8 | 1 TPS | **106 TPS** |
-| 16 | did not finish | **143 TPS** |
-
-That table is the record of one fix on the day it was made, kept because the *shape* is
-the point — flat-to-collapsing versus scaling with clients. The absolute numbers are not
-current: the same machine now measures 112 TPS at 16 concurrent. Re-run `benchmark.py`
-for figures to rely on rather than reading either column as today's performance.
-
-Two diagnoses were wrong before that one was right. First suspect was the rate limiter's
-in-memory storage, which does an O(n) list prepend under a lock — disproved by re-running
-against a limiter with empty state and getting identical numbers. Second was Windows TCP,
-since latency snapped to 4.2s and 8.4s, the SYN retransmission timers — disproved by
-switching the benchmark client to connection reuse and getting identical numbers. What
-settled it was the service's own `duration_ms` middleware reporting 4,200ms against a
-client-side 4,224ms, which placed the time inside the process.
-
-The lesson is the ordinary one: a benchmark measures the whole system including the thing
-doing the measuring, and the first plausible explanation is usually not the true one.
-
-The 500 TPS floor is a hard test assertion in `test_ledger.py` — not a metric, a test.
+**Delivery is at least once, not exactly once.** A worker that crashes after delivering
+but before recording the result will deliver that event again once its lease expires.
+Every delivery carries `X-Transaction-Id`, so the receiver can discard repeats.
 
 ---
 
-## Schema
+## How it was tested
 
-```sql
--- Financial record. The composite primary key is the per-tenant idempotency guard.
--- ON CONFLICT (org_id, transaction_id) DO NOTHING skips a duplicate within its tenant.
--- BIGINT: covers amounts up to ~$92 quadrillion (INTEGER max is only ~$21M).
--- CHECK (length(payload) < 50000): prevents unbounded growth from malicious payloads.
--- Tenant registry (migration 0004). The API key is stored only as a SHA-256, so a
--- database dump does not hand over working credentials. The Stripe signing secret
--- cannot be hashed — verifying an HMAC needs the value — so in production it belongs
--- in a secret manager with this column holding a reference.
-CREATE TABLE org (
-    org_id                TEXT        PRIMARY KEY,
-    name                  TEXT        NOT NULL,
-    api_key_sha256        TEXT        UNIQUE,
-    stripe_webhook_secret TEXT        NOT NULL,
-    active                BOOLEAN     NOT NULL DEFAULT TRUE,
-    downstream_url        TEXT,       -- migration 0005; NULL falls back to DOWNSTREAM_URL
-    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+**The suite.** `test_ledger.py` is a single script that prints one line per check and
+exits non-zero on a failure: 612 checks against a live PostgreSQL 16. The guarantees above
+are behaviour of the database (a unique key serializing concurrent inserts, policies
+applying to a restricted role, row locks skipping claimed rows), so the suite runs
+against one rather than a mock. CI runs it on Python 3.12 and 3.13, runs ruff and bandit,
+and builds and attacks the real Compose stack (`.github/workflows/`).
 
--- PRIMARY KEY is (org_id, transaction_id), NOT transaction_id alone.
---   transaction_id IS the idempotency guard, and Stripe event ids are unique per
---   ACCOUNT rather than globally. With a single-column key, one tenant's event would
---   hit ON CONFLICT against another tenant's and be discarded as a duplicate —
---   silent revenue loss, indistinguishable from the guard working correctly.
---   The composite key makes the guard per-tenant, which is what it always meant.
-CREATE TABLE ledger (
-    org_id          TEXT        NOT NULL DEFAULT 'default' REFERENCES org(org_id),
-    transaction_id  TEXT        NOT NULL,
-    event_type      TEXT        NOT NULL,
-    customer_id     TEXT        NOT NULL,
-    amount_cents    BIGINT,                 -- NULL exactly for customer.subscription.*
-    currency        TEXT        NOT NULL DEFAULT 'usd',
-    status          TEXT        NOT NULL,   -- POSTED | VOID | LIFECYCLE (PENDING: pre-Cycle-6 rows)
-    idempotency_key TEXT        NOT NULL,
-    payload         TEXT        NOT NULL CHECK (length(payload) < 50000),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT ledger_amount_matches_kind   -- migration 0007, NOT VALID: new rows only
-        CHECK ((amount_cents IS NULL) = (event_type LIKE 'customer.subscription.%')),
-    PRIMARY KEY (org_id, transaction_id)
-);
+**Mutation testing.** Reverting a fix and watching its test fail is how you know the test
+tests something. For the later fixes that was done by hand; there is no automated mutation
+run in the repository. Details are in [docs/testing.md](docs/testing.md).
 
--- Written in the same BEGIN...COMMIT as the ledger row.
--- (org_id, transaction_id) REFERENCES ledger ON DELETE CASCADE:
---   enforces Transactional Outbox invariant at DB level — an outbox row
---   cannot exist without its corresponding ledger row.
---   Application logic alone is not sufficient; the FK constraint is the guarantee.
--- dispatched=0 = pending downstream delivery.
--- Claim commits before HTTP; each delivery result commits in a separate transaction.
-CREATE TABLE outbox (
-    id             BIGSERIAL   PRIMARY KEY,
-    org_id         TEXT        NOT NULL DEFAULT 'default',
-    transaction_id TEXT        NOT NULL,
-    event_type     TEXT        NOT NULL,
-    payload        TEXT        NOT NULL,
-    dispatched     INTEGER     NOT NULL DEFAULT 0,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    dispatched_at  TIMESTAMPTZ,
-    -- Delivery state (migration 0008)
-    attempts       INTEGER     NOT NULL DEFAULT 0,
-    next_attempt_at TIMESTAMPTZ,
-    claimed_until  TIMESTAMPTZ,
-    last_error     TEXT,
-    -- Composite, following the ledger key above.
-    FOREIGN KEY (org_id, transaction_id)
-        REFERENCES ledger(org_id, transaction_id) ON DELETE CASCADE
-);
+### Failure testing
 
--- Every rejection lands here. raw_payload is never corrected, never truncated.
--- Humans review DLQ entries. The system never assumes a DLQ entry is unimportant.
-CREATE TABLE dlq (
-    id             BIGSERIAL   PRIMARY KEY,
-    org_id         TEXT        NOT NULL DEFAULT 'default',
-    transaction_id TEXT        NOT NULL,
-    reason         TEXT        NOT NULL,   -- DUPLICATE | INVALID | TRANSIENT | UNKNOWN_TYPE
-    raw_payload    TEXT        NOT NULL,
-    received_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- Retry budget (migration 0002)
-    status         TEXT        NOT NULL DEFAULT 'pending',  -- pending | retrying | resolved | exhausted
-    retry_count    INTEGER     NOT NULL DEFAULT 0,
-    max_retries    INTEGER     NOT NULL DEFAULT 3,
-    next_retry_at  TIMESTAMPTZ,
-    -- Claim timestamp (migration 0003). retry_dlq_batch commits its claim before
-    -- doing the work, so without this a crash mid-batch left rows in 'retrying'
-    -- that no later batch would ever select again. NULL counts as infinitely
-    -- stale, which recovers rows stranded before this column existed.
-    claimed_at     TIMESTAMPTZ
-);
+The unit-level suite proves each mechanism; the harness in [`e2e/`](e2e/README.md) checks
+that they hold together. It runs the full stack with a real downstream receiver, then
+loads, interrupts and attacks it from outside. Three things it found, measured on a local
+Compose run before they were fixed:
 
--- Indexes for hot query paths
--- org_id leads every composite index: each query is scoped to one tenant, and an
--- index that does not lead with the predicate's first column cannot serve it.
-CREATE INDEX IF NOT EXISTS idx_ledger_org_customer ON ledger(org_id, customer_id);
-CREATE INDEX IF NOT EXISTS idx_outbox_org_dispatched ON outbox(org_id, dispatched, id) WHERE dispatched=0;
-CREATE INDEX IF NOT EXISTS idx_outbox_pending_by_org ON outbox(org_id, id) WHERE dispatched=0;
-CREATE INDEX IF NOT EXISTS idx_dlq_org_retry ON dlq(org_id, status, next_retry_at) WHERE status='pending';
-CREATE INDEX IF NOT EXISTS idx_dlq_stale_claim ON dlq(status, claimed_at) WHERE status='retrying';
-CREATE INDEX IF NOT EXISTS idx_org_api_key ON org(api_key_sha256) WHERE api_key_sha256 IS NOT NULL AND active;
-```
+- One unsigned 100 MB request killed the API container for lack of memory.
+- A downstream that answered `302` made the worker mark events delivered that never
+  arrived.
+- With 64 concurrent clients, 4,526 of 20,000 requests were answered `500` or `502`.
 
-| Status | Event types | Meaning |
-|---|---|---|
-| `POSTED` | `invoice.paid` | Stripe considers the invoice paid; recorded at the first non-null field in `amount_paid` → `amount` → `amount_due` |
-| `VOID` | `invoice.payment_failed` | Payment failed, recorded at `amount_due` |
-| `LIFECYCLE` | `customer.subscription.created` · `.updated` · `.deleted` | Account state changed; no money moved. `amount_cents` is NULL, and the row is forwarded downstream like any other |
-| `PENDING` | none since Cycle 6 | Was `customer.subscription.updated`; kept so rows written before stay valid |
+After the fixes, from the last full run (one machine, 12 cores, 14 GB RAM, default
+Compose limits, API container capped at 0.5 CPU and 256 MB):
 
-**Domain decision 5e — settled:** `POSTED` means Stripe considers the invoice paid,
-including payment made outside Stripe. Classification follows `invoice.paid`; the code
-does not check how the invoice was paid.
-
-**Domain decision 5f — settled:** a $0 `invoice.paid` is recorded as `POSTED` with
-`amount_cents=0`. An invoice with no non-null amount field routes to the DLQ as
-`DLQ_INVALID`; a $0 `invoice.payment_failed` is still rejected as `DLQ_INVALID`.
-
-**Subscription events carry no amount, on purpose.** Stripe's Subscription object has no
-top-level amount field — prices live in `items.data[].price` — and the ledger used to
-demand one from every event, so every real `customer.subscription.*` event was
-dead-lettered as `INVALID` and counted in `dlq_depth`. The ledger reads billing amounts
-from invoice events and ignores amount fields on subscription events. A subscription row
-records that an account changed state, which is what downstream systems act on. The database enforces the split
-(`ledger_amount_matches_kind`), and `SUM(amount_cents)` skips the NULLs.
-
-Upgrading a deployment that ran before this change: its DLQ holds those subscription
-events as `INVALID` entries. Replay them with `POST /dlq/{id}/retry`; each settles as
-`LIFECYCLE` on the first attempt.
-
----
-
-## API Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/webhook/stripe` | Ingest for the default tenant. 200 for valid JSON, including duplicates and invalid events once they are in the DLQ; 503 on DB failure, and for an invalid event whose DLQ row could not be written (correct Stripe retry protocol). |
-| `POST` | `/webhook/stripe/{org_id}` | Per-tenant ingest. Signature verified with that tenant's secret, so the path cannot be used to write into another tenant. Unknown org returns the same 400 as a bad signature — no enumeration. |
-| `GET` | `/health` | Liveness check |
-| `GET` | `/ledger/summary` | Row counts by status, DLQ depth, outbox pending count |
-| `GET` | `/dlq/entries` | Inspect the caller's DLQ, newest ID first; filter by `status`, page with `before_id`, and set `limit` (default 50, effective range 1–1,000). |
-| `POST` | `/dlq/{id}/retry` | Replay one entry. `409` if already `resolved` — the ledger holds it, so there is nothing to replay. `exhausted` stays replayable. |
-| `GET` | `/metrics` | Prometheus exposition, operator only: `BILLING_API_KEY` → 200, a tenant key → 403. |
-
-`GET /dlq/entries` query parameters:
-
-| Parameter | Behavior |
+| Scenario | Result |
 |---|---|
-| `status` | Omit for all statuses, or select `pending`, `retrying`, `resolved`, `exhausted`, or `actionable`. `actionable` includes pending, retrying and exhausted entries. Any other value returns 422. |
-| `before_id` | Keyset cursor: return entries with `id < before_id`, ordered by descending ID. Pass the response's `next_before_id` for the next page. No entry appears twice; an entry whose insert commits after the walk has passed its ID shows up on the next walk from the top. |
-| `limit` | Default 50; values below 1 return 422; values above 1,000 are capped at 1,000. |
+| 20,000 signed webhooks, 64 concurrent clients | all `200`; each in the ledger exactly once; no duplicate deliveries |
+| 10,000 signed webhooks, 200 concurrent clients | all `200`; p99 under 2 s |
+| PostgreSQL killed for 6 s under load | only `503` during the outage; no acknowledged event lost |
+| Unsigned 100 to 300 MB bodies, direct and through Caddy | `413` or a cut upload; no restart; memory flat |
+| Slow-header client through Caddy | connection closed after about 10 s |
 
-The response contains `entries`, `count`, and `next_before_id`. A full page returns its
-last entry's ID as the cursor; a short or empty page returns null. Each entry includes
-`status`, `retry_count`, `max_retries`, `next_retry_at`, and `claimed_at`, alongside its
-ID, transaction ID, reason, raw payload and received timestamp. Use `status=pending`
-to find old pending entries even when newer resolved entries fill the unfiltered page.
+No acknowledged event was lost or delivered twice in any run. The numbers depend on the
+machine; the properties are what the run checks. `benchmark.py` measures throughput on
+your own hardware, so this repository publishes no throughput figure.
 
 ---
 
-## Observability
+## Operating it
 
-**Structured logs.** `LOG_FORMAT=json` (the default in containers) emits one JSON object per line. Anything passed through `extra={...}` becomes a top-level field, so `transaction_id`, `outcome`, `duration_ms`, `path` and `status` are queryable directly:
+| Method | Path | Auth | What it does |
+|---|---|---|---|
+| `POST` | `/webhook/stripe/{org_id}` | Stripe signature | Ingest for one tenant, verified with that tenant's signing secret. An unknown tenant returns the same `400` as a bad signature. |
+| `POST` | `/webhook/stripe` | Stripe signature | Ingest for the `default` tenant. |
+| `GET` | `/ledger/summary` | API key | Ledger counts by status, DLQ depth, outbox backlog, for the caller's tenant. |
+| `GET` | `/dlq/entries` | API key | Dead-lettered events, newest first. Filter with `status` (`pending`, `retrying`, `resolved`, `exhausted`, `actionable`), page with `before_id`, `limit` 1 to 1,000. |
+| `POST` | `/dlq/{id}/retry` | API key | Replay one entry. `409` if it is already `resolved`. |
+| `GET` | `/metrics` | operator key | Prometheus metrics for all tenants. A tenant key gets `403`. |
+| `GET` | `/health` | none | Liveness. It does not check the database. |
+| `GET` | `/docs`, `/redoc`, `/openapi.json` | none | Only when `BILLING_ENV=dev` and the ingress is on loopback; otherwise `404`. |
 
-```json
-{"ts":"2026-08-09T18:07:47+00:00","level":"INFO","logger":"ledger","message":"request POST /webhook/stripe -> 200",
- "event":"http_request","method":"POST","path":"/webhook/stripe","status":200,"duration_ms":12.6,"client_ip":"203.0.113.9"}
-```
+Webhook responses: `200` for any event that was handled, including rejected ones;
+`400` for a bad signature or unknown tenant; `413` over 1 MiB; `422` for a malformed
+envelope; `429` over the rate limit; `503` when the database cannot take the event.
 
-Plain text is unparseable at the moment you most need it: *"which `transaction_id` failed, how often, and how slow was it"* becomes a regex against a human sentence, and that regex breaks the next time someone rewords a log line. Consumers here read keys, not prose. Records are always one line — log shippers split on newlines, so a multi-line record arrives as several unparseable fragments — and tracebacks are folded into a single string field for the same reason. `worker.py` reuses the same formatter: two services logging the same event in two shapes cannot be correlated on `transaction_id`, which is exactly the field you want when tracing an event from ingest through to dispatch.
+**Outcomes** in the `200` body: `POSTED` (invoice paid), `VOID` (payment failed, recorded
+at `amount_due`), `LIFECYCLE` (subscription created, updated or deleted, stored with no
+amount), `DLQ_INVALID`, `DLQ_DUPLICATE`, and `UNSUPPORTED` (a well-formed Stripe event of a
+type the ledger does not record: stored as a `resolved` DLQ row, not counted in
+`dlq_depth`, pruned with the duplicates).
 
-**Metrics.** `GET /metrics` exposes `webhook_events_total{outcome}`, `http_requests_total{method,path,status}`, `http_request_duration_seconds{method,path}`, plus `dlq_depth`, `dlq_total` and `outbox_pending`.
-
-`dlq_depth` counts only rows still needing action — `pending`, `retrying`, `exhausted`. `dlq_total` counts every row ever written. They are separate because they answer different questions and one was previously doing both jobs badly: a single number counting all rows grew monotonically with historical traffic and never came back down, since `prune_dlq` only ages out `DUPLICATE` rows. A resolved `INVALID` entry inflated "queue depth" forever. An alert set on a figure that only rises is an alert that eventually gets muted.
-
-Labels use the route **template** (`/dlq/{dlq_id}/retry`), never the resolved path. Labelling by resolved path gives every id its own time series — the standard way to take down a Prometheus server with your own instrumentation.
-
-The two queue gauges are read from the database on each scrape rather than tracked in memory. The worker drains the outbox and prunes the DLQ from a different process, so an in-memory count would diverge from the tables it claims to describe, and a queue depth that is confidently wrong is worse than no queue depth at all.
-
-**Secret provenance.** The startup log emits a `secrets_loaded` event and `/metrics` exposes `billing_secrets_info`, each carrying a SHA-256 prefix of the live secrets and where they came from (`env` or `file`). This exists because the failure it catches is otherwise silent: **`docker compose restart` does not re-read `.env`** — it restarts the existing container with its original environment, so a rotated secret is not live until `docker compose up -d` recreates the container. Without a fingerprint, an operator who edits `.env` and restarts gets no error, no log and no metric telling them the old credential is still in use.
-
-Secrets can also be supplied as files via `BILLING_API_KEY_FILE` and `STRIPE_WEBHOOK_SECRET_FILE` — the Docker/Kubernetes convention, and the only way to rotate without replacing the container, since a container's environment is immutable for its lifetime while a mounted file is not. A configured but unreadable `*_FILE` stops the service rather than falling back to the environment variable.
-
-Publishing a hash is safe for a high-entropy secret and not for a guessable one; see [SECURITY.md](SECURITY.md).
-
-`/metrics` is the operator's endpoint when authentication is configured: it accepts `BILLING_API_KEY`. Its counters are summed over every tenant and `billing_secrets_info` fingerprints the operator's own secrets, so a tenant key gets `403`, no key or an unknown one `401`. The queue gauges cover every tenant; a tenant's own figures are `/ledger/summary`. With tenants holding keys and `BILLING_API_KEY` empty, set an operator key to enable scrapes. When no key is configured anywhere, the endpoint remains open in development mode.
-
-The header is `X-Api-Key`, which Prometheus's `authorization:` block cannot send (it sends `Authorization: <type> <credentials>`, so the example this section used to show got `401` on every scrape). Use `http_headers` — check that your Prometheus version's configuration reference lists it:
+**Metrics.** `webhook_events_total{outcome}`, `http_requests_total`,
+`http_request_duration_seconds` (labelled by route template, not by resolved path),
+`dlq_depth` (rows needing action), `dlq_total`, `outbox_pending` and
+`billing_secrets_info` (a hash prefix of the live secrets, to confirm a rotation took
+effect). The queue gauges are read from the database on each scrape. Prometheus is not
+part of the Compose stack. To scrape with the operator key, send it as a header:
 
 ```yaml
 scrape_configs:
@@ -619,144 +234,134 @@ scrape_configs:
         files: [/etc/prom/billing.key]
 ```
 
----
+**Logs.** `LOG_FORMAT=json` (the Compose default) writes one JSON object per line from
+both the API and the worker. At start-up the API logs whether row-level security is in
+force:
 
-**DLQ Operationalization** — `GET /dlq/entries` is the ops interface for triage. Every rejected event lands in the DLQ with its `raw_payload` holding every field Stripe sent — never corrected, never truncated (re-serialized, so not byte-for-byte). If that DLQ write itself fails, the webhook answers 503 instead of 200, so Stripe redelivers an event nothing has recorded yet. In fintech, a rejected payment event without a recoverable audit trail is a compliance gap, not a logging inconvenience. An operator retrieves entries, inspects the reason code, fixes the upstream issue, and replays the original payload.
-
----
-
-## Test Coverage
-
-```
-486 passed / 0 failed · python test_ledger.py · 2026-11-09 · PostgreSQL 16
-
-Phase 1    Entry boundary — Pydantic type, Field, enum; currency / customer / amount rules
-Phase 2    Output models  — DLQEntry, LedgerEntry construction + to_db() serialization
-Phase 3    Cross-field    — failed invoice amount > 0; paid invoice can be 0; customer ID 'cus_'
-Phase 5    Full stack     — HTTP 200/400/422/503, HMAC signature, 5-thread concurrent
-                            idempotency, batch duplicate partition, BIGINT, outbox, DLQ
-Phase 7    Outbox worker  — drain_batch dispatch + dispatched_at, SKIP LOCKED, idempotent re-drain
-Phase 10   Migrations     — alembic upgrade/downgrade round-trip, schema parity with _bootstrap()
-Phase 11   DLQ retry      — TRANSIENT backoff, exhaustion, manual POST /dlq/{id}/retry
-Phase 12   Observability  — JSON formatter (field promotion, one line, traceback folding,
-                            unserializable degradation), /metrics shape, outcome labels,
-                            route-template cardinality, gauge-vs-table agreement, auth
-A12 / A13  Tenant delivery — a DLQ replay lands in the owning tenant (entry resolved AND
-                            that tenant's ledger holding the row); each tenant's events reach
-                            only its own endpoint; a quiet tenant is not starved by a noisy one
-A11        Per-tenant ingest — signature proves the tenant; one tenant's secret cannot
-                            post into another's path; unknown org is byte-identical to a
-                            bad signature; same event id ingests for both tenants
-A9 / A10   Tenancy       — same event id from two tenants both post and keep their own
-                            amounts; replay within a tenant is still a duplicate; a tenant
-                            cannot read or retry another's rows; X-Org-Id cannot override
-                            the credential
-A6 / A7    Ops surface   — secret *_FILE sources, fingerprints, unreadable-file refusal;
-                            the pool hands back the same connection instead of reopening
-A8         Config        — rate-limit defaults pinned so "configurable" stays unchanged
-A4 / A5    Terminal state — 'resolved' survives _increment_retry; dlq_depth counts backlog,
-                            dlq_total counts history; both gauges agree with /ledger/summary
-A15 / A16  Row-level security — connected as the RESTRICTED role, because running these
-                            as the owner would prove nothing: unset scope sees zero rows,
-                            a query that FORGETS its org_id predicate still cannot cross
-                            tenants, a cross-tenant INSERT is refused by WITH CHECK. A16
-                            then drives the real endpoints, core functions and worker
-                            drain over that connection — every application query site
-                            has to carry a scope for any of it to answer at all
-A17        Deploy-time rows — a rotated STRIPE_WEBHOOK_SECRET still reaches the default
-                            tenant's registry row, other tenants stay untouched, and the
-                            role that serves traffic cannot rewrite the registry
-A18        /metrics is operator-only — tenant keys get 403 and no exposition, the
-                            operator sees every tenant's backlog. Drives the real
-                            connection pool rather than the test double, so the pool the
-                            application actually builds is covered at all
-A0         Amount extract — per-event-type field priority; unknown amount → DLQ, never $0
-A1 / A2    DLQ integrity  — retry appends no rows; 'resolved' terminal (409); 'exhausted' replayable
-A3         Claim recovery — stale claim reclaimed, live claim not stolen, batch not aborted
-M1 / M5    Ops boundary   — X-Api-Key auth (401 missing/wrong, 200 correct), prune_dlq retention
-C6-1       Disposable DB  — suite and benchmark refuse any database not named *_test / *_bench
-                            (exit 2, before connecting; dbname= overrides and key=value DSNs too)
-C6-2       Automatic events — request: null and idempotency_key: null → stored, keyed by event id
-C6-3       Demo credentials — refused at startup unless BILLING_ENV=dev AND a loopback ingress
-C6-4       Subscriptions  — Stripe's documented objects (fixtures/stripe/) ledgered as LIFECYCLE
-                            with no amount; DB constraint; pre-fix DLQ entries settle on replay
-C6-5       Full payload   — ledger, outbox and DLQ hold every field Stripe sent
-C6-6       DLQ outage     — invalid event whose DLQ write fails → 503 (PostgreSQL lock + timeout)
-C6-7       Two workers    — a second replica drains while the first holds its batch
-C6-8       Refused rows   — an event the database refuses (> 50 000 chars) → DLQ, not 500
-C6-9       RLS truth      — superuser / BYPASSRLS / a table without RLS all read as inert;
-                            provision.py rotates billing_app from APP_DATABASE_URL
-C6-10      Zero invoices  — signed $0 invoice.paid → POSTED at 0 with no DLQ entry;
-                            $0 invoice.payment_failed → DLQ_INVALID
-C6-11      DLQ queries    — status filters, actionable set, unknown status → 422, retry fields;
-                            cursor walks all 1,203 entries once in descending ID order
-C6-12      Outbox leases  — idle DB session during dispatch, per-row finish, failed-row backoff;
-                            quiet tenant served despite an older failing backlog;
-                            live lease skipped, expired lease reclaimed;
-                            stale failure preserves a replacement lease, late success records delivery,
-                            late failure leaves a delivered row's retry state untouched
+```bash
+docker compose logs billing | grep -E "rls_enforced|rls_inert"
 ```
 
-**Mutation-verified.** A passing suite proves nothing until you watch it fail. Seventeen deliberate breaks — dropping `extra=` promotion, removing currency normalization, reverting amount extraction, unauthenticating `/metrics`, labelling by resolved path, ignoring `from_retry`, removing the stale-claim reclaim, removing the 409, removing the guarded recovery, dropping the `status <> 'resolved'` guard, letting `dlq_depth` count resolved rows again, reverting the pool to `minconn=1`, quietly changing a rate-limit default, making each `_tx` accept its tenant scope and silently never apply it, dropping the `/metrics` render lock, and dropping the pool's `autocommit` — each turned the suite red. The guarded-recovery mutant reproduced the original defect exactly: two rows stranded in `retrying` because one row's failure aborted the batch. The two scope mutants reproduced the state row-level security shipped in before it was in force: policies present, nothing enforced — the API's raised `new row violates row-level security policy`, the worker's silently drained zero rows.
+**Adding a tenant.** There is no admin API; a tenant is a row in `org`. The `INSERT` is
+in `.env.example`. Restart the API afterwards: whether any tenant holds a key is read once
+at start-up.
 
-Writing a mutation test is itself easy to get wrong in a way that looks like success. The first `/metrics` reproduction keyed its interleaving on a thread name, and FastAPI dispatches synchronous handlers to an anyio worker thread — so the instrumentation never fired, the leak never reproduced, and the run reported "no leak observed". A18 asserted that the interleave actually happened, because a concurrency test that silently stops being concurrent is worse than no test. Cycle 6 retired that check with the property it guarded: `/metrics` became operator-only, so no tenant reads those gauges any more.
-
-Cycle 6 added fourteen more — every fix except the `/metrics` model change, which the rewritten A18 covers — and each reproduced the defect it guards against rather than failing somewhere else: the suite's guard skipped (exit 1 instead of 2), `request: dict` restored (422 back), the idempotency `.get` default restored (500 back), dev mode forced on (six refusal checks), five ways of undoing the subscription change — one of them caught by the database constraint alone — the four-field payload restored, a DLQ write result ignored (200 back), the candidate-step lock removed (second worker "got 0" back), the refused-row handler removed (500 back), and the BYPASSRLS check removed (`"enforced": true` for a role that bypasses every policy). A later lease mutant removed the fencing guard from the worker's failure update: the stale-worker checks failed with the reproduced state — the reclaiming worker's lease cleared, and `attempts=2` with a `last_error` on a delivered row.
-
-**Database coverage and test doubles:** idempotency tests execute real inserts; RLS tests connect as the restricted role; worker concurrency tests use separate PostgreSQL connections. Many HTTP sections use `_MockPool` to inject one controlled real connection. Phase 5 application checks and some retry/metrics checks patch Stripe signature verification to isolate routing and response behavior; separate signed-request checks exercise verification. Phase 4 injects a `process_stripe_event` failure to check the HTTP 503 response. Tenant delivery checks (A13), worker concurrency (C6-7), and lease/backoff checks (C6-12) replace dispatch to capture destinations, control interleaving, or simulate downstream failure without an external HTTP service. Model and formatter checks also run in memory.
-
-**Why concurrency needs PostgreSQL:** the idempotency guarantee depends on PostgreSQL's constraint engine serializing concurrent inserts at the thread-connection boundary. A test double cannot establish `ON CONFLICT DO NOTHING` behavior. The test releases five threads through a barrier, each with its own database connection, to insert the same `event_id`; a separate connection verifies that exactly one ledger row exists.
-
-CI runs the suite on Python 3.12 and 3.13 with PostgreSQL 16.
-
-**Test isolation:** database sections use `fresh_conn()`, which issues `TRUNCATE TABLE outbox, dlq, ledger RESTART IDENTITY` and removes non-default tenants. This resets table data and sequences before the section builds its fixtures.
-
-**Concurrent idempotency test:**
-```python
-# 5 threads fire the same event_id simultaneously
-threads = [threading.Thread(target=_fire) for _ in range(5)]
-for t in threads: t.start()
-for t in threads: t.join()
-
-assert results.count("POSTED") == 1        # exactly one INSERT won the constraint race
-assert results.count("DLQ_DUPLICATE") == 4  # all others: ON CONFLICT hit
-assert ledger_row_count == 1               # verified by a separate connection
-```
+**Data model.** Four tables, created by the migrations in `alembic/versions/`:
+`org` (tenant registry: API key hash, Stripe signing secret, downstream URL), `ledger`
+(one row per recorded event; amounts in cents as `BIGINT`), `outbox` (delivery state per
+event: attempts, next attempt, lease, last error) and `dlq`. The migrations are the source
+of truth for the schema.
 
 ---
 
-## Production Gap Checklist
+## Configuration
 
-| Gap | Priority | Status | Fix |
+Every environment variable the services read. "Compose" says whether
+`docker-compose.yml` passes it through; the others take effect if you add them to the
+service's `environment:` block.
+
+| Variable | Default | Purpose | Compose |
 |---|---|---|---|
-| Runtime ingress (Caddy) | **CRITICAL** | Done | `CADDY_DOMAIN` never reached the Caddy container, so `{$CADDY_DOMAIN}` expanded to nothing, the site block degenerated into a global options block, and Caddy crash-looped on every `up` — HTTPS ingress had never worked. Fixed, plus an admin-API healthcheck so nothing gates on a container that silently never started. |
-| `X-Forwarded-For` trust | **HIGH** | Done | Was `--forwarded-allow-ips "*"`, letting any caller pick its own rate-limit bucket. Now pinned to Caddy's static address. See *Rate Limiting* above. |
-| Container healthcheck | **HIGH** | Done | Probed bare `localhost`, which musl resolves to `::1` while uvicorn binds IPv4 only — a healthy service reported `unhealthy` on every start. Now probes `127.0.0.1`. |
-| DLQ self-amplification | **HIGH** | Done | Retrying an entry whose event already reached the ledger appended a *new* DLQ row while resolving the old one, so the queue grew by one row per retry and `dlq_depth` became inflatable by retry activity. A replay now never creates DLQ rows, and `resolved` is terminal — 409 at the endpoint and a `status <> 'resolved'` guard on the one UPDATE that wrote status without checking it. |
-| Stranded retry claims | **HIGH** | Done | `retry_dlq_batch` commits its claim before doing the work; a failure in the recovery path left rows in `retrying` that the claim query never selected again. Migration 0003 adds `claimed_at`; stale claims are reclaimed automatically. |
-| Outbox worker | **HIGH** | Done | Standalone Docker service — short claim transaction with `SELECT FOR UPDATE SKIP LOCKED` and a lease, HTTP outside transactions, per-row finish with lease fencing, per-tenant round-robin selection, and dispatch backoff with no attempt limit. Migration 0008 adds the delivery state and per-tenant pending index. Delivery is at-least-once; receivers deduplicate by `transaction_id`. |
-| DLQ retry budget | **HIGH** | Done | `retry_count`/`max_retries`/`next_retry_at` columns, exponential backoff, `POST /dlq/{id}/retry`, and a worker retry loop are implemented. Only `TRANSIENT` entries auto-retry; nothing in the live ingest path classifies an event as `TRANSIENT` yet (single-event DB failures return 503 so Stripe retries). The mechanism is provisioned for a future non-Stripe / async source with no upstream retrier. |
-| DLQ retention | **MEDIUM** | Done | `prune_dlq()` deletes `DUPLICATE` rows older than 90 days; the worker runs it at most once per hour. Without retention, Stripe's at-least-once redelivery grows the `dlq` table without bound. |
-| Schema migrations | **HIGH** | Done | Alembic migrations in `alembic/versions/` manage the production schema; the `migrate` service runs `alembic upgrade head`, then `provision.py`, before the API starts. CI applies the migrations too — `_bootstrap()` mirrors the tables with `IF NOT EXISTS` guards but creates neither the RLS policies nor the `billing_app` role, so a suite running without alembic could not have tested either. The API no longer calls `_bootstrap()` when it runs as the restricted role: it has no DDL rights, and shipping owner credentials to the container that serves traffic would undo the point of the role. |
-| Per-event-type amount extraction | **MEDIUM** | Done | A failed invoice carries `amount_paid=0` with the real figure in `amount_due`, so reading `amount_paid` for every type dead-lettered every `invoice.payment_failed` — the events dunning runs on. `_AMOUNT_FIELDS_BY_TYPE` now maps each type to its field priority. An event with no amount field at all still routes to the DLQ: an unknown amount recorded as $0 reconciles cleanly and is therefore invisible. |
-| Structured JSON logging | **MEDIUM** | Done | `LOG_FORMAT=json` emits one JSON object per line; `transaction_id`, `outcome`, `duration_ms`, `path` and `status` are top-level fields. API and worker share the formatter so an event can be correlated from ingest to dispatch. |
-| Prometheus `/metrics` | **MEDIUM** | Done | `webhook_events_total{outcome}`, `http_requests_total`, `http_request_duration_seconds`, `dlq_depth` (backlog), `dlq_total` (audit count), `outbox_pending`. Key-protected, labelled by route template. |
-| Currency normalization | **LOW** | Done | Lowercased at the entry boundary by a `mode="before"` validator, so `USD` is accepted and stored as `usd` rather than dead-lettered. `LedgerEntry` still rejects un-normalized input as a second layer. |
-| Dependency pins | **MEDIUM** | Done | `psycopg2-binary==2.9.9` had no cp313 wheel, so the documented "Python 3.12+" prerequisite could not be followed. Bumped to 2.9.12; supported range stated explicitly. |
-| CI blind spot | **HIGH** | Done | No workflow built the image or started compose, which is why the three runtime findings above survived four audit cycles with green badges. `stack.yml` now builds, boots, and attacks the stack. |
-| Multi-tenancy | — | Partial | `org_id` on every table with a composite `(org_id, transaction_id)` primary key, so the idempotency guard is per-tenant; the tenant is derived from the API key rather than a header; ops queries scoped; per-tenant ingest verified with that tenant's own signing secret; the worker delivers to each tenant's `downstream_url` and drains round-robin so one tenant's backlog cannot starve another. Remaining: no cross-tenant ledger or DLQ API credential; the operator key grants aggregate `/metrics` access — see [SECURITY.md](SECURITY.md). |
-| Row-level security | **HIGH** | Done | Isolation was a convention every query had to keep, and on 2026-08-11 the batch path forgot it in two branches — one tenant's payload readable by another, one Stripe event POSTED under two tenants. `ledger`, `outbox` and `dlq` now carry default-deny policies with `USING` and `WITH CHECK`, and the service connects as `billing_app` (`NOSUPERUSER NOBYPASSRLS`). The role is the part that matters: a superuser bypasses RLS regardless of `ENABLE` or `FORCE`, so policies alone enforce nothing. The process logs `rls_enforced` or `rls_inert` at every boot, and CI fails the build on `rls_inert`. |
-| GDPR / LGPD erasure | — | Not attempted | Conflicts directly with the append-only ledger this system is built around. Resolving that needs a documented retention and pseudonymization policy first, not code. |
-| PgBouncer + Kubernetes | — | Not attempted | Deployment topology, not application behavior. The `--workers 1` / `maxconn=20` note above is the prerequisite to settle first. |
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/billing` | Owner connection: migrations, `provision.py`, local runs | yes (`migrate`) |
+| `APP_DATABASE_URL` | `DATABASE_URL`; in Compose `billing_app` | Restricted role the API and worker connect as; this is what puts row-level security in force | yes |
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | `postgres`, `postgres`, `billing` | Credentials and name of the Compose PostgreSQL | yes |
+| `STRIPE_WEBHOOK_SECRET` | `whsec_YOUR_SECRET_HERE` | Signing secret of the `default` tenant (written to the registry by `provision.py`) | yes |
+| `STRIPE_WEBHOOK_SECRET_FILE` | empty | Read the secret from this file instead; an unreadable file stops the service | yes |
+| `BILLING_API_KEY` | empty; Compose `dev_key_change_in_production` | API key of the `default` tenant and the operator key for `/metrics` | yes |
+| `BILLING_API_KEY_FILE` | empty | Read the key from this file instead | yes |
+| `BILLING_ENV` | empty; Compose `dev` | `dev` allows demo credentials and the API docs, if the ingress is also on loopback | yes |
+| `INGRESS_BIND_ADDR` | `127.0.0.1` | Address Caddy's ports are published on; a non-loopback value revokes dev mode | yes |
+| `CADDY_DOMAIN` | `localhost` | Domain Caddy gets a certificate for | yes |
+| `FORWARDED_ALLOW_IPS` | Compose `172.28.0.10` | Proxy address uvicorn trusts for `X-Forwarded-For` (an exact address, not a range) | yes |
+| `LOG_FORMAT` | `text`; Compose `json` | `json` or plain text logs | yes |
+| `DB_POOL_SIZE` | `20` (worker: `1` in Compose) | Connections in the API's pool | yes |
+| `DB_POOL_WAIT_SECONDS` | `5` | How long a request waits for a free connection before `503` | no |
+| `MAX_REQUEST_BODY_BYTES` | `1048576` | Request body cap in the app (Caddy has its own 1 MiB cap) | no |
+| `RATE_LIMIT_WEBHOOK` | `100/minute` | Per client IP, webhook routes | yes |
+| `RATE_LIMIT_OPS` | `20/minute` | Per client IP, summary and DLQ routes | yes |
+| `RATE_LIMIT_METRICS` | `60/minute` | Per client IP, `/metrics` | yes |
+| `RATE_LIMIT_AUTH_FAILURES` | `20/minute` | Failed authentications per client IP before `429` | no |
+| `DOWNSTREAM_URL` | empty | Delivery URL for tenants without their own `downstream_url` | yes |
+| `WORKER_LOG_ONLY` | `false`; Compose `true` | Allows the worker to run with no URL, logging events instead of delivering them; with `false` and no URL it refuses to start | yes |
+| `WORKER_BATCH_SIZE` | `100` | Outbox rows claimed per poll | yes |
+| `WORKER_POLL_INTERVAL` | `5` | Seconds to wait when there is nothing to do | yes |
+| `WORKER_DISPATCH_CONCURRENCY` | `8` | Tenants delivered to at once | no |
+| `DISPATCH_SOCKET_TIMEOUT` | `10` | Seconds per connect or read to a downstream | no |
+| `DISPATCH_DEADLINE_SECONDS` | `15` | Total seconds one delivery may take | no |
+| `WORKER_LEASE_SECONDS` | `WORKER_BATCH_SIZE * DISPATCH_DEADLINE_SECONDS + 60` (1,560) | How long a claim keeps other workers off a row | no |
+
+`.env.example` documents each value that matters before a deployment is reachable from a
+network.
 
 ---
 
-## Origin
+## Security
 
-The fault-tolerance patterns here — idempotent inserts, transactional outbox, dead-lettering — are derived from [Aequitas](https://github.com/DDRG15/aequitas-privacy-engine), a high-throughput engine built to process 75k+ events per second with zero data loss under hard kills.
+The main controls, in one place. [SECURITY.md](SECURITY.md) has the reasoning, what is
+deliberately not covered, and how to report a vulnerability.
 
-In billing, a single race condition is a financial discrepancy. This system treats data like currency.
+- Every webhook's Stripe signature is verified with the tenant's own secret, also when the
+  secret is still the placeholder.
+- Operational endpoints need an API key. The tenant is derived from the key, never from a
+  header. `/metrics` needs the operator key.
+- PostgreSQL enforces tenant isolation (row-level security) for a role that is neither
+  superuser nor `BYPASSRLS`; the API says at every start-up whether it is in force.
+- The service refuses to start on the published demo credentials unless the run is
+  declared local.
+- Request size and speed are limited at Caddy and in the app; failed logins are
+  rate-limited.
+- The container runs as a non-root user and `/docs` is off outside dev.
+
+These are engineering controls, not a compliance programme.
 
 ---
 
-*Diego Alonso Del Río García — August 9, 2026*
+## Limitations
+
+- **There is no PostHog adapter**, despite the repository's folder name. The worker sends
+  each event as generic JSON over HTTP POST (headers `X-Event-Type`, `X-Transaction-Id`,
+  `X-Org-Id`).
+- **Five Stripe event types are recorded:** `invoice.paid`, `invoice.payment_failed` and
+  `customer.subscription.created`, `.updated` and `.deleted`. Other types are answered
+  `200` and stored as `UNSUPPORTED`. The fixtures in `fixtures/stripe/` are built from
+  Stripe's API reference; the system has not yet received events from a real Stripe
+  account.
+- **One shared API key per tenant.** No user accounts, roles or key-rotation flow, and no
+  log of who read what.
+- **Tenants are added with SQL**, and a tenant's Stripe signing secret is stored in plain
+  text in `org` (verifying a signature needs the value; in production it belongs in a
+  secret manager).
+- **Delivery is at least once**; receivers must deduplicate on `X-Transaction-Id`.
+- **The DLQ's automatic retry loop has nothing to retry today.** It handles `TRANSIENT`
+  entries, and nothing in the ingest path writes that reason; a database failure returns
+  `503` so Stripe retries. Rejected events are replayed by hand.
+- **One API process and one worker**, with a 256 MB, 0.5 CPU limit on the API container.
+  It has not been run behind PgBouncer or on Kubernetes.
+- **Secrets are read once at start-up.** Rotating means recreating the container.
+- **No erasure path.** The ledger is append-only by design, which conflicts with
+  GDPR-style deletion until a retention policy is decided.
+- **Prometheus is not included** in the Compose stack.
+
+---
+
+## Roadmap
+
+1. **Stripe test-mode integration** (next): receive real test-mode events with the Stripe
+   CLI (`stripe listen --forward-to`) and replace the reference-built fixtures with
+   captured ones.
+2. **Checkout and PaymentIntent event types**, once real payload shapes are in hand.
+3. Deferred connection-pool start-up, then retiring `_bootstrap()`.
+4. An optional PostHog adapter.
+
+What, when, where, why and done-when for each item are in
+[docs/architecture.md](docs/architecture.md#proposals-order-and-dependencies).
+
+---
+
+## Origin and licence
+
+The fault-tolerance patterns (idempotent inserts, transactional outbox, dead-lettering)
+come from [Aequitas](https://github.com/DDRG15/aequitas-privacy-engine), an earlier
+project by the same author.
+
+Licensed under the [MIT License](LICENSE). Diego Alonso Del Río García.

@@ -6,8 +6,8 @@ This page holds the maintained Mermaid source for the system. The interactive vi
 
 Every node names something that exists in the repository: a function in `ledger.py`,
 `worker.py` or `provision.py`, an HTTP route, a table, an environment variable or a
-compose service. A diagram is a map, not evidence that a path was tested. Behaviour the
-test suite covers is described in the README.
+compose service. A diagram is a map, not evidence that a path was tested. What the
+test suite covers is listed in [testing.md](testing.md).
 
 Reading the arrows: an arrow points from the caller, or the producer of the data, to the
 callee or the consumer. The worker polling the database is drawn as the worker calling
