@@ -41,6 +41,7 @@ from logging.handlers import RotatingFileHandler  # Rotating file handler — ca
 import os             # DATABASE_URL, STRIPE_WEBHOOK_SECRET, BILLING_API_KEY env var lookup
 import re             # the shape a tenant id may take in a webhook path (_ORG_ID_RE)
 import time           # perf_counter for benchmark timing
+import warnings       # placeholder-secret warning, emitted from the API lifespan
 import threading      # serialises the /metrics set-then-render pair (see metrics())
 import stripe         # Stripe SDK for HMAC-SHA256 webhook signature verification
 import psycopg2       # PostgreSQL driver — production-grade relational storage
@@ -683,19 +684,12 @@ STRIPE_WEBHOOK_SECRET: str = _read_secret("STRIPE_WEBHOOK_SECRET", "whsec_YOUR_S
 #     comment said the opposite ("will reject ALL incoming requests", "fail hard at
 #     startup"), the warning repeated it, and the code only warned.
 #
-#     The warning below fires in every process that imports this module. The refusal to
+#     The warning fires at API startup (lifespan). The refusal to
 #     SERVE traffic on it lives in _enforce_no_demo_credentials(), which runs at
 #     application startup — see BILLING_ENV and INGRESS_BIND_ADDR below.
 _PLACEHOLDER_SECRET = "whsec_YOUR_SECRET_HERE"
-if STRIPE_WEBHOOK_SECRET == _PLACEHOLDER_SECRET:
-    import warnings
-    warnings.warn(
-        "STRIPE_WEBHOOK_SECRET is the placeholder published in this repository. Signatures "
-        "made with it VERIFY, so anyone can forge events into the default org. Development "
-        "only: unless BILLING_ENV=dev and the ingress is bound to loopback, the service "
-        "refuses to start on it.",
-        stacklevel=1,
-    )
+# The warning for it is emitted by _log_api_startup_notices() (lifespan), for the same
+#     reason as the BILLING_API_KEY one below: only the API verifies signatures.
 
 # API key for ops endpoints (/ledger/summary, /dlq/entries).
 #     If empty (env var not set), the check is skipped — dev-mode convenience.
@@ -706,13 +700,11 @@ BILLING_API_KEY: str = _read_secret("BILLING_API_KEY", "")
 # Fail-open on an empty key is a deliberate dev convenience — but a silent one is a
 #     liability. If a production deploy forgets BILLING_API_KEY, /dlq/entries would
 #     serve raw Stripe payloads (customer IDs, amounts) to anyone, with no signal.
-#     Make that misconfiguration loud at startup instead of silent at runtime.
-if not BILLING_API_KEY:
-    _log.warning(
-        "BILLING_API_KEY is empty — /ledger/summary, /dlq/entries and /dlq/{id}/retry "
-        "are UNAUTHENTICATED. Dev mode only. Set a strong key (openssl rand -hex 32) "
-        "before any network-reachable deployment."
-    )
+#     Make that misconfiguration loud at startup instead of silent at runtime. The
+#     warning is emitted by _log_api_startup_notices() from the application lifespan,
+#     not at import: the worker imports this module too, serves no HTTP, and a
+#     "UNAUTHENTICATED" line in its log is a false alarm that sends an operator
+#     chasing an endpoint that process does not have.
 
 # May this process serve traffic on credentials published in this repository?
 #
@@ -796,12 +788,11 @@ _SECRET_FINGERPRINTS = {
     "stripe_secret_source":  "file" if os.environ.get("STRIPE_WEBHOOK_SECRET_FILE") else "env",
     "billing_key_source":    "file" if os.environ.get("BILLING_API_KEY_FILE") else "env",
 }
-_log.info(
-    "secrets loaded stripe=%s(%s) billing_api_key=%s(%s)",
-    _SECRET_FINGERPRINTS["stripe_webhook_secret"], _SECRET_FINGERPRINTS["stripe_secret_source"],
-    _SECRET_FINGERPRINTS["billing_api_key"],       _SECRET_FINGERPRINTS["billing_key_source"],
-    extra={"event": "secrets_loaded", **_SECRET_FINGERPRINTS},
-)
+# The "secrets loaded" log line is emitted from the lifespan as well — see
+#     _log_api_startup_notices(). The worker does not verify signatures or check API
+#     keys, and its copy of this module runs on whatever env it was handed (often the
+#     placeholder), so its fingerprint differed from the API's and broke the one
+#     comparison an operator makes after a rotation: "does the log show the new hash?".
 
 
 # ===========================================================================
@@ -1765,10 +1756,49 @@ def process_stripe_event_batch(
 #     lives in process_stripe_event() — framework-agnostic and independently testable.
 # ===========================================================================
 
+def _log_api_startup_notices() -> None:
+    """Startup lines that describe the HTTP surface. Emitted by the API process only.
+
+    Scenario: worker.py imports this module, so a notice written at module level prints
+    in the worker too. Consequence: the worker logged "BILLING_API_KEY is empty ...
+    UNAUTHENTICATED" for endpoints it does not serve, and a "secrets loaded" line whose
+    fingerprint came from the worker's own environment. Decision: these run from the
+    lifespan, which only uvicorn (and `with TestClient(app)`) executes.
+    """
+    if STRIPE_WEBHOOK_SECRET == _PLACEHOLDER_SECRET:
+        warnings.warn(
+            "STRIPE_WEBHOOK_SECRET is the placeholder published in this repository. Signatures "
+            "made with it VERIFY, so anyone can forge events into the default org. Development "
+            "only: unless BILLING_ENV=dev and the ingress is bound to loopback, the service "
+            "refuses to start on it.",
+            stacklevel=1,
+        )
+    if not BILLING_API_KEY:
+        _log.warning(
+            "BILLING_API_KEY is empty — /ledger/summary, /dlq/entries and /dlq/{id}/retry "
+            "are UNAUTHENTICATED. Dev mode only. Set a strong key (openssl rand -hex 32) "
+            "before any network-reachable deployment."
+        )
+    _log.info(
+        "secrets loaded stripe=%s(%s) billing_api_key=%s(%s)",
+        _SECRET_FINGERPRINTS["stripe_webhook_secret"], _SECRET_FINGERPRINTS["stripe_secret_source"],
+        _SECRET_FINGERPRINTS["billing_api_key"],       _SECRET_FINGERPRINTS["billing_key_source"],
+        extra={"event": "secrets_loaded", **_SECRET_FINGERPRINTS},
+    )
+    if RATE_LIMIT_WEBHOOK != "100/minute":
+        _log.warning(
+            "RATE_LIMIT_WEBHOOK is %s, not the 100/minute default — intended for local "
+            "benchmarking. A raised limit on a reachable deployment lets a flood exhaust "
+            "the connection pool and grow outbox_pending without bound.",
+            RATE_LIMIT_WEBHOOK,
+        )
+
+
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Startup checks that must pass before the first request. Resolved at call time:
     _enforce_no_demo_credentials needs the pool, which is built further down."""
+    _log_api_startup_notices()
     _enforce_no_demo_credentials()
     yield
 
@@ -1792,14 +1822,6 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 RATE_LIMIT_WEBHOOK = os.getenv("RATE_LIMIT_WEBHOOK", "100/minute")
 RATE_LIMIT_OPS     = os.getenv("RATE_LIMIT_OPS",     "20/minute")
 RATE_LIMIT_METRICS = os.getenv("RATE_LIMIT_METRICS", "60/minute")
-
-if RATE_LIMIT_WEBHOOK != "100/minute":
-    _log.warning(
-        "RATE_LIMIT_WEBHOOK is %s, not the 100/minute default — intended for local "
-        "benchmarking. A raised limit on a reachable deployment lets a flood exhaust "
-        "the connection pool and grow outbox_pending without bound.",
-        RATE_LIMIT_WEBHOOK,
-    )
 
 # ---------------------------------------------------------------------------
 # Metrics

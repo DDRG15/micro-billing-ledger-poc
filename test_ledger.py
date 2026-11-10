@@ -4426,6 +4426,62 @@ finally:
 
 
 # =============================================================================
+# C6-23: API-only startup notices come from the API process, not from the worker
+#     worker.py imports ledger, and ledger printed its startup notices at import. The
+#     worker therefore logged "BILLING_API_KEY is empty ... UNAUTHENTICATED" about
+#     endpoints it does not serve, and a "secrets loaded" line whose fingerprint came
+#     from the worker's own environment, not the API's. An operator checking that a
+#     rotation landed compared the wrong hash. The notices now run from the lifespan.
+# =============================================================================
+print("\n── C6-23: API-only startup notices are emitted by the API lifespan only ──")
+
+import subprocess as _sp_623  # noqa: E402
+
+_env_623 = {k: v for k, v in os.environ.items()
+            if k not in ("BILLING_API_KEY", "BILLING_API_KEY_FILE", "BILLING_ENV")}
+_proc_623 = _sp_623.run(
+    [sys.executable, "-c", "import ledger"], cwd=os.path.dirname(os.path.abspath(__file__)),
+    env=_env_623, capture_output=True, text=True, timeout=60)
+_out_623 = _proc_623.stdout + _proc_623.stderr
+chk("importing ledger with no BILLING_API_KEY succeeds", _proc_623.returncode == 0,
+    _out_623[-300:])
+chk("…and logs no UNAUTHENTICATED warning (the importer may be the worker)",
+    "UNAUTHENTICATED" not in _out_623,
+    "; ".join(_l[:120] for _l in _out_623.splitlines() if "UNAUTHENTICATED" in _l))
+chk("…and logs no 'secrets loaded' fingerprint line",
+    "secrets loaded" not in _out_623,
+    "; ".join(_l[:120] for _l in _out_623.splitlines() if "secrets loaded" in _l))
+
+_recs_623 = []
+
+
+class _Capture623(logging.Handler):
+    def emit(self, record):
+        _recs_623.append(record.getMessage())
+
+
+_orig_623 = {k: getattr(L, k) for k in ("BILLING_ENV", "INGRESS_BIND_ADDR", "BILLING_API_KEY",
+                                        "_ANY_ORG_KEYS", "_pool")}
+c623 = fresh_conn()
+L._pool = _MockPool(c623)
+L.BILLING_ENV, L.INGRESS_BIND_ADDR, L.BILLING_API_KEY, L._ANY_ORG_KEYS = "dev", "127.0.0.1", "", False
+_h623 = _Capture623()
+L._log.addHandler(_h623)
+try:
+    with TestClient(L.app) as _cl623:
+        _cl623.get("/health")
+finally:
+    L._log.removeHandler(_h623)
+    for _k, _v in _orig_623.items():
+        setattr(L, _k, _v)
+    c623.close()
+chk("the API lifespan still warns that the ops endpoints are UNAUTHENTICATED",
+    any("UNAUTHENTICATED" in m for m in _recs_623), str(_recs_623)[:300])
+chk("the API lifespan still logs the secrets fingerprint line",
+    any(m.startswith("secrets loaded stripe=") for m in _recs_623), str(_recs_623)[:300])
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
