@@ -1,56 +1,30 @@
-# .dockerignore — Micro-Billing-Ledger PoC
-# ==========================================
-# Excludes files from the Docker build context.
-#     A smaller context = faster builds and no accidental secret leaks into images.
-#     Rule: only source code and package manifests belong inside the image.
+# .dockerignore -- allowlist for the Docker build context.
 #
+# The context is everything the daemon receives, whether or not a COPY reads it.
+# A deny-list has to anticipate every file that will ever appear in a checkout
+# (local env files, editor state, caches, notes). An allowlist inverts that: nothing
+# enters the context unless the Dockerfile needs it, so a new stray file is excluded
+# by default.
+#
+# Keep this list equal to the COPY instructions in the Dockerfile. Adding a COPY
+# there without adding the matching "!" line here fails the build with
+# "file not found", which is the intended signal.
 
-# Git history — never include in the image. Large, irrelevant to runtime, and leaks commit metadata.
-.git/
-.gitignore
+# Exclude everything.
+*
 
-# Secrets — critical exclusion. .env must NEVER enter a Docker image.
-#     If an image with .env is pushed to a registry, the secret is compromised.
-#     .env.example is also excluded — it contains placeholder values, not needed at runtime.
-.env
-.env.example
-.env.local
-.env.production
+# Dependency manifest (COPY requirements.txt in the builder stage).
+!requirements.txt
 
-# Python bytecode and virtual environments — machine-specific, rebuilt inside the container.
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
-env/
-*.egg-info/
+# Application sources and migration config (COPY in the runtime stage).
+!ledger.py
+!worker.py
+!provision.py
+!alembic.ini
+!alembic/
 
-# Test suite and audit/planning documents — not needed at runtime.
-test_ledger.py
-PREFLIGHT_AUDIT.md
-FULL_SPECTRUM_AUDIT.md
-PRIVATE_README.md
-LOGIC_AUDIT.md
-IMPLEMENTATION_REPORT.md
-README.md
-*.md
-# Archived private docs folder — *.md above only matches the root, so the folder
-# needs its own rule or its contents enter the build context (not the image — the
-# Dockerfile COPYs specific files — but private docs do not belong in the context).
-documentos/
-
-# Development toolchain config and cache.
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Log files — runtime artefacts, not source. Could contain PII.
-*.log
-
-# OS noise.
-.DS_Store
-Thumbs.db
-
-# Claude Code workspace files — local AI assistant state, not part of the app.
-.claude/
+# Bytecode caches inside the allowed directories are machine-specific.
+# These come after the "!" lines because the last matching rule wins.
+**/__pycache__
+**/*.pyc
+**/*.pyo
