@@ -414,13 +414,20 @@ These are engineering controls, not a compliance programme.
 - **Five Stripe event types are recorded:** `invoice.paid`, `invoice.payment_failed` and
   `customer.subscription.created`, `.updated` and `.deleted`. Other types are answered
   `200` and stored as `UNSUPPORTED`. The fixtures in `fixtures/stripe/` are built from
-  Stripe's API reference. The service has also received events from a Stripe sandbox
-  (test mode, API version `2026-10-28`), forwarded by `stripe listen` and generated with
-  `stripe trigger` for `invoice.paid`, `invoice.payment_failed` and the three subscription
-  events: 73 events, all answered `200`, 10 recorded in the ledger (4 `POSTED`, 1 `VOID`,
-  5 `LIFECYCLE`) and 63 stored as `UNSUPPORTED`, none lost or recorded twice. It has not
-  received live-mode traffic. [docs/architecture.md](docs/architecture.md#verified-against-a-stripe-test-mode-account)
-  has the commands to repeat the run.
+  Stripe's API reference. The service has also been reconciled against a Stripe sandbox
+  (test mode, API version `2026-10-28`) with [`e2e/stripe_sandbox.py`](e2e/README.md#stripe-sandbox-reconciliation):
+  1,817 events of 70 types plus 60 Stripe resends, all answered `200`; Stripe's own count
+  of paid invoices, failed payments and subscription events equals the ledger's, with the
+  same event ids and the same amounts to the cent (81 paid invoices, 128,500 cents). It
+  has not received live-mode traffic, and the run raised the webhook rate limit and
+  called the API directly, not through Caddy.
+  [docs/architecture.md](docs/architecture.md#verified-against-a-stripe-test-mode-account)
+  has the full result.
+- **No local spool when PostgreSQL is down.** The API answers `503` and Stripe's retries
+  are the buffer. Accepting the event with `200` and holding it in memory would lose it
+  on a restart, and Stripe never resends an event it was told arrived. A durable spool on
+  local disk would remove the wait for Stripe's retry, at the cost of a second store to
+  replay, monitor and secure; for a proof of concept that is not worth it.
 - **One shared API key per tenant.** No user accounts, roles or key-rotation flow, and no
   log of who read what.
 - **Tenants are added with SQL**, and a tenant's Stripe signing secret is stored in plain

@@ -171,40 +171,24 @@ deliberately vulnerable code.
 ## Manual check against a Stripe sandbox
 
 The fixtures are built from Stripe's API reference, so the suite shows that the code accepts
-what the reference documents, not what Stripe sends. The check that closes that gap needs a
-Stripe test-mode account and the Stripe CLI, so it is not part of CI. Result of the last run
-(test mode, API version `2026-10-28`, `invoice.paid`, `invoice.payment_failed` and the three
-`customer.subscription.*` types generated with `stripe trigger`):
+what the reference documents, not what Stripe sends. `e2e/stripe_sandbox.py` closes that gap.
+It needs a Stripe test-mode account and the Stripe CLI, so it is not part of CI. Result of the
+last run (test mode, API version `2026-10-28`):
 
 | Measured | Result |
 |---|---|
-| Events the CLI forwarded | 73, all answered `200` |
-| Ledger rows | 10: 4 `POSTED`, 1 `VOID`, 5 `LIFECYCLE` |
-| `UNSUPPORTED` rows in `dlq` | 63, across 17 event types |
+| Events received | 1,817 of 70 types, plus 60 Stripe resends; 1,877 deliveries, all answered `200` |
+| Ledger against Stripe's event list | 81 `POSTED` = 81 `invoice.paid`, 35 `VOID` = 35 `invoice.payment_failed`, 86 `LIFECYCLE` = 86 subscription events, same event ids |
+| Money against Stripe | 128,500 cents paid and 64,195 cents failed, equal on both sides |
 | Lost or recorded twice | 0 and 0 |
-| Amounts against the Stripe dashboard | gross volume USD 65.00 equals the four `POSTED` rows; the failed payment of USD 20.00 equals the `VOID` row |
+| Resends | no ledger row changed |
 
-To repeat it:
-
-```bash
-stripe listen --all-snapshot --forward-to localhost:8000/webhook/stripe   # prints a whsec_ secret
-# Leave the listener running. Set STRIPE_WEBHOOK_SECRET in .env to that secret and run
-# docker compose up -d, then use a second terminal for the rest.
-stripe trigger invoice.paid
-stripe trigger invoice.payment_failed
-stripe trigger customer.subscription.created
-stripe trigger customer.subscription.updated
-stripe trigger customer.subscription.deleted
-curl -H "X-Api-Key: dev_key_change_in_production" http://localhost:8000/ledger/summary
-```
-
-CLI 1.55 refuses to start `stripe listen` without `--events` or `--all-snapshot`. The run
-passes when every forwarded event shows `[200]` in the listener output and the ledger counts
-plus `dlq_total` add up to the number of events forwarded, on a database that held nothing
-before the run. The outcome counts are also on `/metrics` as `webhook_events_total{outcome}`.
-The captured payloads were not saved as fixtures;
-[architecture.md](architecture.md#verified-against-a-stripe-test-mode-account) has the
-longer description.
+The run raised the webhook rate limit and called port 8000 directly; the script also resends
+any event `stripe listen` dropped before it reconciles, and reports how many. The command,
+the phases and every control are in [e2e/README.md](../e2e/README.md#stripe-sandbox-reconciliation),
+and [architecture.md](architecture.md#verified-against-a-stripe-test-mode-account) has the
+longer description. The exit status is 0 only when every control passes. The captured
+payloads were not saved as fixtures.
 
 ## Mutation testing
 

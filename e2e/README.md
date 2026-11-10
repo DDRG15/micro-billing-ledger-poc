@@ -114,8 +114,22 @@ listener log and the Stripe events the run compared against; nothing in it is a 
 | Phase | What it does |
 |---|---|
 | 1. Volume | `stripe trigger` over about 100 event types, four at a time (lowered if Stripe rate-limits), until more than `--target-events` (default 1000) events were forwarded |
-| 2. Resends | `stripe events resend` for `--resends` (default 60) delivered events, `invoice.paid` and subscription events included |
+| Catch-up | every event Stripe emitted that never reached the service is resent, up to `--catchup-rounds` (default 5) rounds |
+| 2. Resends | `stripe events resend` for `--resends` (default 60) delivered events, `invoice.paid` and subscription events included, then the same catch-up |
 | 3. Controls | the checks below |
+
+The catch-up exists because `stripe listen` is a development tunnel. Under a burst of about
+ten events a second it dropped 329 of 1,912 events and never retried them, while the
+service answered every request it received. Stripe retries a registered webhook endpoint
+on its own; the tunnel does not, so the script does it, and the report counts what the
+listener dropped (`listener_catch_up`). Stopping the listener for 25 seconds mid-run
+dropped 83 events; all 83 were resent in one round and every control passed.
+
+Some `stripe trigger` fixtures (`payment_intent.*`, `charge.succeeded`, `setup_intent.*`,
+`quote.*`) are refused by the sandbox at API version `2026-10-28`, because they use
+endpoints Stripe has retired; Stripe may email the account about those calls. The events
+still arrive as side effects of the invoice and subscription triggers. `--types` limits the
+run to fixtures that work.
 
 | Control | Pass condition |
 |---|---|
@@ -124,5 +138,5 @@ listener log and the Stripe events the run compared against; nothing in it is a 
 | c | `amount_paid` of the `invoice.paid` events equals the POSTED `amount_cents`, and `amount_due` of the failed payments equals the VOID `amount_cents`, to the cent |
 | d | every delivery the listener logged was answered 200 |
 | e | no pending outbox rows, and no ledger row without an outbox row |
-| g | the listener forwarded every event Stripe emitted in the window |
+| g | every event Stripe emitted in the window reached the service, directly or through the catch-up |
 | r | each resend was redelivered, answered 200, and left the ledger unchanged |

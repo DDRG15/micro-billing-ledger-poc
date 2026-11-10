@@ -335,6 +335,11 @@ flowchart TB
 - **Row-level security needs the right role.** The policies bind `billing_app`. If the
   service connects as a superuser or a `BYPASSRLS` role, it logs `rls_inert` at start-up
   and isolation falls back to the `org_id` predicates in each query.
+- **No local spool when PostgreSQL is down.** The API answers `503` and Stripe's retries
+  are the buffer. Answering `200` and holding the event in memory would lose it on a
+  restart, and Stripe never resends an event it was told arrived. A durable spool on local
+  disk would avoid the wait for Stripe's retry, at the cost of a second store to replay,
+  monitor and secure. For a proof of concept that trade is not worth it.
 - **The DLQ retry loop is wired but idle.** `retry_dlq_batch` only picks up rows with
   reason `TRANSIENT`, and nothing in the ingest path writes that reason today. `INVALID`
   rows have `max_retries = 0`; they are replayed by hand through
@@ -349,49 +354,57 @@ flowchart TB
 
 The five event types were first tested against fixtures built from Stripe's API
 reference. A fixture shows that the code accepts what the reference documents; it does
-not show what Stripe sends. The service has since received events from a Stripe sandbox
-(test mode, API version `2026-10-28`): `stripe listen` forwarded to
-`localhost:8000/webhook/stripe`, the published loopback port and the `default` tenant, and
-`stripe trigger` generated `invoice.paid`, `invoice.payment_failed` and
-`customer.subscription.created`, `.updated` and `.deleted`.
+not show what Stripe sends. `e2e/stripe_sandbox.py` closes that gap: it drives a Stripe
+sandbox (test mode, API version `2026-10-28`) with `stripe trigger`, receives the events
+through `stripe listen` on `localhost:8000/webhook/stripe` (the `default` tenant), asks
+Stripe to resend some of them, and reconciles the database against Stripe's own event
+list. Result of the last run, on the code that keys a payment by its invoice:
 
 | Measured | Result |
 |---|---|
-| Events forwarded by the CLI | 73, every one answered `200` |
-| Recorded in the ledger | 10: 4 `POSTED`, 1 `VOID`, 5 `LIFECYCLE` |
-| Stored as `UNSUPPORTED` in `dlq` | 63, across 17 event types |
-| Lost | 0: 10 ledger rows plus 63 `dlq` rows equal the 73 events |
-| Recorded twice | 0: the 10 ledger rows carry 10 distinct event ids |
-| Stripe dashboard | gross volume USD 65.00, the four `POSTED` rows (20.00 + 15.00 + 15.00 + 15.00); one failed payment of USD 20.00, the `VOID` row |
+| Events Stripe emitted and the service received | 1,817 of 70 types, plus 60 resends: 1,877 deliveries, every one answered `200` |
+| Paid invoices | Stripe 81, `POSTED` 81; 128,500 cents on both sides |
+| Failed payments | Stripe 35, `VOID` 35; 64,195 cents on both sides |
+| Subscription events | Stripe 86, `LIFECYCLE` 86 |
+| Event ids | the ledger holds exactly the ids Stripe lists for those types |
+| Other types | 1,615 stored as `UNSUPPORTED` |
+| Lost, or recorded twice | 0 and 0: every received event has exactly one row |
+| Stripe resends | 60 redelivered, all answered `200`; no ledger row changed; the 35 of supported types left a resolved `DUPLICATE` row |
+| Outbox | drained, one outbox row per ledger row |
 
-The 63 `UNSUPPORTED` events were not requested. A `stripe trigger` creates the customer,
-the payment method, the invoice and the payment around the event it names, and each of
-those resources produces its own event. The types that arrived include `customer.created`,
-`payment_method.attached`, `invoice.created`, `invoice.finalized`,
-`invoice.payment_succeeded`, `charge.succeeded`, `payment_intent.created` and
-`payment_intent.succeeded`. Every one was answered `200` and stored as a resolved `dlq`
-row, which is what the ledger is built to do with a type it does not record.
+Three conditions differ from a default deployment, and the result says nothing beyond
+them: the webhook rate limit was raised to `100000/minute`, because the listener reaches
+the service from one address; requests went to port 8000, not through Caddy; and Stripe's
+own retry of a registered endpoint was not exercised, because `stripe listen` does not
+register one.
 
-To repeat it, with the Stripe CLI logged in to a test-mode account:
+`stripe listen` is a development tunnel and loses events under load. In an earlier run at
+about ten events a second it dropped 329 of 1,912 events, and the service had answered
+every request the tunnel delivered. The script therefore resends, before reconciling,
+every event Stripe emitted that never reached the service, and reports how many the
+listener dropped (none in the run above; 83 when the listener was stopped for 25 seconds
+on purpose, all recovered in one round).
+
+Most of the `UNSUPPORTED` events were not requested. A `stripe trigger` creates the
+customer, the payment method, the invoice and the payment around the event it names, and
+each of those resources produces its own event: every paid invoice arrived with
+`invoice.payment_succeeded`, `payment_intent.succeeded` and `charge.succeeded`. Those are
+the same payment announced three more times, which is why the ledger keys a payment by its
+invoice and not by the event id.
+
+To repeat it, with the Stripe CLI logged in to a test-mode account (CLI 1.55 refuses to
+start `stripe listen` without `--events` or `--all-snapshot`):
 
 ```bash
-# 1. Start the listener. It prints its own whsec_ signing secret.
-#    CLI 1.55 refuses to start without --events or --all-snapshot.
-stripe listen --all-snapshot --forward-to localhost:8000/webhook/stripe
-
-# 2. Put that secret in STRIPE_WEBHOOK_SECRET in .env, then start or recreate the stack.
-docker compose up -d
-
-# 3. In a second terminal, generate the five supported types.
-stripe trigger invoice.paid
-stripe trigger invoice.payment_failed
-stripe trigger customer.subscription.created
-stripe trigger customer.subscription.updated
-stripe trigger customer.subscription.deleted
-
-# 4. Compare the ledger with what the listener forwarded.
-curl -H "X-Api-Key: dev_key_change_in_production" http://localhost:8000/ledger/summary
+cp .env.example .env
+export STRIPE_WEBHOOK_SECRET="$(stripe listen --print-secret | grep -oE 'whsec_[A-Za-z0-9]+')"
+RATE_LIMIT_WEBHOOK=100000/minute docker compose up -d --build --wait
+stripe listen --all-snapshot --forward-to localhost:8000/webhook/stripe > listen.log 2>&1 &
+python e2e/stripe_sandbox.py --listen-log listen.log --out-dir evidence
 ```
+
+[e2e/README.md](../e2e/README.md#stripe-sandbox-reconciliation) lists the phases, the
+controls and the options.
 
 The check is that the ledger counts plus `dlq_total` equal the number of
 `<--  [200]` lines the listener printed. The split between the two depends on what the
