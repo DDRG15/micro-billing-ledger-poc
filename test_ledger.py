@@ -2604,9 +2604,8 @@ finally:
 #     every other release calls conn.close(). With minconn=1 the pool retained exactly
 #     ONE connection, so under concurrency each request opened a fresh PostgreSQL
 #     connection and closed it on release — and since _connect() runs inside getconn
-#     while the pool lock is held, that serialized every caller.
-#     Measured before the fix: 1 TPS at 4 concurrent clients, p50 4.2 SECONDS.
-#     After: 61 TPS at 4, 143 TPS at 16, p50 under 100ms throughout.
+#     while the pool lock is held, that serialized every caller. This section checks the
+#     mechanism (connections are retained), not a throughput figure.
 # =============================================================================
 print("\n── A7: the connection pool actually pools ──────────────────────────────")
 

@@ -2316,10 +2316,10 @@ else:
 #     exactly ONE connection: under concurrency each request opened a fresh PostgreSQL
 #     connection and closed it again on release, and because _connect() runs inside
 #     getconn while the pool lock is held, that connect/close storm serialized every
-#     caller. Measured on this machine: 23 TPS at 1 client, 15 at 2, then 1 TPS at 4 with
-#     p50 latency of 4.2 SECONDS — and the app's own middleware confirmed the time was
-#     spent inside the process, not in the network. After the change: 61 TPS at 4 and
-#     143 TPS at 16, p50 under 100ms throughout.
+#     caller. The early throughput figures recorded for this were not trustworthy: the
+#     load generator of the time (urllib, one TCP connection per request) produced its
+#     own collapse, see benchmark.py. The mechanism above is what the change addresses;
+#     benchmark.py measures the result on the machine that runs it.
 #     Size to the PostgreSQL max_connections budget: every worker process holds this many.
 #     APP_DATABASE_URL, not DATABASE_URL: every connection that serves traffic runs as the
 #     restricted role, which is what makes the row-level security policies apply at all.
