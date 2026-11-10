@@ -120,7 +120,7 @@ def _qall(conn, sql: str, params: tuple = ()) -> list:
         return cur.fetchall()
 
 
-_open_conns: list = []  # M7: every fresh_conn() is tracked here and closed at end of run
+_open_conns: list = []  # every fresh_conn() is tracked here and closed at end of run
 
 
 def fresh_conn():
@@ -137,7 +137,7 @@ def fresh_conn():
         # Tenants too: org rows are not truncated by the line above (ledger references
         #     them), so without this a section inherits the tenants another one created.
         cur.execute("DELETE FROM org WHERE org_id <> 'default'")
-    _open_conns.append(conn)  # M7: tracked for guaranteed close at end of run
+    _open_conns.append(conn)  # tracked for guaranteed close at end of run
     return conn
 
 
@@ -434,13 +434,13 @@ chk(f"throughput ≥ 500 TPS  (got {tps:,.0f})", tps >= 500)
 print(f"         {N:,} events in {elapsed:.3f}s  →  {tps:,.0f} TPS  "
       f"(batch via execute_values, PostgreSQL localhost)")
 
-# M5 — data integrity: verify actual row count in DB matches batch input size.
+# Data integrity: verify actual row count in DB matches batch input size.
 #     A broken batch function that returns dummy results without touching the DB
 #     would pass the TPS check above but fail this assertion.
 bench_row_count = _q1(conn4, "SELECT COUNT(*) FROM ledger")
 chk(f"batch data integrity: exactly {N} rows in ledger",
     bench_row_count == N, f"got {bench_row_count}")
-conn4.close()  # L3 — explicit close to avoid leaking connection
+conn4.close()  # explicit close to avoid leaking connection
 
 
 # =============================================================================
@@ -941,10 +941,10 @@ dlq_conn.close()
 
 
 # =============================================================================
-# PHASE 4 NEW TESTS: M3, M4, L4
+# PHASE 4: batch indexing, DB failure -> 503, empty batch
 # =============================================================================
 
-print("\n── Phase 4: Batch result indexed by input position (M3) ─────────────────")
+print("\n── Phase 4: Batch result indexed by input position ──────────────────────")
 # Verifies that results[i] corresponds to events[i] for every position.
 #     A scrambled-return bug (e.g., results returned in RETURNING order instead of
 #     input order) would pass all previous batch tests but fail these assertions.
@@ -964,7 +964,7 @@ chk("batch results[2] matches input event_pos_c",     pos_results[2]["transactio
 pos_conn.close()
 
 
-print("\n── Phase 4: DB failure raises RuntimeError → HTTP 503 (M4) ─────────────")
+print("\n── Phase 4: DB failure raises RuntimeError → HTTP 503 ──────────────────")
 # Verifies that when process_stripe_event raises RuntimeError (DB-level failure),
 #     the FastAPI handler converts it to HTTP 503. The handler is coded correctly
 #     but was never exercised by any previous test.
@@ -989,7 +989,7 @@ finally:
     db_err_conn.close()
 
 
-print("\n── Phase 4: Empty batch returns empty list (L4) ─────────────────────────")
+print("\n── Phase 4: Empty batch returns empty list ──────────────────────────────")
 # Verifies the early-exit guard: process_stripe_event_batch(conn, []) → [].
 #     Simple guard but was untested — a regression that removed it would silently
 #     crash on the first None access in the results list.
@@ -1313,12 +1313,12 @@ manual_conn.close()
 
 
 # =============================================================================
-# M1: API KEY AUTH BOUNDARY
+# API KEY AUTH BOUNDARY
 # Verifies _require_api_key actually enforces the key. The rest of the suite runs
 #     with BILLING_API_KEY="" (auth disabled); this section sets a key and asserts
 #     401 on missing/wrong and 200 on correct, then restores the empty key.
 # =============================================================================
-print("\n── M1: API key auth boundary ────────────────────────────────────────────")
+print("\n── API key auth boundary ────────────────────────────────────────────────")
 
 auth_conn          = fresh_conn()
 original_pool_auth = L._pool
@@ -1342,11 +1342,11 @@ finally:
 
 
 # =============================================================================
-# M5: DLQ RETENTION (prune_dlq)
+# DLQ RETENTION (prune_dlq)
 # Verifies prune_dlq deletes old DUPLICATE rows only — recent DUPLICATE rows and
 #     INVALID rows of any age are kept (they need human review).
 # =============================================================================
-print("\n── M5: prune_dlq retention ──────────────────────────────────────────────")
+print("\n── prune_dlq retention ──────────────────────────────────────────────────")
 
 prune_conn = fresh_conn()
 with prune_conn.cursor() as cur:
@@ -6100,7 +6100,7 @@ chk("0013: pending INVALID and TRANSIENT rows are untouched",
 c633.close()
 
 # =============================================================================
-# M7: close every connection opened via fresh_conn(). Closing an already-closed
+# Close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
 for _c in _open_conns:

@@ -70,7 +70,7 @@ after the fact, which key a skipped row hit.
 ### What each section covers
 
 The labels are the ones used in the section headers of `test_ledger.py`, so they can be
-found with `grep`.
+found with `grep`. A-n and C6-n are section ids in `test_ledger.py`.
 
 | Section | What it checks |
 |---|---|
@@ -83,7 +83,7 @@ found with `grep`.
 | Alembic migrations | `upgrade head` reaches the head revision, the three tables and the `dispatched_at` and `claimed_at` columns exist, `downgrade base` and `upgrade head` again |
 | DLQ retry | `TRANSIENT` entries get `max_retries` 3 and `INVALID` ones 0, `retry_dlq_batch` replays and resolves, exhaustion, `POST /dlq/{id}/retry` resolves a `POSTED` replay |
 | JSON logging and Prometheus `/metrics` | JSON log formatter, `/metrics` shape, outcome labels, route-template label cardinality, gauges agree with the tables |
-| M1, M5 | API key boundary (401 and 200), `prune_dlq` retention |
+| API key auth boundary, `prune_dlq` retention | API key boundary (401 and 200), DLQ retention |
 | A0 | Amount extraction per event type; an unknown amount goes to the DLQ, never to `$0` |
 | A1, A2, A4 | DLQ integrity: a retry appends no rows, `resolved` is terminal at every write site (409 at the endpoint) |
 | A3 | Stale retry claims are reclaimed, live ones are not stolen |

@@ -166,7 +166,8 @@ Every delivery carries `X-Transaction-Id`, so the receiver can discard repeats.
 exits non-zero on a failure: 817 checks against a live PostgreSQL 16. The guarantees above
 are behaviour of the database (a unique key serializing concurrent inserts, policies
 applying to a restricted role, row locks skipping claimed rows), so the suite runs
-against one rather than a mock. CI runs it on Python 3.12 and 3.13, runs ruff and bandit,
+against a real PostgreSQL; some HTTP sections inject a controlled real connection or patch
+signature verification (see [docs/testing.md](docs/testing.md)). CI runs it on Python 3.12 and 3.13, runs ruff and bandit,
 and builds and attacks the real Compose stack (`.github/workflows/`).
 
 **Mutation testing.** Reverting a fix and watching its test fail is how you know the test
