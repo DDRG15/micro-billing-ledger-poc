@@ -19,7 +19,7 @@ DATABASE_URL        the owner connection; migrations only
 DOWNSTREAM_URL      (optional) — if set, HTTP POST each event payload here
 WORKER_BATCH_SIZE   (default: 100) — rows read per poll cycle
 WORKER_POLL_INTERVAL (default: 5)  — seconds to sleep when queue is empty
-WORKER_DISPATCH_CONCURRENCY (default: 8) — tenants dispatched in parallel within a batch
+WORKER_DISPATCH_CONCURRENCY (default: 8) — max tenants dispatching at once (tasks in flight)
 
 DESIGN NOTES
 ------------
@@ -31,7 +31,8 @@ DESIGN NOTES
   leaves its claim to expire, and the row is delivered again. Receivers deduplicate on
   transaction_id.
 - psycopg2.OperationalError triggers exponential backoff + reconnect.
-- SIGTERM sets a stop flag; the worker finishes the current batch then exits 0.
+- SIGTERM sets a stop flag; the worker claims nothing more, lets each in-flight tenant task
+  finish its current row (rows not yet sent are released), records them and exits 0.
 """
 
 import logging
@@ -43,9 +44,9 @@ import socket
 import threading
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
-from typing import Dict, Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Sequence, Tuple
 
 import psycopg2
 import psycopg2.extensions
@@ -292,6 +293,9 @@ _CLAIM_SQL = """
         -- that are backing off or leased are not eligible at all.
         SELECT c.id, c.org_id
         FROM   org g
+        -- Tenants that still have a dispatch task in flight in THIS process (%(skip)s)
+        --     are not claimed again: a tenant has one task at a time, so its rows stay
+        --     serial and in id order across claims.
         CROSS  JOIN LATERAL (
             SELECT o.id, o.org_id
             FROM   outbox o
@@ -303,6 +307,16 @@ _CLAIM_SQL = """
             LIMIT  %(batch_size)s
             FOR UPDATE SKIP LOCKED
         ) c
+        WHERE  g.org_id <> ALL(%(skip)s::text[])
+    ), chosen AS (
+        -- At most %(max_orgs)s tenants, taken in the rotation order below. The
+        --     continuous dispatcher claims only as many tenants as it has free slots, so
+        --     a claimed row never waits in a queue behind a slow task while its lease
+        --     runs down.
+        SELECT org_id
+        FROM   (SELECT DISTINCT org_id FROM candidates) d
+        ORDER  BY (org_id COLLATE "C" <= %(after)s), org_id COLLATE "C"
+        LIMIT  %(max_orgs)s
     ), picked AS (
         -- Round-robin across tenants: rank within each tenant, take rank 1 of every
         -- tenant before rank 2 of any. Within a rank, tenants go in org_id order
@@ -313,7 +327,8 @@ _CLAIM_SQL = """
         SELECT id, org_id, rn
         FROM  (SELECT id, org_id,
                       ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
-               FROM   candidates) r
+               FROM   candidates
+               WHERE  org_id IN (SELECT org_id FROM chosen)) r
         -- COLLATE "C": byte order, the same order Python compares the cursor in.
         ORDER  BY rn, (org_id COLLATE "C" <= %(after)s), org_id COLLATE "C", id
         LIMIT  %(batch_size)s
@@ -332,8 +347,12 @@ _CLAIM_SQL = """
 _rr_after: str = ""
 
 
-def _claim_batch(conn: psycopg2.extensions.connection) -> List[psycopg2.extras.RealDictRow]:
+def _claim_batch(conn: psycopg2.extensions.connection, skip: Sequence[str] = (),
+                 max_orgs: Optional[int] = None) -> List[psycopg2.extras.RealDictRow]:
     """Claim up to WORKER_BATCH_SIZE rows, fairly across tenants, in one short transaction.
+
+    skip: tenants not to claim from (they have a dispatch task in flight).
+    max_orgs: claim from at most this many tenants (default: no limit beyond the batch).
 
     The row locks taken by FOR UPDATE SKIP LOCKED last only until this transaction
     commits, milliseconds later; what keeps other workers off the rows during dispatch is
@@ -342,7 +361,9 @@ def _claim_batch(conn: psycopg2.extensions.connection) -> List[psycopg2.extras.R
     global _rr_after
     with _tx(conn, _ledger.ALL_ORGS) as cur:
         cur.execute(_CLAIM_SQL, {"batch_size": WORKER_BATCH_SIZE,
-                                 "lease": WORKER_LEASE_SECONDS, "after": _rr_after})
+                                 "lease": WORKER_LEASE_SECONDS, "after": _rr_after,
+                                 "skip": list(skip),
+                                 "max_orgs": WORKER_BATCH_SIZE if max_orgs is None else max_orgs})
         rows = cur.fetchall()
     served = [r["org_id"] for r in rows if r["rn"] == 1]
     if served:
@@ -437,6 +458,30 @@ def _dispatch_tenant(rows: List[psycopg2.extras.RealDictRow]) -> List[_Outcome]:
     return outcomes
 
 
+def _record_outcomes(conn: psycopg2.extensions.connection, outcomes: List[_Outcome]) -> int:
+    """Commit outcomes on the connection-owning thread; returns how many were delivered.
+
+    Consumes the list as it goes, so a caller that retries after a database error resumes
+    at the first outcome that was not committed instead of recording any twice.
+    """
+    sent = 0
+    while outcomes:
+        row, kind, error = outcomes[0]
+        if kind == "released":
+            _release_row(conn, row)
+        elif kind == "failed":
+            log.warning(
+                "dispatch_failed id=%s transaction_id=%s attempts=%d error=%s",
+                row["id"], row["transaction_id"], row["attempts"] + 1, error,
+            )
+            _finish_row(conn, row, error)
+        else:
+            _finish_row(conn, row, None)
+            sent += 1
+        outcomes.pop(0)
+    return sent
+
+
 def drain_batch(conn: psycopg2.extensions.connection) -> int:
     """
     Claim a batch, dispatch it with no transaction open, commit each row's outcome.
@@ -477,21 +522,7 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
         by_org.setdefault(row["org_id"], []).append(row)
 
     def record(outcomes: List[_Outcome]) -> int:
-        """Commit one tenant's outcomes on this thread; returns how many were delivered."""
-        sent = 0
-        for row, kind, error in outcomes:
-            if kind == "released":
-                _release_row(conn, row)
-            elif kind == "failed":
-                log.warning(
-                    "dispatch_failed id=%s transaction_id=%s attempts=%d error=%s",
-                    row["id"], row["transaction_id"], row["attempts"] + 1, error,
-                )
-                _finish_row(conn, row, error)
-            else:
-                _finish_row(conn, row, None)
-                sent += 1
-        return sent
+        return _record_outcomes(conn, outcomes)
 
     dispatched = 0
     t0 = time.monotonic()
@@ -521,58 +552,191 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
     return dispatched
 
 
+class _TenantTask:
+    """One tenant's claimed rows, dispatching on a pool thread."""
+
+    def __init__(self, org_id: str, rows: List[psycopg2.extras.RealDictRow], future: "Future") -> None:
+        self.org_id = org_id
+        self.rows = rows
+        self.future = future
+        self.started = time.monotonic()
+        self.outcomes: Optional[List[_Outcome]] = None   # taken from the future once done
+
+
+class _Dispatcher:
+    """Continuous dispatch for run_loop: tasks outlive a poll.
+
+    drain_batch is one synchronous round and waits for every tenant task it started. In
+    the polling loop that meant a tenant trickling bytes held the NEXT claim back for its
+    whole 15 s deadline: rows another tenant received meanwhile waited, and since the
+    rotation gives the slow tenant a slot in every claim, each batch lasted one deadline
+    (reproduced against the compose stack: 10 fast-tenant rows delivered after 15.2 s).
+    Here each poll, on the thread that owns the connection:
+      1. records the tasks that have finished (never blocks on one that has not),
+      2. claims rows for tenants with NO task in flight, at most as many tenants as free
+         slots (WORKER_DISPATCH_CONCURRENCY minus tasks in flight),
+      3. submits one task per newly claimed tenant.
+    A tenant therefore never has two tasks at once (its rows stay serial and in id
+    order), and a slow tenant occupies one slot instead of the whole worker. Pool threads
+    do HTTP only; every database call happens in poll() / finish().
+
+    Lease: claims are limited to free slots, so a claimed task starts at once and runs at
+    most (its rows) x DISPATCH_DEADLINE_SECONDS, within the lease default.
+    """
+
+    def __init__(self) -> None:
+        self._slots = WORKER_DISPATCH_CONCURRENCY
+        self._pool = ThreadPoolExecutor(max_workers=self._slots, thread_name_prefix="dispatch")
+        self._tasks: Dict[str, _TenantTask] = {}
+
+    @property
+    def in_flight(self) -> int:
+        return len(self._tasks)
+
+    def _collect(self, conn: psycopg2.extensions.connection, block: bool = False) -> int:
+        """Record every finished task. Returns the rows delivered plus rows released/failed."""
+        handled = 0
+        for org_id, task in list(self._tasks.items()):
+            if task.outcomes is None:
+                if not task.future.done():
+                    continue
+                try:
+                    task.outcomes = task.future.result()
+                except Exception as exc:
+                    # _dispatch_tenant catches per-row errors, so this is a bug in the
+                    #     task itself. Dropping the task frees the tenant; its rows are
+                    #     redelivered once their lease expires (at-least-once).
+                    log.error("dispatch_task_crashed org_id=%s error=%s", org_id, exc)
+                    del self._tasks[org_id]
+                    continue
+            n = len(task.outcomes)
+            sent = _record_outcomes(conn, task.outcomes)   # raises with the rest kept in place
+            del self._tasks[org_id]
+            handled += n
+            if sent:
+                log.info(
+                    "dispatched=%d lag_ms=%d oldest_id=%d newest_id=%d",
+                    sent, int((time.monotonic() - task.started) * 1000),
+                    task.rows[0]["id"], task.rows[-1]["id"],
+                )
+        return handled
+
+    def _claim(self, conn: psycopg2.extensions.connection) -> int:
+        free = self._slots - len(self._tasks)
+        if _stop or free <= 0:
+            return 0
+        rows = _claim_batch(conn, skip=list(self._tasks), max_orgs=free)
+        by_org: Dict[str, List[psycopg2.extras.RealDictRow]] = {}
+        for row in rows:                   # rows are sorted by id: each list keeps id order
+            by_org.setdefault(row["org_id"], []).append(row)
+        for org_id, org_rows in by_org.items():
+            self._tasks[org_id] = _TenantTask(
+                org_id, org_rows, self._pool.submit(_dispatch_tenant, org_rows))
+        return len(rows)
+
+    def poll(self, conn: psycopg2.extensions.connection) -> bool:
+        """One round on the connection-owning thread. True when it recorded or claimed."""
+        handled = self._collect(conn)
+        claimed = self._claim(conn)
+        return bool(handled or claimed)
+
+    def wait(self, seconds: float) -> None:
+        """Idle until a task finishes, `seconds` pass or the worker is told to stop."""
+        deadline = time.monotonic() + seconds
+        while not _stop:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            futures = [t.future for t in self._tasks.values() if t.outcomes is None]
+            if futures:
+                done, _ = wait(futures, timeout=min(0.5, left), return_when=FIRST_COMPLETED)
+                if done:
+                    return
+            else:
+                time.sleep(min(0.5, left))
+
+    def finish(self, conn: psycopg2.extensions.connection, timeout: float) -> None:
+        """Shutdown: claim nothing more, let in-flight tasks end, record what they report.
+
+        Each task stops at its current row's deadline and reports the rest "released"
+        (it reads _stop between rows), so this waits about one dispatch deadline, inside
+        the container's stop_grace_period. A task still running after `timeout` is left:
+        its rows are redelivered once the lease expires.
+        """
+        try:
+            wait([t.future for t in self._tasks.values() if t.outcomes is None], timeout=timeout)
+            self._collect(conn)
+        finally:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+
+
 # ---------------------------------------------------------------------------
 # Main run loop
 # ---------------------------------------------------------------------------
 
 def run_loop(conn: psycopg2.extensions.connection) -> None:
     """
-    Infinite polling loop. Drains outbox until empty, then sleeps. Prunes old
-    DUPLICATE DLQ rows at most once per hour. Reconnects with exponential backoff on DB errors.
+    Infinite polling loop. Each poll records finished dispatch tasks and claims rows for
+    tenants not already in flight (see _Dispatcher), so a slow tenant never holds back the
+    others; sleeps only when a poll found nothing to do. Prunes old DUPLICATE DLQ rows at
+    most once per hour. Reconnects with exponential backoff on DB errors; tasks in flight
+    keep running and are recorded on the new connection.
     """
     backoff: float = 5.0
     last_prune: float = 0.0          # monotonic ts of last DLQ prune (0 → prune on first cycle)
     prune_interval: float = 3600.0   # prune DUPLICATE DLQ rows at most once per hour
 
-    while not _stop:
+    dispatcher = _Dispatcher()
+    try:
+        while not _stop:
+            try:
+                progressed = dispatcher.poll(conn)
+                retried = _ledger.retry_dlq_batch(conn)
+                now = time.monotonic()
+                if now - last_prune >= prune_interval:
+                    deleted = _ledger.prune_dlq(conn)
+                    last_prune = now
+                    if deleted:
+                        log.info("dlq_pruned deleted=%d reason=DUPLICATE older_than_days=90", deleted)
+                backoff = 5.0  # reset on success
+                if not progressed and retried == 0:
+                    # Nothing recorded, claimed or retried: wait for the poll interval, or
+                    #     for a task to finish (so its outcome is recorded promptly), in
+                    #     small slices so SIGTERM is handled quickly. With work just claimed
+                    #     or recorded the loop polls again at once.
+                    log.debug("queue_empty — waiting up to %.0fs (%d tenants in flight)",
+                              WORKER_POLL_INTERVAL, dispatcher.in_flight)
+                    dispatcher.wait(WORKER_POLL_INTERVAL)
+            except psycopg2.OperationalError as exc:
+                log.error("db_error retrying in %.0fs: %s", backoff, exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+                # B1: keep trying until we actually get a new connection.
+                # The old `except: pass` left conn pointing at the broken connection,
+                # causing an infinite tight loop of immediate failures.
+                new_conn = None
+                while new_conn is None and not _stop:
+                    try:
+                        new_conn = _connect()
+                        log.info("reconnected to database")
+                    except psycopg2.OperationalError as reconnect_exc:
+                        log.error("reconnect_failed retrying in %.0fs: %s", backoff, reconnect_exc)
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, 60.0)
+                if new_conn is not None:
+                    conn = new_conn
+            except Exception as exc:
+                log.error("unexpected_error retrying in %.0fs: %s", backoff, exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+    finally:
+        # SIGTERM (or any exit): in-flight tenant tasks stop after their current row,
+        #     report the rest as released, and are recorded here on the connection. The
+        #     wait is bounded by one dispatch deadline, inside stop_grace_period.
         try:
-            count = drain_batch(conn)
-            retried = _ledger.retry_dlq_batch(conn)
-            now = time.monotonic()
-            if now - last_prune >= prune_interval:
-                deleted = _ledger.prune_dlq(conn)
-                last_prune = now
-                if deleted:
-                    log.info("dlq_pruned deleted=%d reason=DUPLICATE older_than_days=90", deleted)
-            backoff = 5.0  # reset on success
-            if count == 0 and retried == 0:
-                log.debug("queue_empty — sleeping %.0fs", WORKER_POLL_INTERVAL)
-                # Sleep in small increments so SIGTERM is handled quickly.
-                deadline = time.monotonic() + WORKER_POLL_INTERVAL
-                while time.monotonic() < deadline and not _stop:
-                    time.sleep(0.5)
-        except psycopg2.OperationalError as exc:
-            log.error("db_error retrying in %.0fs: %s", backoff, exc)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
-            # B1: keep trying until we actually get a new connection.
-            # The old `except: pass` left conn pointing at the broken connection,
-            # causing an infinite tight loop of immediate failures.
-            new_conn = None
-            while new_conn is None and not _stop:
-                try:
-                    new_conn = _connect()
-                    log.info("reconnected to database")
-                except psycopg2.OperationalError as reconnect_exc:
-                    log.error("reconnect_failed retrying in %.0fs: %s", backoff, reconnect_exc)
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 60.0)
-            if new_conn is not None:
-                conn = new_conn
+            dispatcher.finish(conn, DISPATCH_DEADLINE_SECONDS + 5)
         except Exception as exc:
-            log.error("unexpected_error retrying in %.0fs: %s", backoff, exc)
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60.0)
+            log.error("shutdown_record_failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

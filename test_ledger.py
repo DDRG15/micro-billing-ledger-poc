@@ -4921,6 +4921,169 @@ finally:
 
 
 # =============================================================================
+# C6-29: a slow tenant's task in flight does not delay claiming the other tenants
+#     C6-22 fixed dispatch inside one batch, but drain_batch still waited for EVERY tenant
+#     task before returning, so the polling loop could not claim again until the slowest
+#     tenant hit its 15 s deadline. Live: a tenant trickling bytes, then 10 rows for
+#     another tenant, delivered only after 15.2 s; and since the rotation gives the slow
+#     tenant a slot in every claim, every batch lasted one deadline. The dispatcher keeps
+#     tasks across polls, claims only tenants with no task in flight, records finished
+#     tasks without waiting for the others, and releases unsent rows on SIGTERM.
+# =============================================================================
+print("\n── C6-29: continuous dispatch; slow tenant in flight, others still served ─")
+
+c629 = fresh_conn()
+with c629.cursor() as _c:
+    for _o in ("c629_slow", "c629_fast"):
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,'whsec_t')",
+                   (_o, _o))
+_orig_629 = (W._dispatch_row, W.WORKER_BATCH_SIZE, W.WORKER_DISPATCH_CONCURRENCY, W._rr_after,
+             W._stop)
+W.WORKER_BATCH_SIZE, W.WORKER_DISPATCH_CONCURRENCY, W._rr_after = 10, 8, ""
+_hold_629, _slow_in_629 = threading.Event(), threading.Event()
+_active_629, _max_active_629, _done_629 = {}, {}, []
+_lock_629 = threading.Lock()
+
+
+def _dispatch_629(row, destination=None):
+    _o = row["org_id"]
+    with _lock_629:
+        _active_629[_o] = _active_629.get(_o, 0) + 1
+        _max_active_629[_o] = max(_max_active_629.get(_o, 0), _active_629[_o])
+    try:
+        if _o.endswith("_slow"):
+            _slow_in_629.set()
+            _hold_629.wait(4)               # the downstream is trickling
+    finally:
+        with _lock_629:
+            _active_629[_o] -= 1
+            _done_629.append((_o, row["id"]))
+
+
+def _state_629(org):
+    return _q1(c629, "SELECT COUNT(*) FROM outbox WHERE org_id=%s AND dispatched=1", (org,))
+
+
+def _poll_until_629(disp, cond, seconds=3.0):
+    """Poll (no waiting on the poll interval) until cond() holds; returns the poll count."""
+    _n, _end = 0, time.monotonic() + seconds
+    while time.monotonic() < _end:
+        disp.poll(c629)
+        _n += 1
+        if cond():
+            break
+        time.sleep(0.02)
+    return _n
+
+
+W._dispatch_row = _dispatch_629
+_d629 = W._Dispatcher()
+try:
+    L.process_stripe_event_batch(c629, [fake_event(eid=f"evt_c629_slow_{_i}") for _i in range(2)],
+                                 org_id="c629_slow")
+    _d629.poll(c629)
+    chk("the slow tenant's task starts and stays in flight",
+        _slow_in_629.wait(3) and _d629.in_flight == 1, str(_d629.in_flight))
+    # Rows that arrive AFTER the slow task started: five for the fast tenant, one more
+    #     for the slow tenant (which must wait for its in-flight task, not start a second).
+    L.process_stripe_event_batch(c629, [fake_event(eid=f"evt_c629_fast_{_i}") for _i in range(5)],
+                                 org_id="c629_fast")
+    L.process_stripe_event_batch(c629, [fake_event(eid="evt_c629_slow_late")], org_id="c629_slow")
+    _t0_629 = time.monotonic()
+    _polls_629 = _poll_until_629(_d629, lambda: _state_629("c629_fast") == 5)
+    chk("the fast tenant is delivered and recorded while the slow task is still in flight",
+        _state_629("c629_fast") == 5 and _state_629("c629_slow") == 0
+        and not _hold_629.is_set() and time.monotonic() - _t0_629 < 2.5,
+        f"fast={_state_629('c629_fast')} slow={_state_629('c629_slow')} "
+        f"after {time.monotonic() - _t0_629:.1f}s, {_polls_629} polls")
+    chk("…within a few polls, none of which waited for the slow tenant", _polls_629 <= 10,
+        str(_polls_629))
+    _late = _q1(c629, "SELECT claimed_until IS NULL AND dispatched = 0 FROM outbox "
+                      "WHERE transaction_id='evt_c629_slow_late'")
+    chk("the slow tenant's new row is not claimed while its task is in flight", _late is True,
+        str(_late))
+    _hold_629.set()
+    _poll_until_629(_d629, lambda: _state_629("c629_slow") == 3 and _d629.in_flight == 0)
+    chk("once the slow task ends its rows are recorded; the late row follows in a new task",
+        _state_629("c629_slow") == 3 and _d629.in_flight == 0, str(_state_629("c629_slow")))
+    chk("a tenant never has two tasks dispatching at once",
+        _max_active_629 == {"c629_slow": 1, "c629_fast": 1}, str(_max_active_629))
+    _slow_ids = [_i for _o, _i in _done_629 if _o == "c629_slow"]
+    chk("…and its rows went out in id order across the two tasks",
+        len(_slow_ids) == 3 and _slow_ids == sorted(_slow_ids), str(_slow_ids))
+
+    # SIGTERM while a task is mid-row: the row in flight finishes, the unsent rows come
+    #     back untried (lease cleared, no attempt counted), and nothing new is claimed.
+    _hold_629.clear()
+    _slow_in_629.clear()
+    L.process_stripe_event_batch(c629, [fake_event(eid=f"evt_c629_term_{_i}") for _i in range(3)],
+                                 org_id="c629_slow")
+    _d629.poll(c629)
+    _slow_in_629.wait(3)
+    W._stop = True
+    L.process_stripe_event_batch(c629, [fake_event(eid="evt_c629_after_stop")], org_id="c629_fast")
+    _d629.poll(c629)
+    _hold_629.set()
+    _d629.finish(c629, 5)
+    with c629.cursor() as _c:
+        _c.execute("SELECT COUNT(*) FILTER (WHERE dispatched = 1), "
+                   "COUNT(*) FILTER (WHERE dispatched = 0 AND claimed_until IS NULL "
+                   "AND attempts = 0) FROM outbox WHERE transaction_id LIKE 'evt_c629_term_%'")
+        _term_629 = _c.fetchone()
+    chk("SIGTERM: the row in flight finishes; the two unsent rows are released untried",
+        _term_629 == (1, 2), str(_term_629))
+    _after = _q1(c629, "SELECT claimed_until IS NULL AND dispatched = 0 FROM outbox "
+                       "WHERE transaction_id='evt_c629_after_stop'")
+    chk("…and a row that arrives once stopping has begun is not claimed", _after is True,
+        str(_after))
+
+    # The same through run_loop itself (its own connection, a real stop): a new tenant's
+    #     rows are delivered while the slow task is mid-row, and stopping releases the rest.
+    _hold_629.clear()
+    _slow_in_629.clear()
+    _orig_poll_629 = W.WORKER_POLL_INTERVAL
+    W._stop, W.WORKER_POLL_INTERVAL = False, 0.2
+    with c629.cursor() as _c:
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES "
+                   "('c629_loop_slow','x','whsec_t'), ('c629_loop_fast','x','whsec_t')")
+    L.process_stripe_event_batch(c629, [fake_event(eid=f"evt_c629_ls_{_i}") for _i in range(3)],
+                                 org_id="c629_loop_slow")
+    _loop_conn_629 = W._connect()
+    _loop_629 = threading.Thread(target=W.run_loop, args=(_loop_conn_629,), name="c629-loop")
+    _loop_629.start()
+    try:
+        _slow_in_629.wait(3)
+        L.process_stripe_event_batch(c629, [fake_event(eid=f"evt_c629_lf_{_i}") for _i in range(3)],
+                                     org_id="c629_loop_fast")
+        _end_629 = time.monotonic() + 3
+        while time.monotonic() < _end_629 and _state_629("c629_loop_fast") < 3:
+            time.sleep(0.05)
+        chk("run_loop delivers a new tenant's rows while another tenant's task is mid-row",
+            _state_629("c629_loop_fast") == 3 and _state_629("c629_loop_slow") == 0,
+            f"fast={_state_629('c629_loop_fast')} slow={_state_629('c629_loop_slow')}")
+    finally:
+        W._stop = True
+        _hold_629.set()
+        _loop_629.join(15)
+        W._stop, W.WORKER_POLL_INTERVAL = False, _orig_poll_629
+        _loop_conn_629.close()
+    with c629.cursor() as _c:
+        _c.execute("SELECT COUNT(*) FILTER (WHERE dispatched = 1), "
+                   "COUNT(*) FILTER (WHERE dispatched = 0 AND claimed_until IS NULL "
+                   "AND attempts = 0) FROM outbox WHERE transaction_id LIKE 'evt_c629_ls_%'")
+        _loop_state_629 = _c.fetchone()
+    chk("…and on stop run_loop exits after recording: one row sent, two released untried",
+        not _loop_629.is_alive() and _loop_state_629 == (1, 2),
+        f"alive={_loop_629.is_alive()} state={_loop_state_629}")
+finally:
+    _hold_629.set()
+    (W._dispatch_row, W.WORKER_BATCH_SIZE, W.WORKER_DISPATCH_CONCURRENCY, W._rr_after,
+     W._stop) = _orig_629
+    _d629._pool.shutdown(wait=True, cancel_futures=True)
+    c629.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================
