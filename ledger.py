@@ -511,7 +511,15 @@ class DLQReason(str, Enum):
     """
     DUPLICATE    = "DUPLICATE"     # Stripe retry of already-processed event
     INVALID      = "INVALID"       # Failed Pydantic validation — bad structure or business rule
-    UNKNOWN_TYPE = "UNKNOWN_TYPE"  # Reserved — currently caught as INVALID by Pydantic enum
+    UNKNOWN_TYPE = "UNKNOWN_TYPE"  # Reserved, never written — see UNSUPPORTED
+    # A well-formed event of a type this ledger does not record (charge.succeeded,
+    #     payment_intent.succeeded, checkout.session.completed ...). A Stripe account
+    #     sends many types the webhook endpoint never asked for, and each one used to
+    #     land as INVALID with status 'pending': counted in dlq_depth, the "something is
+    #     wrong" alarm, and never pruned. Nothing is wrong and nothing can be done with
+    #     such an event, so it is stored for visibility with status 'resolved' (not
+    #     actionable, not retried, 409 on manual retry) and aged out like DUPLICATE.
+    UNSUPPORTED  = "UNSUPPORTED"
     # TRANSIENT is the only reason the retry worker auto-processes. It is wired and tested
     #     but has no production trigger today: single-event DB failures return HTTP 503 so
     #     Stripe itself retries, and batch failures roll back atomically. It is provisioned
@@ -847,7 +855,7 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
     Three tables:
     - ledger: financial record — transaction_id TEXT PRIMARY KEY = idempotency guard
     - outbox: pending downstream delivery — dispatched=0 means not yet forwarded
-    - dlq: rejected events — DUPLICATE, INVALID, or UNKNOWN_TYPE
+    - dlq: rejected events — DUPLICATE, INVALID, UNSUPPORTED or TRANSIENT
     """
     conn = psycopg2.connect(dsn)
     # autocommit=True so DDL (CREATE TABLE) and reads execute outside any transaction.
@@ -1031,6 +1039,12 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
                 END IF;
             END $$
         """)
+        # uq_dlq_one_unsupported_per_event (migration 0011): same rule for UNSUPPORTED rows.
+        #     No existing rows to remove: the reason is new.
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_dlq_one_unsupported_per_event
+            ON dlq (org_id, transaction_id) WHERE reason = 'UNSUPPORTED'
+        """)
         # idx_dlq_stale_claim — covers the reclaim half of the retry_dlq_batch WHERE
         # clause: status='retrying' AND claim older than the timeout. Mirrors 0003.
         cur.execute("""
@@ -1095,6 +1109,8 @@ def _tx(conn: "psycopg2.extensions.connection",
 #     dict[EventType, LedgerStatus] means mypy enforces that every EventType
 #     has a corresponding status — a missing entry is a type error, not a
 #     silent KeyError at runtime.
+_SUPPORTED_EVENT_TYPES: frozenset = frozenset(t.value for t in EventType)
+
 _STATUS_MAP: dict[EventType, LedgerStatus] = {
     EventType.INVOICE_PAID:   LedgerStatus.POSTED,     # Revenue confirmed
     EventType.INVOICE_FAILED: LedgerStatus.VOID,       # Payment failed, recorded at amount_due
@@ -1109,7 +1125,27 @@ _STATUS_MAP: dict[EventType, LedgerStatus] = {
 #     LIFECYCLE to the status map alone would have let a replayed subscription event
 #     reach the ledger while its DLQ entry went on retrying — the ledger and the DLQ
 #     each telling a different story about the same event.
-_RESOLVING_OUTCOMES: frozenset = frozenset({s.value for s in LedgerStatus} | {"DLQ_DUPLICATE"})
+#     UNSUPPORTED settles an entry as well: a row written as INVALID before that outcome
+#     existed (a charge.succeeded from an earlier run) replays to UNSUPPORTED, and
+#     leaving it pending would keep it in dlq_depth forever with nothing left to try.
+_RESOLVING_OUTCOMES: frozenset = frozenset(
+    {s.value for s in LedgerStatus} | {"DLQ_DUPLICATE", "UNSUPPORTED"})
+
+
+def _unsupported_event_type(event: dict) -> Optional[str]:
+    """The event's type if it is a well-formed event of a type this ledger does not record.
+
+    Returns None for everything else, including supported types and events whose
+    envelope is broken (no usable id, no string type): those stay INVALID, because that
+    is a malformed sender, not a Stripe event type we chose not to handle. An event with
+    a supported type and a bad body is likewise INVALID: only the TYPE decides.
+    """
+    etype = event.get("type")
+    eid = event.get("id")
+    if (isinstance(etype, str) and etype and etype not in _SUPPORTED_EVENT_TYPES
+            and isinstance(eid, str) and _EVENT_ID_RE.fullmatch(eid)):
+        return etype
+    return None
 
 
 def process_stripe_event(
@@ -1144,9 +1180,28 @@ def process_stripe_event(
       LIFECYCLE  — new customer.subscription.*, written with no amount
       DLQ_INVALID    — Pydantic validation failed; event in DLQ
       DLQ_DUPLICATE  — already processed; idempotency guard fired; event in DLQ
+      UNSUPPORTED    — well-formed event of a type the ledger does not record; kept in
+                       the DLQ as a resolved row (not counted in dlq_depth)
     Neither outcome writes a new DLQ row when from_retry is True.
     """
     now = datetime.now(timezone.utc)
+
+    # ── Unsupported type: recorded for visibility, never an error ────────────
+    # Checked before validation, which would reject it as INVALID. Answered 200 like
+    #     every other terminal outcome: a non-2xx would make Stripe redeliver an event
+    #     we will never act on. The row is audit-only, so a failed write is logged (with
+    #     the payload, by _write_dlq) and the answer stays 200, as for DUPLICATE.
+    unsupported = _unsupported_event_type(event)
+    if unsupported is not None:
+        if not from_retry:
+            _write_dlq(conn, DLQEntry(
+                org_id=org_id, transaction_id=event["id"], reason=DLQReason.UNSUPPORTED,
+                raw_payload=event, status=DLQStatus.RESOLVED))
+        return {
+            "outcome":        "UNSUPPORTED",
+            "transaction_id": event["id"],
+            "reason":         f"Event type not supported: {unsupported}",
+        }
 
     # ── LAYER 1: Pydantic Validation ─────────────────────────────────────────
     # StripeEvent(**event) runs all Field constraints AND all @model_validators.
@@ -1573,11 +1628,13 @@ def prune_dlq(
     conn: "psycopg2.extensions.connection",
     retention_days: int = 90,
 ) -> int:
-    """Delete DUPLICATE DLQ rows older than retention_days. Returns rows deleted.
+    """Delete DUPLICATE and UNSUPPORTED DLQ rows older than retention_days. Returns rows deleted.
 
     Without retention the dlq table grows without bound: Stripe's at-least-once
     redelivery writes a DUPLICATE row per replayed event, and at 500 TPS even a small
     duplicate rate is millions of audit-only rows per day. Those rows are safe to age out.
+    UNSUPPORTED rows are the same kind of row: a Stripe account sends event types the
+    ledger never records, one row each, with nothing left to do.
     INVALID and exhausted entries are NEVER pruned — they need human review and stay until
     an operator resolves them.
 
@@ -1590,9 +1647,9 @@ def prune_dlq(
     with _tx(conn, ALL_ORGS) as cur:
         cur.execute(
             "DELETE FROM dlq "
-            "WHERE reason = %s "
+            "WHERE reason = ANY(%s) "
             "  AND received_at < NOW() - make_interval(days => %s)",
-            (DLQReason.DUPLICATE.value, retention_days),
+            ([DLQReason.DUPLICATE.value, DLQReason.UNSUPPORTED.value], retention_days),
         )
         return cur.rowcount
 
@@ -1659,6 +1716,20 @@ def process_stripe_event_batch(
     #     on the exception path. Separating validation from the transaction means the DB
     #     sees only structurally correct, business-rule-valid data. The hot path stays hot.
     for idx, event in enumerate(events):
+        unsupported = _unsupported_event_type(event)
+        if unsupported is not None:
+            # Same rule as process_stripe_event: a resolved audit row, not an error.
+            invalid_dlq_rows.append(
+                DLQEntry(org_id=org_id, transaction_id=event["id"],
+                         reason=DLQReason.UNSUPPORTED, raw_payload=event,
+                         status=DLQStatus.RESOLVED).to_db()
+            )
+            results[idx] = {
+                "outcome":        "UNSUPPORTED",
+                "transaction_id": event["id"],
+                "reason":         f"Event type not supported: {unsupported}",
+            }
+            continue
         try:
             validated = StripeEvent(**event)
         except ValidationError as e:

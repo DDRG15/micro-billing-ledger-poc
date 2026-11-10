@@ -297,8 +297,12 @@ chk("event type 'invoice.paid' → POSTED",       r["outcome"] == "POSTED")
 
 ev_invalid_type = fake_event(eid="evt_bad_type", etype="payment.created")
 r = L.process_stripe_event(conn, ev_invalid_type)
-chk("event type 'payment.created' → DLQ_INVALID",
-    r["outcome"] == "DLQ_INVALID", f"got {r['outcome']}")
+# Since C6-28 a well-formed event of a type the ledger does not record is UNSUPPORTED
+#     (a resolved audit row), not INVALID; either way it never reaches the ledger.
+chk("event type 'payment.created' → UNSUPPORTED, not ledgered",
+    r["outcome"] == "UNSUPPORTED"
+    and _q1(conn, "SELECT COUNT(*) FROM ledger WHERE transaction_id='evt_bad_type'") == 0,
+    f"got {r['outcome']}")
 
 
 print("\n── Phase 1: Missing Required Fields ───────────────────────────────────")
@@ -366,8 +370,8 @@ r = L.process_stripe_event(conn2, {"id": "", "type": "invoice.paid", "data": {}}
 chk("empty id → DLQ_INVALID",                  r["outcome"] == "DLQ_INVALID")
 
 r = L.process_stripe_event(conn2, fake_event(eid="evt_x", etype="payment.created"))
-chk("unknown type → DLQ_INVALID",              r["outcome"] == "DLQ_INVALID",
-    f"got {r['outcome']} instead of DLQ_INVALID")
+chk("unknown type → UNSUPPORTED (was DLQ_INVALID before C6-28)", r["outcome"] == "UNSUPPORTED",
+    f"got {r['outcome']} instead of UNSUPPORTED")
 
 dlq_count = _q1(conn2, "SELECT COUNT(*) FROM dlq")
 chk("DLQ has 2 rows",                           dlq_count == 2)
@@ -897,8 +901,8 @@ L.process_stripe_event(dlq_conn, fake_event(eid="evt_dlq_3", customer=""))
 rows = _qall(dlq_conn, "SELECT transaction_id, reason, raw_payload FROM dlq ORDER BY id")
 
 chk("DLQ has 3 rows",                           len(rows) == 3,   f"got {len(rows)}")
-chk("all 3 reasons are INVALID",
-    all(r[1] == "INVALID" for r in rows))
+chk("reasons are INVALID, UNSUPPORTED (charge.refunded, since C6-28), INVALID",
+    [r[1] for r in rows] == ["INVALID", "UNSUPPORTED", "INVALID"], str([r[1] for r in rows]))
 chk("raw_payload is a JSON string",
     all(isinstance(r[2], str) for r in rows))
 
@@ -1528,13 +1532,15 @@ chk("dlq.claimed_at exists (migration 0003 / _bootstrap parity)",
         "SELECT COUNT(*) FROM information_schema.columns "
         "WHERE table_name='dlq' AND column_name='claimed_at'") == 1)
 
+# The payloads are an invoice.paid with no data: INVALID on every replay. A type the
+#     ledger does not record would replay to UNSUPPORTED (C6-28), which settles the row.
 with claim_conn.cursor() as c:
     c.execute("BEGIN")
     for i in range(3):
         c.execute(
             "INSERT INTO dlq (transaction_id, reason, raw_payload, status, retry_count, max_retries) "
             "VALUES (%s, %s, %s, 'pending', 0, 3)",
-            (f"evt_claim_{i}", "TRANSIENT", json.dumps({"id": f"evt_claim_{i}", "type": "bogus.type"})),
+            (f"evt_claim_{i}", "TRANSIENT", json.dumps({"id": f"evt_claim_{i}", "type": "invoice.paid"})),
         )
     c.execute("COMMIT")
 
@@ -2366,7 +2372,7 @@ if app_conn is not None:
         #     branch builds a DLQ row directly, so it gets asserted rather than assumed.
         _batch = L.process_stripe_event_batch(
             app_conn,
-            [fake_event(eid="evt_rls_q2", amount=500), {"id": "evt_rls_bad", "type": "nope"}],
+            [fake_event(eid="evt_rls_q2", amount=500), {"id": "evt_rls_bad", "type": "invoice.paid"}],
             org_id="rlsapp_q",
         )
         chk("the batch path writes under RLS",
@@ -4772,6 +4778,146 @@ chk("…and INVALID rows (not subject to the index) are untouched",
 chk("…and the unique index exists again",
     _q1(c627, "SELECT COUNT(*) FROM pg_indexes WHERE indexname='uq_dlq_one_duplicate_per_event'") == 1)
 c627.close()
+
+
+# =============================================================================
+# C6-28: event types the ledger does not record are UNSUPPORTED, not INVALID
+#     A real Stripe account sends many types the endpoint never asked for
+#     (charge.succeeded, payment_intent.succeeded, checkout.session.completed ...). Each
+#     landed in the DLQ as INVALID with status 'pending': counted in dlq_depth, the
+#     "something is wrong" alarm, and never pruned. They now get their own outcome and
+#     reason, UNSUPPORTED: answered 200, visible in /dlq/entries, stored as a resolved
+#     row so dlq_depth and `actionable` ignore it, and aged out by prune_dlq.
+# =============================================================================
+print("\n── C6-28: UNSUPPORTED event types are visible, quiet and pruned ─────────")
+
+c628 = fresh_conn()
+_SEC_C628 = "whsec_c628_signing_secret"
+with c628.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+               ("c628", "c628", _SEC_C628))
+_orig_pool_628 = L._pool
+_orig_key_628 = (L.BILLING_API_KEY, L._ANY_ORG_KEYS)
+L._pool = _MockPool(c628)
+L._limiter.reset()
+_TYPES_628 = ["charge.succeeded", "payment_intent.succeeded", "checkout.session.completed"]
+try:
+    _cl628 = TestClient(L.app, raise_server_exceptions=False)
+    _res628 = []
+    for _i, _t in enumerate(_TYPES_628):
+        _ev = {"id": f"evt_c628_{_i}", "type": _t, "object": "event", "livemode": False,
+               "data": {"object": {"id": f"obj_{_i}", "object": _t.split(".")[0], "amount": 4900}}}
+        _res628.append(_post_raw(_cl628, "/webhook/stripe/c628", json.dumps(_ev), _SEC_C628))
+    chk("three unsupported Stripe types → 200 with outcome UNSUPPORTED",
+        all(r.status_code == 200 and r.json().get("outcome") == "UNSUPPORTED" for r in _res628),
+        str([(r.status_code, r.text[:80]) for r in _res628]))
+    chk("…the reason names the type",
+        "charge.succeeded" in _res628[0].json().get("reason", ""), _res628[0].text)
+    chk("…none reached the ledger or the outbox",
+        _q1(c628, "SELECT COUNT(*) FROM ledger WHERE org_id='c628'") == 0
+        and _q1(c628, "SELECT COUNT(*) FROM outbox WHERE org_id='c628'") == 0)
+    _rows628 = _qall(c628, "SELECT reason, status, max_retries, raw_payload FROM dlq "
+                           "WHERE org_id='c628' ORDER BY id")
+    chk("…each is a DLQ row: reason UNSUPPORTED, status resolved, never retried",
+        len(_rows628) == 3 and all(r[:3] == ("UNSUPPORTED", "resolved", 0) for r in _rows628),
+        str([r[:3] for r in _rows628]))
+    chk("…with the full payload kept",
+        json.loads(_rows628[0][3]).get("livemode") is False and json.loads(_rows628[0][3])["data"]["object"]["amount"] == 4900)
+
+    # Operator views: the whole point is that these do not look like trouble.
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS = "", False
+    L._DLQ_DEPTH.set(-1)
+    _m628 = _cl628.get("/metrics").text
+    chk("dlq_depth gauge stays 0 (not an alarm)", "dlq_depth 0.0" in _m628, "dlq_depth missing or non-zero")
+    chk("dlq_total counts them as audit rows", "dlq_total 3.0" in _m628)
+    chk("webhook_events_total carries an UNSUPPORTED outcome label",
+        'webhook_events_total{outcome="UNSUPPORTED"}' in _m628)
+
+    # /ledger/summary and /dlq/entries are scoped to the default org: replay under it.
+    for _i, _t in enumerate(_TYPES_628):
+        _r = L.process_stripe_event(c628, {"id": f"evt_c628_d{_i}", "type": _t, "data": {"object": {}}})
+        chk(f"default-org seed event {_i} → UNSUPPORTED", _r["outcome"] == "UNSUPPORTED", str(_r))
+    _sum628 = _cl628.get("/ledger/summary").json()
+    chk("/ledger/summary: dlq_depth 0, dlq_total 3 (default org)",
+        _sum628["dlq_depth"] == 0 and _sum628["dlq_total"] == 3, str(_sum628))
+    _all628 = _cl628.get("/dlq/entries").json()["entries"]
+    chk("/dlq/entries lists them with reason UNSUPPORTED",
+        len(_all628) == 3 and {e["reason"] for e in _all628} == {"UNSUPPORTED"}, str(_all628)[:200])
+    chk("…but ?status=actionable does not",
+        _cl628.get("/dlq/entries?status=actionable").json()["entries"] == [])
+
+    # A genuinely broken event is still the alarm it always was.
+    L.process_stripe_event(c628, {"id": "evt_c628_bad", "type": "invoice.paid", "data": {}})
+    chk("a supported type with a broken body is still INVALID and counted",
+        _cl628.get("/ledger/summary").json()["dlq_depth"] == 1)
+    chk("…an unsupported type with an unusable id is INVALID, not UNSUPPORTED",
+        L.process_stripe_event(c628, {"id": "evt\nbad", "type": "charge.succeeded", "data": {}})["outcome"]
+        == "DLQ_INVALID")
+    chk("…and so is an event with no string type",
+        L.process_stripe_event(c628, {"id": "evt_c628_notype", "data": {}})["outcome"] == "DLQ_INVALID")
+
+    # Replays do not multiply the rows (migration 0011).
+    _before628 = _q1(c628, "SELECT COUNT(*) FROM dlq WHERE reason='UNSUPPORTED'")
+    _errs628 = []
+    _grab628 = type("G", (logging.Handler,), {"emit": lambda self, r: _errs628.append(r.getMessage()[:100])
+                                               if r.levelno >= logging.ERROR else None})()
+    L._log.addHandler(_grab628)
+    try:
+        for _ in range(5):
+            L.process_stripe_event(c628, {"id": "evt_c628_d0", "type": _TYPES_628[0], "data": {"object": {}}})
+    finally:
+        L._log.removeHandler(_grab628)
+    chk("replaying an unsupported event 5x adds no row and logs no error",
+        _q1(c628, "SELECT COUNT(*) FROM dlq WHERE reason='UNSUPPORTED'") == _before628 and not _errs628,
+        f"{_before628} -> {_q1(c628, 'SELECT COUNT(*) FROM dlq WHERE reason=%s', ('UNSUPPORTED',))} {_errs628[:1]}")
+
+    # Nothing to replay: a resolved row is terminal.
+    _uid = _q1(c628, "SELECT id FROM dlq WHERE reason='UNSUPPORTED' AND org_id=%s ORDER BY id LIMIT 1",
+               (L.DEFAULT_ORG_ID,))
+    chk("manual retry of an UNSUPPORTED entry → 409 (resolved is terminal)",
+        _cl628.post(f"/dlq/{_uid}/retry").status_code == 409)
+
+    # A row written as INVALID before this outcome existed settles when replayed.
+    with c628.cursor() as _c:
+        _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status, max_retries) "
+                   "VALUES ('evt_c628_legacy','INVALID',%s,'pending',0) RETURNING id",
+                   (json.dumps({"id": "evt_c628_legacy", "type": "charge.succeeded", "data": {"object": {}}}),))
+        _legacy = _c.fetchone()[0]
+    _r = _cl628.post(f"/dlq/{_legacy}/retry")
+    chk("a legacy pending INVALID row of an unsupported type resolves on manual retry",
+        _r.status_code == 200 and _r.json().get("outcome") == "UNSUPPORTED"
+        and _q1(c628, "SELECT status FROM dlq WHERE id=%s", (_legacy,)) == "resolved", _r.text[:160])
+    chk("…without appending a row for the replay",
+        _q1(c628, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_c628_legacy'") == 1)
+
+    # Retention: aged out like DUPLICATE; INVALID and young rows stay.
+    with c628.cursor() as _c:
+        _c.execute("UPDATE dlq SET received_at = NOW() - interval '100 days' "
+                   "WHERE transaction_id IN ('evt_c628_d0','evt_c628_d1','evt_c628_bad')")
+    _n_unsup = _q1(c628, "SELECT COUNT(*) FROM dlq WHERE reason='UNSUPPORTED'")
+    _pruned = L.prune_dlq(c628, retention_days=90)
+    chk("prune_dlq deletes the 2 aged UNSUPPORTED rows, nothing else",
+        _pruned == 2 and _q1(c628, "SELECT COUNT(*) FROM dlq WHERE reason='UNSUPPORTED'") == _n_unsup - 2,
+        f"pruned {_pruned}")
+    chk("…the aged INVALID row stays for human review",
+        _q1(c628, "SELECT COUNT(*) FROM dlq WHERE transaction_id='evt_c628_bad'") == 1)
+
+    # Batch path: same classification, one transaction.
+    _b628 = L.process_stripe_event_batch(c628, [
+        fake_event(eid="evt_c628_bok"),
+        {"id": "evt_c628_bu", "type": "charge.refunded", "data": {"object": {}}},
+        {"id": "evt_c628_bi", "type": "invoice.paid", "data": {}},
+    ], org_id="c628")
+    chk("batch: POSTED, UNSUPPORTED, DLQ_INVALID",
+        [r["outcome"] for r in _b628] == ["POSTED", "UNSUPPORTED", "DLQ_INVALID"],
+        str([r["outcome"] for r in _b628]))
+    chk("…the batch UNSUPPORTED row is resolved",
+        _q1(c628, "SELECT status FROM dlq WHERE transaction_id='evt_c628_bu'") == "resolved")
+finally:
+    L._pool = _orig_pool_628
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS = _orig_key_628
+    L._limiter.reset()
+    c628.close()
 
 
 # =============================================================================
