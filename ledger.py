@@ -567,6 +567,8 @@ class DLQReason(str, Enum):
     instead of freeform strings means DLQ entries can be filtered and replayed
     by reason type — e.g., replay all INVALID entries after fixing a validator.
     """
+    # Stripe's redelivery of an event the ledger already holds. Audit-only: stored as
+    #     'resolved' (see DLQEntry), so a redelivery is not counted in dlq_depth.
     DUPLICATE    = "DUPLICATE"     # Stripe retry of already-processed event
     INVALID      = "INVALID"       # Failed Pydantic validation — bad structure or business rule
     UNKNOWN_TYPE = "UNKNOWN_TYPE"  # Reserved, never written — see UNSUPPORTED
@@ -592,6 +594,14 @@ class DLQReason(str, Enum):
     #     for a future non-Stripe / internal-async source — one with no upstream retrier —
     #     where a network timeout or an upstream 503 must be re-attempted by us, not Stripe.
     TRANSIENT    = "TRANSIENT"     # Transient DB/network error — auto-retryable (see note above)
+
+
+# Reasons that record an event with nothing left to do. Born 'resolved' (DLQEntry), so they
+#     never count in dlq_depth, are never retried, answer 409 on manual retry, and are
+#     aged out by prune_dlq.
+_AUDIT_ONLY_REASONS: frozenset = frozenset({
+    DLQReason.DUPLICATE, DLQReason.UNSUPPORTED, DLQReason.DUPLICATE_PAYMENT,
+})
 
 
 class DLQStatus(str, Enum):
@@ -620,6 +630,8 @@ class DLQEntry(BaseModel):
     received_at:    datetime   = Field(default_factory=lambda: datetime.now(timezone.utc))
     # Retry tracking — DUPLICATE and INVALID default to max_retries=0 (no auto-retry).
     # TRANSIENT defaults to max_retries=3 (auto-retried by the worker).
+    # status defaults to PENDING, except for the audit-only reasons (_AUDIT_ONLY_REASONS),
+    #     which __init__ files as RESOLVED unless the caller set a status explicitly.
     status:         DLQStatus  = DLQStatus.PENDING
     retry_count:    int        = 0
     max_retries:    int        = 0
@@ -631,6 +643,16 @@ class DLQEntry(BaseModel):
         # next_retry_at stays NULL, which the SELECT treats as "retry immediately".
         if self.reason == DLQReason.TRANSIENT and self.max_retries == 0:
             object.__setattr__(self, "max_retries", 3)
+        # A DUPLICATE, UNSUPPORTED or DUPLICATE_PAYMENT row is born resolved. Each records
+        #     an event there is nothing to do with: already in the ledger, a type the ledger
+        #     does not record, or a payment already counted. DUPLICATE used to be born
+        #     'pending' with max_retries 0, so no worker ever touched it and it stayed in
+        #     dlq_depth, the number that means "rows still needing action": every Stripe
+        #     redelivery raised the alarm by one, for good, with nothing wrong. Deciding it
+        #     here, not at each call site, keeps the single-event path,
+        #     the batch path and any future writer in agreement.
+        if self.reason in _AUDIT_ONLY_REASONS and "status" not in self.model_fields_set:
+            object.__setattr__(self, "status", DLQStatus.RESOLVED)
 
     def to_db(self) -> tuple:
         # org_id leads, matching the column order in every dlq INSERT.
@@ -1871,8 +1893,7 @@ def prune_dlq(
             "DELETE FROM dlq "
             "WHERE reason = ANY(%s) "
             "  AND received_at < NOW() - make_interval(days => %s)",
-            ([DLQReason.DUPLICATE.value, DLQReason.UNSUPPORTED.value,
-              DLQReason.DUPLICATE_PAYMENT.value], retention_days),
+            (sorted(r.value for r in _AUDIT_ONLY_REASONS), retention_days),
         )
         return cur.rowcount
 

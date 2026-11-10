@@ -752,15 +752,18 @@ with patch("stripe.Webhook.construct_event"):
     #     Posted above: evt_http_001, evt_http_up_curr (uppercase currency is
     #     normalized and accepted) and evt_http_zero ($0 invoice.paid) = 3 ledger
     #     rows, 3 outbox rows. DLQ: 1 DUPLICATE + 2 INVALID (malformed currency, bad
-    #     prefix) = 3.
+    #     prefix) = 3 rows. dlq_depth counts the 2 INVALID ones only: a DUPLICATE row is
+    #     born resolved (migration 0013), because the event is already in the ledger.
     r = client.get("/ledger/summary")
     chk("GET /ledger/summary → 200",                r.status_code == 200)
     summary = r.json()
     chk("summary has 'ledger' key",                 "ledger" in summary)
     chk("summary has 'dlq_depth' key",              "dlq_depth" in summary)
     chk("summary has 'outbox_pending' key",         "outbox_pending" in summary)
-    chk("summary dlq_depth is 3",                   summary["dlq_depth"] == 3,
-        f"got {summary['dlq_depth']}")
+    chk("summary dlq_depth is 2 (the INVALID rows; the DUPLICATE is resolved)",
+        summary["dlq_depth"] == 2, f"got {summary['dlq_depth']}")
+    chk("summary dlq_total is 3 (every row, the DUPLICATE included)",
+        summary["dlq_total"] == 3, f"got {summary['dlq_total']}")
     chk("summary outbox_pending is 3",              summary["outbox_pending"] == 3,
         f"got {summary['outbox_pending']}")
 
@@ -1509,6 +1512,13 @@ ev_term = fake_event(eid="evt_term_001")
 L.process_stripe_event(term_conn, ev_term)
 L.process_stripe_event(term_conn, ev_term)
 term_dlq_id = _q1(term_conn, "SELECT id FROM dlq WHERE transaction_id='evt_term_001' ORDER BY id LIMIT 1")
+# A DUPLICATE row is born resolved now, so a replay of a fresh one is already 409. The
+#     sequence below needs a replayable entry whose event is in the ledger: a DUPLICATE
+#     row written 'pending' before migration 0013, which is what this UPDATE recreates.
+chk("a fresh DUPLICATE row is born resolved",
+    _q1(term_conn, "SELECT status FROM dlq WHERE id=%s", (term_dlq_id,)) == "resolved")
+with term_conn.cursor() as c:
+    c.execute("UPDATE dlq SET status='pending' WHERE id=%s", (term_dlq_id,))
 
 r_t1 = term_client.post(f"/dlq/{term_dlq_id}/retry")
 chk("1st manual retry → 200", r_t1.status_code == 200, f"got {r_t1.status_code}: {r_t1.text}")
@@ -1915,6 +1925,10 @@ try:
     # The retry endpoint is a WRITE. Another tenant's id must be indistinguishable
     #     from a nonexistent one, or the response becomes an existence oracle.
     _a_dlq_id = _ea[0]["id"]
+    # A's entry is a DUPLICATE, born resolved; reopened as a pre-0013 row would be, so the
+    #     owner's retry runs the replay instead of stopping at 409.
+    with iso_conn.cursor() as c:
+        c.execute("UPDATE dlq SET status='pending' WHERE id=%s", (_a_dlq_id,))
     chk("tenant B cannot retry tenant A's DLQ entry (404, not 200)",
         iso_client.post(f"/dlq/{_a_dlq_id}/retry", headers=_hB).status_code == 404)
     chk("tenant A can retry its own entry",
@@ -2438,6 +2452,11 @@ if app_conn is not None:
             L.BILLING_API_KEY = _orig_key_rlsm
 
         # ── the write endpoint, and the cross-tenant refusal ──────────────────
+        # P's entry is a DUPLICATE, born resolved; the owner reopens it as a pre-0013 row
+        #     would be, so P's retry runs the replay under RLS instead of stopping at 409.
+        chk("P's DUPLICATE entry is born resolved", _ep[0]["status"] == "resolved", str(_ep[0]))
+        with app_owner.cursor() as c:
+            c.execute("UPDATE dlq SET status='pending' WHERE id=%s", (_ep[0]["id"],))
         chk("Q cannot retry P's DLQ entry",
             app_client.post(f"/dlq/{_ep[0]['id']}/retry", headers=_hQ).status_code == 404)
         chk("P can retry its own entry",
@@ -5623,16 +5642,12 @@ try:
     chk("(b) webhook_events_total carries a DUPLICATE_PAYMENT outcome (the alerting counter)",
         'webhook_events_total{outcome="DUPLICATE_PAYMENT"}' in _m632)
     _s632 = _cl632.get("/ledger/summary").json()
-    # Default org's dlq holds two rows: the DUPLICATE_PAYMENT trace (resolved) and the
-    #     DUPLICATE row of the b1 redelivery above, which is written 'pending' as DUPLICATE
-    #     rows always are. Only that one is in dlq_depth.
-    _pend632 = _q1(c632, "SELECT COUNT(*) FROM dlq WHERE org_id='default' "
-                         "AND status IN ('pending','retrying','exhausted')")
-    chk("(b) /ledger/summary (default org): POSTED 2 (two invoices), and the trace row is "
-        "not in dlq_depth", _s632["ledger"].get("POSTED") == 2 and _s632["dlq_total"] == 2
-        and _s632["dlq_depth"] == _pend632 == 1
-        and _q1(c632, "SELECT status FROM dlq WHERE reason='DUPLICATE_PAYMENT' "
-                      "AND org_id='default'") == "resolved", str(_s632))
+    # Default org's dlq holds two rows: the DUPLICATE_PAYMENT trace and the DUPLICATE row
+    #     of the b1 redelivery above. Both are born resolved; neither needs action.
+    chk("(b) /ledger/summary (default org): POSTED 2 (two invoices); the trace row and the "
+        "DUPLICATE row are in dlq_total, not in dlq_depth",
+        _s632["ledger"].get("POSTED") == 2 and _s632["dlq_total"] == 2
+        and _s632["dlq_depth"] == 0, str(_s632))
     _did = _q1(c632, "SELECT id FROM dlq WHERE reason='DUPLICATE_PAYMENT' AND org_id='default'")
     chk("(b) manual retry of a DUPLICATE_PAYMENT row → 409: resolved is terminal",
         _cl632.post(f"/dlq/{_did}/retry").status_code == 409)
@@ -5971,8 +5986,8 @@ chk("(f) the index and the trace index exist, the CHECK exists and is NOT VALID 
 chk("(f) a backfilled row guards its invoice: a new event for in_m1 → DUPLICATE_PAYMENT",
     L.process_stripe_event(c632, _fixture("invoice.paid", "evt_m_new", invoice_id="in_m1"))["outcome"]
     == "DUPLICATE_PAYMENT")
-_d2 = _alembic_632("downgrade", "-1")
-chk("(f) alembic downgrade -1 exits 0 and removes what 0012 added",
+_d2 = _alembic_632("downgrade", "0011")
+chk("(f) alembic downgrade 0011 (through 0013, then 0012) exits 0 and removes what 0012 added",
     _d2.returncode == 0 and _schema_632() == (False, 0, 0), _d2.stderr.strip()[-300:])
 chk("(f) …keeping every ledger row and the DUPLICATE_PAYMENT trace row",
     _q1(c632, "SELECT COUNT(*) FROM ledger") == len(_seed_632)
@@ -5995,6 +6010,94 @@ _u3 = _alembic_632("upgrade", "head")
 chk("(f) once a human removes the extra row, upgrade head succeeds",
     _u3.returncode == 0 and _schema_632() == (True, 2, 1), _u3.stderr.strip()[-300:])
 c632.close()
+
+# =============================================================================
+# C6-33: a redelivered event does not raise dlq_depth
+#     A DUPLICATE row records Stripe redelivering an event the ledger already holds. It
+#     was written 'pending' with max_retries 0: no worker ever moved it, and dlq_depth,
+#     "DLQ rows still needing action", counted it, so every Stripe redelivery raised the
+#     alarm by one, for good. DLQEntry now files
+#     every audit-only reason (DUPLICATE, UNSUPPORTED, DUPLICATE_PAYMENT) as resolved, on
+#     every write path, and migration 0013 settles the pending DUPLICATE rows written
+#     before it.
+# =============================================================================
+print("\n── C6-33: a DUPLICATE row is resolved and stays out of dlq_depth ────────")
+
+c633 = fresh_conn()
+_orig_pool_633 = L._pool
+_orig_key_633 = (L.BILLING_API_KEY, L._ANY_ORG_KEYS)
+L._pool = _MockPool(c633)
+L._limiter.reset()
+try:
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS = "", False
+    _cl633 = TestClient(L.app, raise_server_exceptions=False)
+    _depth633 = lambda: _cl633.get("/ledger/summary").json()  # noqa: E731
+    _ev633 = fake_event(eid="evt_c633_single")
+    L.process_stripe_event(c633, _ev633)
+    _s0 = _depth633()
+    _outs633 = [L.process_stripe_event(c633, _ev633)["outcome"] for _ in range(3)]
+    _s1 = _depth633()
+    chk("single path: 3 redeliveries → DLQ_DUPLICATE, dlq_depth unchanged at 0",
+        _outs633 == ["DLQ_DUPLICATE"] * 3 and _s0["dlq_depth"] == 0 and _s1["dlq_depth"] == 0,
+        f"{_outs633} {_s0} {_s1}")
+    chk("…and the DUPLICATE row exists, resolved, counted in dlq_total",
+        _dlq_632(c633, "DUPLICATE") == [("evt_c633_single", "resolved", 0)]
+        and _s1["dlq_total"] == 1, str(_dlq_632(c633, "DUPLICATE")))
+    _bev = fake_event(eid="evt_c633_batch")
+    _b633 = L.process_stripe_event_batch(c633, [_bev, _bev])
+    _b633 += L.process_stripe_event_batch(c633, [_bev])
+    chk("batch path: a same-batch repeat and a later-batch repeat → DLQ_DUPLICATE, depth 0",
+        [r["outcome"] for r in _b633] == ["POSTED", "DLQ_DUPLICATE", "DLQ_DUPLICATE"]
+        and _depth633()["dlq_depth"] == 0
+        and _q1(c633, "SELECT status FROM dlq WHERE transaction_id='evt_c633_batch'") == "resolved",
+        str([r["outcome"] for r in _b633]))
+    # A real alarm still counts: the change is about duplicates only.
+    L.process_stripe_event(c633, {"id": "evt_c633_bad", "type": "invoice.paid", "data": {}})
+    chk("an INVALID event still raises dlq_depth to 1",
+        _depth633()["dlq_depth"] == 1)
+    L._DLQ_DEPTH.set(-1)
+    _m633 = _cl633.get("/metrics").text
+    chk("/metrics dlq_depth gauge: 1 (the INVALID row), not 3", "dlq_depth 1.0" in _m633,
+        " ".join(_ln for _ln in _m633.splitlines() if _ln.startswith("dlq_depth")))
+    _dup_id = _q1(c633, "SELECT id FROM dlq WHERE transaction_id='evt_c633_single'")
+    chk("manual retry of a DUPLICATE row → 409: resolved is terminal",
+        _cl633.post(f"/dlq/{_dup_id}/retry").status_code == 409)
+    chk("retry_dlq_batch never selects it", L.retry_dlq_batch(c633) == 0)
+    chk("a caller that sets a status explicitly keeps it (DLQEntry decides only the default)",
+        L.DLQEntry(transaction_id="x", reason=L.DLQReason.DUPLICATE, raw_payload={},
+                   status=L.DLQStatus.PENDING).status == L.DLQStatus.PENDING
+        and L.DLQEntry(transaction_id="x", reason=L.DLQReason.INVALID,
+                       raw_payload={}).status == L.DLQStatus.PENDING
+        and L.DLQEntry(transaction_id="x", reason=L.DLQReason.TRANSIENT,
+                       raw_payload={}).status == L.DLQStatus.PENDING)
+finally:
+    L._pool = _orig_pool_633
+    L.BILLING_API_KEY, L._ANY_ORG_KEYS = _orig_key_633
+    L._limiter.reset()
+
+# Migration 0013: rows written before it are settled, and only the right ones.
+_env633 = {**os.environ, "DATABASE_URL": L.DATABASE_URL}
+_d633 = subprocess.run([*_ALEMBIC, "downgrade", "0012"], capture_output=True, text=True, env=_env633)
+chk("alembic downgrade 0012 exits 0 (0013 changes no data on the way down)",
+    _d633.returncode == 0, _d633.stderr.strip()[-300:])
+with c633.cursor() as _c:
+    _c.execute("TRUNCATE dlq RESTART IDENTITY")
+    _c.execute("INSERT INTO dlq (transaction_id, reason, raw_payload, status, claimed_at) VALUES "
+               "('evt_m633_dup_p', 'DUPLICATE', '{}', 'pending', NULL), "
+               "('evt_m633_dup_x', 'DUPLICATE', '{}', 'exhausted', NULL), "
+               "('evt_m633_inv_p', 'INVALID', '{}', 'pending', NULL), "
+               "('evt_m633_tr_p', 'TRANSIENT', '{}', 'pending', NULL)")
+_u633 = subprocess.run([*_ALEMBIC, "upgrade", "head"], capture_output=True, text=True, env=_env633)
+_st633 = dict(_qall(c633, "SELECT transaction_id, status FROM dlq"))
+chk("alembic upgrade head exits 0", _u633.returncode == 0, _u633.stderr.strip()[-300:])
+chk("0013: a pending DUPLICATE row written before it → resolved",
+    _st633.get("evt_m633_dup_p") == "resolved", str(_st633))
+chk("0013: an exhausted DUPLICATE (an operator's replay failed) is left for review",
+    _st633.get("evt_m633_dup_x") == "exhausted", str(_st633))
+chk("0013: pending INVALID and TRANSIENT rows are untouched",
+    _st633.get("evt_m633_inv_p") == "pending" and _st633.get("evt_m633_tr_p") == "pending",
+    str(_st633))
+c633.close()
 
 # =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
