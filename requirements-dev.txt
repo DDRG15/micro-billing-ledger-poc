@@ -9,7 +9,7 @@
 #   ruff check ledger.py worker.py provision.py send_test_webhook.py disposable_db.py test_ledger.py benchmark.py scripts/build_architecture_viewer.py e2e/check_run.py e2e/downstream.py e2e/loadgen.py  # lint
 #   ruff format ledger.py                                                 # format
 #   mypy ledger.py                                                        # type check
-#   bandit -r ledger.py worker.py provision.py send_test_webhook.py disposable_db.py -ll  # security scan
+#   bandit -r ledger.py worker.py provision.py send_test_webhook.py disposable_db.py e2e/check_run.py e2e/downstream.py e2e/loadgen.py -ll  # security scan
 
 # ruff — extremely fast Python linter and formatter (replaces flake8 + isort + pyupgrade).
 #     Detects unused imports, undefined names, style violations, and many more.

@@ -72,9 +72,9 @@ found with `grep`.
 | Phase 4 | Batch results are indexed by input position |
 | Phase 5 | Full stack over HTTP: 200, 400, 422 and 503, HMAC signature, concurrent idempotency, batch duplicate partition, `BIGINT` amounts, outbox, DLQ |
 | Phase 7 | Outbox worker: dispatch, `dispatched_at`, `SKIP LOCKED`, re-drain is idempotent |
-| Phase 10 | Alembic: upgrade and downgrade round trip, schema parity with `_bootstrap()` |
-| Phase 11 | DLQ retry: backoff, exhaustion, `POST /dlq/{id}/retry` |
-| Phase 12 | JSON log formatter, `/metrics` shape, outcome labels, route-template label cardinality, gauges agree with the tables |
+| Alembic migrations | Upgrade and downgrade round trip, schema parity with `_bootstrap()` |
+| DLQ retry | Backoff, exhaustion, `POST /dlq/{id}/retry` |
+| JSON logging and Prometheus `/metrics` | JSON log formatter, `/metrics` shape, outcome labels, route-template label cardinality, gauges agree with the tables |
 | M1, M5 | API key boundary (401 and 200), `prune_dlq` retention |
 | A0 | Amount extraction per event type; an unknown amount goes to the DLQ, never to `$0` |
 | A1, A2, A4 | DLQ integrity: a retry appends no rows, `resolved` is terminal at every write site (409 at the endpoint) |

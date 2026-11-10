@@ -63,7 +63,7 @@ httpx==0.27.2
 #     and GET /ledger/summary. Prevents connection pool exhaustion and DLQ flooding.
 slowapi==0.1.9
 
-# alembic 1.18.4 — database migration framework (Phase 10).
+# alembic 1.18.4 — database migration framework.
 #     Replaces _bootstrap() CREATE TABLE IF NOT EXISTS for production schema management.
 #     Migrations live in alembic/versions/. Run: alembic upgrade head
 alembic==1.18.4
@@ -72,7 +72,7 @@ alembic==1.18.4
 #     Only used for migration execution, not for ORM queries (psycopg2 handles all app queries).
 sqlalchemy==2.0.41
 
-# prometheus-client 0.21.0 — Prometheus exposition for GET /metrics (Phase 12).
+# prometheus-client 0.21.0 — Prometheus exposition for GET /metrics.
 #     Provides Counter/Gauge/Histogram and generate_latest(). Used instead of
 #     hand-rolling the text format because the escaping rules for label values and
 #     the histogram bucket layout are easy to get subtly wrong, and a metrics

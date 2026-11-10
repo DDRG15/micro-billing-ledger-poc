@@ -161,7 +161,7 @@ from prometheus_client import (  # noqa: E402
 
 # The tenant that owns rows written before multi-tenancy existed, and the tenant a
 #     single-operator deployment runs as. Every table defaults to it, so a deployment
-#     that never creates a second org behaves exactly as it did before Phase 13.
+#     that never creates a second org behaves exactly as it did before multi-tenancy was added.
 DEFAULT_ORG_ID: str = "default"
 
 # Opt-in token for work that is legitimately cross-tenant: the outbox drain, the DLQ
@@ -546,7 +546,7 @@ class DLQEntry(BaseModel):
     to_db() serializes to a tuple matching the dlq table column order exactly.
     """
     # Owning tenant. Defaults so a single-operator deployment behaves exactly as it
-    #     did before Phase 13, and so every existing caller keeps working unchanged.
+    #     did before multi-tenancy was added, and so every existing caller keeps working unchanged.
     org_id: str = Field(default=DEFAULT_ORG_ID, min_length=1,
                         description="Owning organisation")
 
@@ -592,7 +592,7 @@ class LedgerEntry(BaseModel):
     to_db() and to the INSERT — the code will be obviously incomplete.
     """
     # Owning tenant. Defaults so a single-operator deployment behaves exactly as it
-    #     did before Phase 13, and so every existing caller keeps working unchanged.
+    #     did before multi-tenancy was added, and so every existing caller keeps working unchanged.
     org_id: str = Field(default=DEFAULT_ORG_ID, min_length=1,
                         description="Owning organisation")
 
@@ -968,8 +968,8 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         # dlq — every rejected event lands here with a structured reason code.
         #     raw_payload is the full event JSON as received (every field; re-serialized,
         #     so not byte-for-byte), kept for replay.
-        #     status/retry columns added in Phase 11 — ADD COLUMN IF NOT EXISTS is
-        #     idempotent for databases that already existed before Phase 11.
+        #     status/retry columns were added after the first schema — ADD COLUMN IF NOT EXISTS is
+        #     idempotent for databases that already existed before that change.
         cur.execute("""
             CREATE TABLE IF NOT EXISTS dlq (
                 id              BIGSERIAL   PRIMARY KEY,
@@ -2674,7 +2674,7 @@ def _require_api_key(request: Request, x_api_key: str = Header(default="")) -> s
          is DEFAULT_ORG_ID. The startup warning already says the endpoints are open.
       2. The presented key matches a registered org — that org.
       3. The presented key matches BILLING_API_KEY — DEFAULT_ORG_ID. This keeps
-         single-operator deployments working exactly as before Phase 13.
+         single-operator deployments working exactly as before multi-tenancy was added.
       4. Otherwise 401.
 
     Operational endpoints expose customer IDs, amounts and raw payloads, so the key is
@@ -3040,8 +3040,10 @@ def dlq_entries(request: Request, limit: int = 50, status: Optional[str] = None,
     conn = _pool.getconn()
     try:
         with _tx(conn, org_id) as cur:
+            # B608 false positive: `where` holds only the three fixed fragments appended
+            #     above, and every value (org, statuses, cursor, limit) is a psycopg2 parameter.
             cur.execute(
-                "SELECT id, transaction_id, reason, raw_payload, received_at, status, "
+                "SELECT id, transaction_id, reason, raw_payload, received_at, status, "  # nosec B608
                 "       retry_count, max_retries, next_retry_at, claimed_at "
                 "FROM dlq WHERE " + " AND ".join(where) + " ORDER BY id DESC LIMIT %s",
                 (*params, limit),

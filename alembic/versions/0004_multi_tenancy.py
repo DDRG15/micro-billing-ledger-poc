@@ -5,7 +5,7 @@ Revises: 0003
 Create Date: 2026-08-11
 
 Adds org_id to ledger, outbox and dlq, and an `org` registry that maps a credential to
-a tenant. Phase 13.
+a tenant.
 
 THE DECISION THAT MATTERS: the ledger primary key becomes (org_id, transaction_id).
 
