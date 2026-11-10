@@ -4177,6 +4177,71 @@ finally:
     c619.close()
 
 
+
+# =============================================================================
+# C6-20: a busy or dead database is a 503 with Retry-After, never a 500
+#     ThreadedConnectionPool.getconn() raised PoolError the moment all connections were
+#     out: 64 concurrent webhooks against the compose stack got 4,526 of 20,000 answered
+#     500 or reset. With PostgreSQL killed, 28 of 35 failures were 500/502, not 503.
+# =============================================================================
+print("\n── C6-20: pool waits, then 503; database errors → 503 ───────────────────")
+
+_orig_pool_620, _orig_wait_620 = L._pool, L.DB_POOL_WAIT_SECONDS
+_p620 = L._AutocommitPool(2, 2, dsn=L.APP_DATABASE_URL)
+try:
+    L.DB_POOL_WAIT_SECONDS = 2.0
+    _a, _b = _p620.getconn(), _p620.getconn()
+    _th_615.Timer(0.3, lambda: _p620.putconn(_a)).start()
+    _t0 = time.monotonic()
+    try:
+        _c3 = _p620.getconn()
+    except Exception as _e:
+        _c3 = None
+        _p620.putconn(_b)          # keep the rest of the section runnable
+        _b = _p620.getconn()
+    chk("a request with every connection out waits for one instead of failing",
+        _c3 is not None and 0.2 < time.monotonic() - _t0 < 1.5, f"{time.monotonic() - _t0:.2f}s")
+    time.sleep(0.4)                # the timer's putconn has run either way
+    L.DB_POOL_WAIT_SECONDS = 0.3
+    _busy = None
+    try:
+        _p620.getconn()
+    except L._PoolBusy as _e:
+        _busy = _e
+    chk("…and gives up with _PoolBusy after DB_POOL_WAIT_SECONDS", _busy is not None)
+    L._pool = _p620
+    _cl620 = TestClient(L.app, raise_server_exceptions=False)
+    _r = _cl620.post("/webhook/stripe", content=b'{"id":"evt_c620","type":"invoice.paid"}',
+                     headers={"Content-Type": "application/json", "Stripe-Signature": "t=1,v1=00"})
+    chk("an ingest request that cannot get a connection → 503 + Retry-After, not 500",
+        _r.status_code == 503 and _r.headers.get("retry-after") == "1", f"{_r.status_code}")
+    _p620.putconn(_b)
+    if _c3 is not None:
+        _p620.putconn(_c3)
+
+    class _DeadPool620:
+        def getconn(self, key=None):
+            raise psycopg2.OperationalError("server closed the connection unexpectedly")
+
+        def putconn(self, *a, **k):
+            pass
+
+    L._pool = _DeadPool620()
+    _orig_key_620, L.BILLING_API_KEY = L.BILLING_API_KEY, ""
+    _orig_any_620, L._ANY_ORG_KEYS = L._ANY_ORG_KEYS, False
+    try:
+        _r1 = _cl620.post("/webhook/stripe/default", content=b'{"id":"evt_c620b","type":"invoice.paid"}',
+                          headers={"Content-Type": "application/json", "Stripe-Signature": "t=1,v1=00"})
+        _r2 = _cl620.get("/ledger/summary")
+    finally:
+        L.BILLING_API_KEY, L._ANY_ORG_KEYS = _orig_key_620, _orig_any_620
+    chk("a dead database → 503 on ingest and on ops endpoints, not 500",
+        _r1.status_code == 503 and _r2.status_code == 503, f"{_r1.status_code} {_r2.status_code}")
+finally:
+    L._pool, L.DB_POOL_WAIT_SECONDS = _orig_pool_620, _orig_wait_620
+    _p620.closeall()
+
+
 # =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.

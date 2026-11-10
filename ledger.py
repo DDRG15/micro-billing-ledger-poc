@@ -2036,11 +2036,62 @@ class _AutocommitPool(ThreadedConnectionPool):
         conn.autocommit = True
         return conn
 
+    # Waiting for a connection. ThreadedConnectionPool.getconn() never waits: with every
+    #     connection checked out it raises PoolError at once. FastAPI runs sync handlers
+    #     on a 40-thread pool against DB_POOL_SIZE (20) connections, so any burst above 20
+    #     concurrent requests failed — against the compose stack, 64 concurrent signed
+    #     webhooks got 4,526 of 20,000 answered 500 or reset (502 through Caddy). A
+    #     semaphore sized to the pool now queues the request for up to
+    #     DB_POOL_WAIT_SECONDS, and only then gives up with _PoolBusy → 503 + Retry-After.
+
+    def __init__(self, minconn, maxconn, *args, **kwargs):
+        super().__init__(minconn, maxconn, *args, **kwargs)
+        self._slots = threading.BoundedSemaphore(maxconn)
+
+    def getconn(self, key=None):
+        if not self._slots.acquire(timeout=DB_POOL_WAIT_SECONDS):
+            raise _PoolBusy()
+        try:
+            return super().getconn(key)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def putconn(self, conn=None, key=None, close=False):
+        try:
+            super().putconn(conn, key, close)
+        finally:
+            self._slots.release()
+
+
+class _PoolBusy(Exception):
+    """Every database connection stayed checked out for DB_POOL_WAIT_SECONDS."""
+
 
 DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "20"))
+DB_POOL_WAIT_SECONDS: float = float(os.getenv("DB_POOL_WAIT_SECONDS", "5"))
 _pool: ThreadedConnectionPool = _AutocommitPool(
     minconn=DB_POOL_SIZE, maxconn=DB_POOL_SIZE, dsn=APP_DATABASE_URL
 )
+
+
+@app.exception_handler(_PoolBusy)
+@app.exception_handler(psycopg2.OperationalError)
+@app.exception_handler(psycopg2.InterfaceError)
+async def _database_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    """503 + Retry-After when the database cannot serve the request right now.
+
+    The README promises 503 for a database failure so Stripe retries. Only the ingest
+    path's own try/except kept that promise; a dead connection anywhere else — the org
+    lookup, an auth dependency, an ops endpoint — escaped as 500, or as a reset that
+    Caddy turned into 502 (28 of 35 failures while PostgreSQL was killed under load).
+    """
+    if request.url.path.startswith("/webhook"):
+        _WEBHOOK_EVENTS.labels("DB_ERROR").inc()
+    _log.error("database unavailable path=%s error=%s", request.url.path, type(exc).__name__,
+               extra={"event": "db_unavailable", "error": type(exc).__name__})
+    return JSONResponse(status_code=503, content={"detail": "Database unavailable, retry"},
+                        headers={"Retry-After": "1"})
 
 
 def _any_org_keys() -> bool:
