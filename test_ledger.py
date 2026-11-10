@@ -4482,6 +4482,50 @@ chk("the API lifespan still logs the secrets fingerprint line",
 
 
 # =============================================================================
+# C6-24: the interactive API docs and the OpenAPI schema are dev-only
+#     FastAPI serves /docs, /redoc and /openapi.json unauthenticated by default, ahead
+#     of the API key check. The schema is a free map of every ops route and the per-tenant
+#     ingest path. Only a declared local dev run (BILLING_ENV=dev on a loopback ingress)
+#     serves them; anything else answers 404.
+# =============================================================================
+print("\n── C6-24: /docs, /redoc and /openapi.json are 404 outside dev mode ──────")
+
+_DOC_PATHS_624 = ("/docs", "/redoc", "/openapi.json")
+_cl624 = TestClient(L.app, raise_server_exceptions=False)
+chk("this suite runs without BILLING_ENV=dev, so docs are off in the loaded app",
+    L._DOCS_ENABLED is False, str(L._DOCS_ENABLED))
+_codes_624 = {p: _cl624.get(p).status_code for p in _DOC_PATHS_624}
+chk("/docs, /redoc and /openapi.json → 404 when not in dev mode",
+    set(_codes_624.values()) == {404}, str(_codes_624))
+chk("…and they are 404 even with a valid API key (not an auth question)",
+    _cl624.get("/openapi.json", headers={"X-Api-Key": L.BILLING_API_KEY}).status_code == 404)
+
+_probe_624 = ("import ledger as L; from starlette.testclient import TestClient; "
+              "c = TestClient(L.app); "
+              "print({p: c.get(p).status_code for p in ('/docs', '/redoc', '/openapi.json')})")
+
+
+def _probe_docs_624(env_overrides: dict) -> str:
+    env = {k: v for k, v in os.environ.items() if k not in ("BILLING_ENV", "INGRESS_BIND_ADDR")}
+    env.update(env_overrides)
+    proc = subprocess.run([sys.executable, "-c", _probe_624],
+                          cwd=os.path.dirname(os.path.abspath(__file__)),
+                          env=env, capture_output=True, text=True, timeout=60)
+    return (proc.stdout.strip().splitlines() or [proc.stderr[-300:]])[-1]
+
+
+_dev_624 = _probe_docs_624({"BILLING_ENV": "dev", "INGRESS_BIND_ADDR": "127.0.0.1"})
+chk("BILLING_ENV=dev on loopback → all three are served (200)",
+    _dev_624 == "{'/docs': 200, '/redoc': 200, '/openapi.json': 200}", _dev_624)
+_exposed_624 = _probe_docs_624({"BILLING_ENV": "dev", "INGRESS_BIND_ADDR": "0.0.0.0"})
+chk("BILLING_ENV=dev but ingress published on 0.0.0.0 → still 404",
+    _exposed_624 == "{'/docs': 404, '/redoc': 404, '/openapi.json': 404}", _exposed_624)
+_prod_624 = _probe_docs_624({"BILLING_ENV": "production"})
+chk("BILLING_ENV=production → 404",
+    _prod_624 == "{'/docs': 404, '/redoc': 404, '/openapi.json': 404}", _prod_624)
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

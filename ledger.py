@@ -1803,7 +1803,21 @@ async def _lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Micro-Billing-Ledger PoC", version="1.0.0", lifespan=_lifespan)
+# FastAPI serves /docs, /redoc and /openapi.json with no authentication by default.
+#     Scenario: the schema lists every ops route, its parameters and the tenant-scoped
+#     paths (/webhook/stripe/{org_id}) to anyone who can reach the ingress, ahead of the
+#     API key check. Consequence: a free map of the attack surface, and a Swagger UI
+#     hosted on the same origin as the ops endpoints. Decision: only a declared local
+#     dev run (the same test that permits demo credentials) gets them; every other
+#     deployment answers 404.
+_DOCS_ENABLED = _demo_credentials_allowed(BILLING_ENV, INGRESS_BIND_ADDR)
+
+app = FastAPI(
+    title="Micro-Billing-Ledger PoC", version="1.0.0", lifespan=_lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 
 # Rate limiter — keyed by client IP. Prevents a single caller from exhausting
 #     the connection pool (maxconn=20) or flooding the DLQ table.
