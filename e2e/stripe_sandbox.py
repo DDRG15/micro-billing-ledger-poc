@@ -250,6 +250,7 @@ class Harness:
         self.start_epoch = int(self.t0)
         self.phase_seconds = {}
         self.baseline_ids = set()
+        self.catchup = {}
 
     # ---- process helpers -------------------------------------------------
 
@@ -556,11 +557,57 @@ class Harness:
         self.phase_seconds["2_resends"] = round(time.time() - began, 1)
         return results
 
+    def catch_up(self, label, targets=(), deliveries_1=None):
+        """Resend what Stripe emitted but the listener never delivered.
+
+        `stripe listen` is a development tunnel. Under a burst it drops events and does not
+        retry them, while Stripe retries a registered webhook endpoint for days. Without this
+        step the reconciliation would measure the tunnel instead of the service. Every event
+        recovered here is counted and reported, so a drop is never hidden.
+
+        `targets` are phase-2 resends whose redelivery the listener also dropped: they are
+        resent again until the service has seen each one a second time.
+        """
+        began = time.time()
+        deliveries_1 = deliveries_1 or {}
+        entry = {"dropped_by_listener": 0, "rounds": 0, "resend_failures": 0, "remaining": 0}
+
+        def undelivered():
+            parsed = parse_listener(self.read_listener())
+            window = {e["id"] for e in self.stripe_events_since(self.start_epoch)}
+            missing = window - set(parsed["sent"]) - self.baseline_ids
+            missing |= {t for t in targets if parsed["sent"][t] <= deliveries_1.get(t, 0)}
+            return sorted(missing)
+
+        def one(evt_id):
+            with self.gate:
+                rc, out, err = self.stripe(["events", "resend", evt_id])
+            return rc == 0
+
+        missing = undelivered()
+        entry["dropped_by_listener"] = len(missing)
+        while missing and entry["rounds"] < self.args.catchup_rounds:
+            entry["rounds"] += 1
+            self.say(f"{label}: round {entry['rounds']}, {len(missing)} events the listener "
+                     f"never delivered; resending")
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.args.catchup_concurrency) as pool:
+                entry["resend_failures"] += sum(1 for ok in pool.map(one, missing) if not ok)
+            self.settle(label)
+            missing = undelivered()
+        entry["remaining"] = len(missing)
+        self.catchup[label] = entry
+        self.phase_seconds[label] = round(time.time() - began, 1)
+        if entry["dropped_by_listener"]:
+            self.say(f"{label}: listener dropped {entry['dropped_by_listener']}, "
+                     f"{entry['remaining']} still undelivered after {entry['rounds']} rounds")
+
     # ---- reconciliation -----------------------------------------------------------
 
     def run(self):
         self.preflight()
         failed_types = self.phase_trigger()
+        self.catch_up("catch-up after phase 1")
 
         parsed_1, run_ids = self.forwarded_new()
         deliveries_1 = {i: parsed_1["sent"][i] for i in run_ids}
@@ -568,6 +615,7 @@ class Harness:
 
         targets = self.pick_resends(parsed_1, run_ids)
         resend_results = self.phase_resend(targets)
+        self.catch_up("catch-up after phase 2", targets, deliveries_1)
 
         began = time.time()
         parsed = parse_listener(self.read_listener())
@@ -649,10 +697,12 @@ class Harness:
                 f"; customer.subscription.{{created,updated,deleted}} Stripe {stripe_sub} vs "
                 f"LIFECYCLE {status_counts.get('LIFECYCLE', 0)}; id sets equal: "
                 f"{stripe_ids == ledger_ids}; per-type mismatches: {mismatch or 'none'}")
-        control("g", "listener forwarded every event Stripe emitted",
+        dropped = sum(c["dropped_by_listener"] for c in self.catchup.values())
+        control("g", "every event Stripe emitted reached the service",
                 not not_forwarded,
-                f"{len(window)} events in the Stripe window, {len(not_forwarded)} never forwarded "
-                f"(first: {not_forwarded[:3]})")
+                f"{len(window)} events in the Stripe window, {len(not_forwarded)} never delivered "
+                f"(first: {not_forwarded[:3]}); the listener dropped {dropped} and they were "
+                f"resent: {self.catchup}")
 
         # (c) money, cent for cent.
         stripe_paid = sum(e["amount_paid"] or 0 for e in stripe_events
@@ -690,8 +740,10 @@ class Harness:
         resend_bad = [i for i in targets
                       if any(a != 200 for a in parsed["answers"].get(i, []))]
         ledger_rows_before = {i: r for i, r in before["ledger"].items()}
-        ledger_changed = {i for i in set(ledger) | set(ledger_rows_before)
-                          if ledger.get(i) != ledger_rows_before.get(i)}
+        # A row that existed before the resends must be unchanged, and a resent event must not
+        #     gain a row. A late event recovered after phase 2 may add its own row legitimately.
+        ledger_changed = {i for i in ledger_rows_before if ledger.get(i) != ledger_rows_before[i]}
+        ledger_changed |= {i for i in targets if i in ledger and i not in ledger_rows_before}
         added = Counter()
         for evt_id in targets:
             for r, n in dlq_by_id[evt_id].items():
@@ -734,6 +786,7 @@ class Harness:
             "final_concurrency": self.gate.limit,
             "invalid_dlq_ids": after["invalid"][:20], "lost_ids": lost[:20],
             "multi_row_ids": multi[:20], "not_forwarded_ids": not_forwarded[:20],
+            "listener_catch_up": self.catchup,
             "phase_seconds": self.phase_seconds,
             "total_seconds": round(time.time() - self.t0, 1),
         }
@@ -797,6 +850,10 @@ def build_parser():
                    help="events to resend in phase 2 (default 60)")
     p.add_argument("--types", nargs="+",
                    help="replace the built-in list of non-core event types")
+    p.add_argument("--catchup-rounds", type=int, default=5,
+                   help="rounds of resending events the listener dropped (default 5)")
+    p.add_argument("--catchup-concurrency", type=int, default=2,
+                   help="parallel resends while catching up (default 2)")
     p.add_argument("--org-id", default="default", help="tenant to reconcile (default: default)")
     p.add_argument("--settle-seconds", type=int, default=12,
                    help="listener quiet time that counts as settled (default 12)")
