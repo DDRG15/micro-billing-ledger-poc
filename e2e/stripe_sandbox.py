@@ -262,25 +262,36 @@ class Harness:
                                timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             return 124, "", "timeout"
+        except OSError as exc:
+            raise HarnessError(f"cannot run the Stripe CLI command: {exc}") from exc
         return p.returncode, p.stdout, p.stderr
 
     def psql(self, sql, variables=None):
         argv = self.psql_cmd + ["-X", "-A", "-t", "-F", "\t", "-v", "ON_ERROR_STOP=1"]
         for key, value in (variables or {}).items():
             argv += ["-v", f"{key}={value}"]
-        p = subprocess.run(argv, input=sql, capture_output=True, text=True,
-                           timeout=120, check=False)
+        try:
+            p = subprocess.run(argv, input=sql, capture_output=True, text=True,
+                               timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HarnessError(f"cannot run the psql command: {exc}") from exc
         if p.returncode != 0:
             raise HarnessError("psql failed: " + mask(p.stderr[-400:]))
         return [line.split("\t") for line in p.stdout.splitlines() if line.strip()]
 
     def read_listener(self):
         if self.args.listen_log:
-            with open(self.args.listen_log, encoding="utf-8", errors="replace") as f:
-                return mask(f.read())
+            try:
+                with open(self.args.listen_log, encoding="utf-8", errors="replace") as f:
+                    return mask(f.read())
+            except OSError as exc:
+                raise HarnessError(f"cannot read the listener log: {exc}") from exc
         argv = [os.path.expanduser(t) for t in shlex.split(self.args.listen_log_cmd)]
-        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, timeout=120, check=False)
+        try:
+            p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HarnessError(f"cannot run the listener log command: {exc}") from exc
         if p.returncode != 0:
             raise HarnessError("listener log command failed: " + mask(p.stdout[-300:]))
         return mask(p.stdout)
