@@ -4242,6 +4242,47 @@ finally:
     _p620.closeall()
 
 
+
+# =============================================================================
+# C6-21: failed authentications are rate-limited, before the database lookup
+#     slowapi counts requests inside the decorated endpoint, but the 401 is raised in
+#     the auth dependency, which FastAPI resolves first: against the compose stack one IP
+#     made 5,879 wrong-key requests in 10 s, each one an org lookup, while a valid key
+#     was cut off at 20/minute.
+# =============================================================================
+print("\n── C6-21: wrong keys → 401 up to the budget, then 429 with no lookup ────")
+
+_orig_621 = (L._ANY_ORG_KEYS, L.BILLING_API_KEY, L._lookup_org_by_key, L._pool)
+_lookups_621 = [0]
+
+
+def _count_lookup_621(conn, key):
+    _lookups_621[0] += 1
+    return None
+
+
+L._ANY_ORG_KEYS, L.BILLING_API_KEY = True, "op_key_c621"
+L._lookup_org_by_key = _count_lookup_621
+c621 = fresh_conn()
+L._pool = _MockPool(c621)
+L._limiter.reset()
+try:
+    _cl621 = TestClient(L.app, raise_server_exceptions=False)
+    _codes_621 = [_cl621.get("/ledger/summary", headers={"X-Api-Key": f"wrong{_i}"}).status_code
+                  for _i in range(25)]
+    _budget_621 = int(L.RATE_LIMIT_AUTH_FAILURES.split("/")[0])
+    chk("wrong keys get 401 up to the failed-auth budget, then 429",
+        _codes_621 == [401] * _budget_621 + [429] * (25 - _budget_621), str(_codes_621))
+    chk("…and once refused, a wrong key costs no database lookup",
+        _lookups_621[0] == _budget_621, f"{_lookups_621[0]} lookups")
+    _r = _cl621.get("/metrics", headers={"X-Api-Key": "wrong-again"})
+    chk("/metrics shares the same budget", _r.status_code == 429, str(_r.status_code))
+finally:
+    L._ANY_ORG_KEYS, L.BILLING_API_KEY, L._lookup_org_by_key, L._pool = _orig_621
+    L._limiter.reset()
+    c621.close()
+
+
 # =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.

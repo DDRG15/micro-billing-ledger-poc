@@ -130,6 +130,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status  # 
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.responses import JSONResponse, Response  # noqa: E402
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator  # noqa: E402
+from limits import parse as _parse_rate_limit  # noqa: E402
 from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: E402
 from slowapi.util import get_remote_address  # noqa: E402
 from slowapi.errors import RateLimitExceeded  # noqa: E402
@@ -2315,7 +2316,33 @@ def _org_webhook_secret(conn: "psycopg2.extensions.connection", org_id: str) -> 
     return row[0] if row else None
 
 
-def _require_api_key(x_api_key: str = Header(default="")) -> str:
+# Failed authentications per client IP. slowapi's per-route limits never see them: the
+#     decorator wraps the endpoint, and FastAPI resolves Depends(_require_api_key) before
+#     calling it, so a 401 raised there was never counted. Against the compose stack one
+#     IP made 5,879 wrong-key requests in 10 s — each a SHA-256 and an org lookup — while
+#     a valid key was cut off at 20/minute. The budget is checked BEFORE the lookup, so an
+#     exhausted client costs no database work.
+RATE_LIMIT_AUTH_FAILURES = os.getenv("RATE_LIMIT_AUTH_FAILURES", "20/minute")
+_AUTH_FAILURE_LIMIT = _parse_rate_limit(RATE_LIMIT_AUTH_FAILURES)
+
+
+def _auth_budget(request: Request) -> str:
+    """Refuse a client that has used up its failed-authentication budget; return its key."""
+    client = get_remote_address(request)
+    if _limiter.enabled and not _limiter._limiter.test(_AUTH_FAILURE_LIMIT, "auth_failure", client):
+        raise HTTPException(status_code=429, detail="Too many failed authentication attempts",
+                            headers={"Retry-After": "60"})
+    return client
+
+
+def _auth_failed(client: str, detail: str) -> HTTPException:
+    """Count one failed authentication for this client and build its 401."""
+    if _limiter.enabled:
+        _limiter._limiter.hit(_AUTH_FAILURE_LIMIT, "auth_failure", client)
+    return HTTPException(status_code=401, detail=detail)
+
+
+def _require_api_key(request: Request, x_api_key: str = Header(default="")) -> str:
     """FastAPI dependency for ops endpoints. Returns the caller's org_id.
 
     The tenant is DERIVED from the credential; it is never accepted from the caller.
@@ -2337,8 +2364,9 @@ def _require_api_key(x_api_key: str = Header(default="")) -> str:
     """
     if not BILLING_API_KEY and not _ANY_ORG_KEYS:
         return DEFAULT_ORG_ID  # dev mode — no credential configured anywhere
+    client = _auth_budget(request)
     if not x_api_key:
-        raise HTTPException(status_code=401, detail="X-Api-Key header required")
+        raise _auth_failed(client, "X-Api-Key header required")
 
     if _ANY_ORG_KEYS:
         conn = _pool.getconn()
@@ -2356,10 +2384,10 @@ def _require_api_key(x_api_key: str = Header(default="")) -> str:
     if BILLING_API_KEY and hmac.compare_digest(x_api_key.encode(), BILLING_API_KEY.encode()):
         return DEFAULT_ORG_ID
 
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    raise _auth_failed(client, "Invalid API key")
 
 
-def _require_operator_key(x_api_key: str = Header(default="")) -> None:
+def _require_operator_key(request: Request, x_api_key: str = Header(default="")) -> None:
     """FastAPI dependency for /metrics: the operator's key, never a tenant's.
 
     /metrics renders process-wide state — webhook and HTTP counters summed over every
@@ -2375,8 +2403,9 @@ def _require_operator_key(x_api_key: str = Header(default="")) -> None:
     """
     if not BILLING_API_KEY and not _ANY_ORG_KEYS:
         return  # dev mode — the startup warning already says the endpoints are open
+    client = _auth_budget(request)
     if not x_api_key:
-        raise HTTPException(status_code=401, detail="X-Api-Key header required")
+        raise _auth_failed(client, "X-Api-Key header required")
     if BILLING_API_KEY and hmac.compare_digest(x_api_key.encode(), BILLING_API_KEY.encode()):
         return
     if _ANY_ORG_KEYS:
@@ -2387,7 +2416,7 @@ def _require_operator_key(x_api_key: str = Header(default="")) -> None:
             _pool.putconn(conn)
         if is_tenant:
             raise HTTPException(status_code=403, detail="/metrics requires the operator key")
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    raise _auth_failed(client, "Invalid API key")
 
 
 class StripeWebhookPayload(BaseModel):
