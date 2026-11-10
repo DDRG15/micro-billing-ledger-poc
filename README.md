@@ -14,7 +14,7 @@ without seeing each other's data.
 **Status:** proof of concept. It is built and tested to behave correctly under failure,
 but it has not carried real traffic, and the [limitations](#limitations) are listed below.
 **Stack:** Python 3.12 and 3.13 · FastAPI · Pydantic v2 · PostgreSQL 16 · Docker Compose ·
-Caddy. **Tests:** 733 checks in one script, plus a separate end-to-end failure harness.
+Caddy. **Tests:** 817 checks in one script, plus a separate end-to-end failure harness.
 
 ---
 
@@ -38,7 +38,10 @@ flowchart LR
 3. **Record once.** In a single database transaction the API inserts the event into the
    `ledger` table and a "to deliver" note into the `outbox` table. The ledger's primary
    key is `(org_id, transaction_id)`, so a second copy of the same event is refused by
-   the database itself, and the API answers `200` with `DLQ_DUPLICATE`.
+   the database itself, and the API answers `200` with `DLQ_DUPLICATE`. A payment is keyed
+   too: at most one `POSTED` row per tenant and Stripe invoice, so a different event
+   announcing a payment already recorded is answered `DUPLICATE_PAYMENT` and recorded
+   nowhere but the `dlq`.
 4. **Keep what was rejected.** Invalid events, repeats and event types the ledger does
    not record are stored in the `dlq` table with the full payload. Stripe still gets a
    `200`, because asking it to resend a bad event would not fix it. If the database
@@ -138,10 +141,12 @@ Each guarantee names the mechanism and the section of `test_ledger.py` that chec
 
 | Guarantee | Mechanism | Checked by |
 |---|---|---|
-| An event is never counted twice, even when five requests carry it at the same moment | `INSERT ... ON CONFLICT (org_id, transaction_id) DO NOTHING`; the database serializes the race | Phase 5 (five threads, one event id, one ledger row); A9 |
+| An event is never counted twice, even when five requests carry it at the same moment | Primary key `(org_id, transaction_id)` and `INSERT ... ON CONFLICT DO NOTHING`; the database serializes the race | Phase 5 (five threads, one event id, one ledger row); A9 |
+| A payment is never counted twice, however many events announce it: one `POSTED` row per tenant and invoice | Unique index `uq_ledger_one_posted_per_invoice` on `(org_id, invoice_id)` for `POSTED` rows, and a CHECK that every `POSTED` or `VOID` row names its invoice (migration 0012). A second event for a paid invoice is answered `200` as `DUPLICATE_PAYMENT`, with no ledger row, no outbox row and one resolved `dlq` row | C6-32 (every order of the four events of one payment; eight concurrent events per invoice, also as `billing_app`; batch and DLQ replay; two tenants; the migration) |
 | The ledger and the delivery queue never disagree | Ledger row and outbox row written in one transaction | The "Outbox written atomically" check |
 | An event the database could not store is retried by Stripe, not acknowledged | `503` with `Retry-After` on pool exhaustion or a dead connection; `503` when a rejected event could not even be written to the DLQ | C6-6, C6-20 |
-| A rejected event is kept in full, and a repeated one leaves a single row | Raw payload stored in `dlq`; unique partial indexes allow one `DUPLICATE` and one `UNSUPPORTED` row per event | C6-5, C6-27, C6-28 |
+| A rejected event is kept in full, and a repeated one leaves a single row | Raw payload stored in `dlq`; unique partial indexes allow one `DUPLICATE`, one `UNSUPPORTED` and one `DUPLICATE_PAYMENT` row per event | C6-5, C6-27, C6-28, C6-32 |
+| `dlq_depth` counts only rows that need a person: Stripe redelivering an event does not raise it | `DUPLICATE`, `UNSUPPORTED` and `DUPLICATE_PAYMENT` rows are written `resolved` on every path; migration 0013 settled the `pending` `DUPLICATE` rows written before | C6-33 |
 | A delivery is retried until it succeeds, and never dropped | Lease, per-row result commit, backoff of 30, 120, 600 then 3,600 s with no attempt limit | Phase 7, C6-12 |
 | A broken downstream cannot starve the others or fake a success | Per-tenant tasks on a bounded thread pool; a 15 s dispatch deadline; a redirect counts as a failure; rows are handed back on shutdown | C6-15, C6-16, C6-17, C6-22, C6-29 |
 | Tenants cannot read or write each other's rows, even through a bug | Row-level security enforced for the restricted `billing_app` role; the tenant comes from the API key, never from a header | A9 to A16 |
@@ -158,7 +163,7 @@ Every delivery carries `X-Transaction-Id`, so the receiver can discard repeats.
 ## How it was tested
 
 **The suite.** `test_ledger.py` is a single script that prints one line per check and
-exits non-zero on a failure: 733 checks against a live PostgreSQL 16. The guarantees above
+exits non-zero on a failure: 817 checks against a live PostgreSQL 16. The guarantees above
 are behaviour of the database (a unique key serializing concurrent inserts, policies
 applying to a restricted role, row locks skipping claimed rows), so the suite runs
 against one rather than a mock. CI runs it on Python 3.12 and 3.13, runs ruff and bandit,
@@ -214,17 +219,22 @@ Webhook responses: `200` for any event that was handled, including rejected ones
 `400` for a bad signature or unknown tenant; `413` over 1 MiB; `422` for a malformed
 envelope; `429` over the rate limit; `503` when the database cannot take the event.
 
-**Outcomes** in the `200` body: `POSTED` (invoice paid), `VOID` (payment failed, recorded
-at `amount_due`), `LIFECYCLE` (subscription created, updated or deleted, stored with no
-amount), `DLQ_INVALID`, `DLQ_DUPLICATE`, and `UNSUPPORTED` (a well-formed Stripe event of a
-type the ledger does not record: stored as a `resolved` DLQ row, not counted in
-`dlq_depth`, pruned with the duplicates).
+**Outcomes** in the `200` body: `POSTED` (invoice paid; at most one per tenant and
+invoice), `VOID` (payment failed, recorded at `amount_due`, one row per
+`invoice.payment_failed` event, never revenue), `LIFECYCLE` (subscription created, updated
+or deleted, stored with no amount), `DLQ_INVALID` (failed validation: a `pending` DLQ row
+that needs a person), and three outcomes that need nobody, each stored as a `resolved` DLQ
+row, not counted in `dlq_depth`, answered `409` on manual retry and pruned after 90 days:
+`DLQ_DUPLICATE` (Stripe redelivered an event the ledger already holds), `DUPLICATE_PAYMENT`
+(a new event for an invoice whose payment is already `POSTED`) and `UNSUPPORTED` (a
+well-formed Stripe event of a type the ledger does not record).
 
 **Metrics.** `webhook_events_total{outcome}`, `http_requests_total{method,path,status}`,
 `http_errors_total{status,error_class,error_type}` (one sample per response with status 400
 or above, see "Errors: class and type" below),
 `http_request_duration_seconds` (labelled by route template, not by resolved path),
-`dlq_depth` (rows needing action), `dlq_total`, `outbox_pending` and
+`dlq_depth` (rows needing action: `pending`, `retrying` or `exhausted`; a redelivery
+or a duplicate payment does not move it), `dlq_total`, `outbox_pending` and
 `billing_secrets_info` (a hash prefix of the live secrets, to confirm a rotation took
 effect). The queue gauges are read from the database on each scrape. Prometheus is not
 part of the Compose stack. To scrape with the operator key, send it as a header:
@@ -324,7 +334,9 @@ at start-up.
 
 **Data model.** Four tables, created by the migrations in `alembic/versions/`:
 `org` (tenant registry: API key hash, Stripe signing secret, downstream URL), `ledger`
-(one row per recorded event; amounts in cents as `BIGINT`), `outbox` (delivery state per
+(one row per recorded event; amounts in cents as `BIGINT`; `invoice_id`, the Stripe
+invoice an invoice row belongs to, on which at most one `POSTED` row per tenant is
+allowed), `outbox` (delivery state per
 event: attempts, next attempt, lease, last error) and `dlq`. The migrations are the source
 of truth for the schema.
 
@@ -415,6 +427,13 @@ These are engineering controls, not a compliance programme.
   text in `org` (verifying a signature needs the value; in production it belongs in a
   secret manager).
 - **Delivery is at least once**; receivers must deduplicate on `X-Transaction-Id`.
+- **A failed payment is recorded once per event, not once per attempt.** Each
+  `invoice.payment_failed` event is a `VOID` row and is delivered downstream. Stripe's
+  `attempt_count` counts only automatic retries, so nothing identifies an attempt more
+  finely than its event, and two events Stripe sent for the same failed attempt would make
+  two `VOID` rows. No total the service exposes adds `VOID` amounts. Each delivery carries
+  the full invoice, `attempt_count` included, for a receiver that has to tell attempts
+  apart.
 - **The DLQ's automatic retry loop has nothing to retry today.** It handles `TRANSIENT`
   entries, and nothing in the ingest path writes that reason; a database failure returns
   `503` so Stripe retries. Rejected events are replayed by hand.

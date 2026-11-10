@@ -61,8 +61,8 @@ flowchart TB
     SIG["stripe.Webhook.construct_event<br/>HMAC with the tenant secret"]
     PROC["process_stripe_event<br/>unsupported type check, then StripeEvent validation<br/>five EventType values, event id printable ASCII 1 to 255"]
     TX["_tx(conn, org_id)<br/>BEGIN, SET LOCAL app.org_id, COMMIT"]
-    INS["Idempotent dual write<br/>ledger row and outbox row<br/>in one transaction"]
-    WDLQ["_write_dlq<br/>reasons INVALID, DUPLICATE, UNSUPPORTED<br/>one DUPLICATE or UNSUPPORTED row per event, ON CONFLICT DO NOTHING<br/>UNSUPPORTED is stored as resolved"]
+    INS["Idempotent dual write<br/>ledger row and outbox row<br/>in one transaction<br/>keys: event id, and one POSTED row per invoice"]
+    WDLQ["_write_dlq<br/>reasons INVALID, DUPLICATE, DUPLICATE_PAYMENT, UNSUPPORTED<br/>one DUPLICATE, DUPLICATE_PAYMENT or UNSUPPORTED row per event, ON CONFLICT DO NOTHING<br/>those three are stored as resolved, INVALID as pending"]
     POOL["_AutocommitPool<br/>DB_POOL_SIZE, default 20<br/>bounded wait DB_POOL_WAIT_SECONDS, default 5"]
     AUTH["_require_api_key and _require_operator_key<br/>SHA-256 lookup in org, or BILLING_API_KEY<br/>failed-auth budget RATE_LIMIT_AUTH_FAILURES"]
     LIMOPS["slowapi limits<br/>RATE_LIMIT_OPS, default 20/minute<br/>RATE_LIMIT_METRICS, default 60/minute"]
@@ -78,19 +78,19 @@ flowchart TB
     FINISH["_finish_row via _collect, on the connection-owning thread<br/>success: dispatched = 1<br/>failure: backoff 30, 120, 600, 3600 s<br/>fenced by claimed_until"]
     RELEASE["_release_row<br/>untried rows of a failed tenant"]
     DLQRETRY["retry_dlq_batch<br/>replays pending TRANSIENT rows<br/>no code path writes TRANSIENT today"]
-    PRUNE["prune_dlq<br/>deletes DUPLICATE and UNSUPPORTED rows older than 90 days<br/>at most once an hour"]
+    PRUNE["prune_dlq<br/>deletes DUPLICATE, DUPLICATE_PAYMENT and UNSUPPORTED rows older than 90 days<br/>at most once an hour"]
 
-    ALEMBIC["alembic upgrade head<br/>revisions 0001 to 0011<br/>DATABASE_URL"]
+    ALEMBIC["alembic upgrade head<br/>revisions 0001 to 0013<br/>DATABASE_URL"]
     PROVISION["provision.py<br/>sync default org signing secret<br/>set the billing_app password"]
 
     PGORG[("org<br/>api_key_sha256, stripe_webhook_secret<br/>downstream_url, active")]
-    PGLEDGER[("ledger<br/>PK org_id and transaction_id<br/>amount_cents, status, payload")]
+    PGLEDGER[("ledger<br/>PK org_id and transaction_id<br/>unique POSTED row per org_id and invoice_id<br/>amount_cents, status, payload")]
     PGOUTBOX[("outbox<br/>dispatched, attempts, next_attempt_at<br/>claimed_until, last_error")]
-    PGDLQ[("dlq<br/>reason, status, retry_count<br/>max_retries, next_retry_at, claimed_at<br/>unique partial indexes for DUPLICATE and UNSUPPORTED")]
+    PGDLQ[("dlq<br/>reason, status, retry_count<br/>max_retries, next_retry_at, claimed_at<br/>unique partial indexes for DUPLICATE, DUPLICATE_PAYMENT and UNSUPPORTED")]
     PGRLS["Row-level security<br/>policies on ledger, outbox, dlq<br/>keyed on app.org_id"]
     ROLE["Role billing_app<br/>NOSUPERUSER, NOBYPASSRLS<br/>SELECT only on org"]
 
-    R200["200 OK with outcome<br/>POSTED, VOID, LIFECYCLE<br/>DLQ_INVALID, DLQ_DUPLICATE, UNSUPPORTED"]
+    R200["200 OK with outcome<br/>POSTED, VOID, LIFECYCLE<br/>DLQ_INVALID, DLQ_DUPLICATE, DUPLICATE_PAYMENT, UNSUPPORTED"]
     RSLOW["Connection closed by Caddy at read_header 10s, no status<br/>NOT RECORDED: no response, no access line, nothing at the default log level (measured)"]
     R499["499 from Caddy: body not done in 30 s, or client closed the request<br/>recorded by Caddy only: access line with status 499, no class and no type<br/>Caddy error routes do not run for 499 (measured)"]
     R502["502 from Caddy: billing:8000 unreachable<br/>recorded by Caddy: access line, class=dependency, type=upstream_unavailable<br/>no application line: the request never reached it"]
@@ -138,9 +138,9 @@ flowchart TB
     PROC -->|"valid event"| TX
     TX -->|"SET LOCAL app.org_id"| PGRLS
     TX --> INS
-    INS -->|"INSERT ON CONFLICT DO NOTHING"| PGLEDGER
+    INS -->|"INSERT ON CONFLICT DO NOTHING, no conflict target"| PGLEDGER
     INS -->|"INSERT only if the ledger row is new"| PGOUTBOX
-    INS -->|"conflict: DUPLICATE, CHECK refused: INVALID"| WDLQ
+    INS -->|"same event: DUPLICATE, paid invoice: DUPLICATE_PAYMENT, CHECK refused: INVALID"| WDLQ
     INS -->|"new event"| R200
     INS -->|"OperationalError"| R503
     WDLQ -->|"INSERT dlq row"| PGDLQ
@@ -185,7 +185,7 @@ flowchart TB
     DLQRETRY -->|"claim pending or stale retrying rows"| PGDLQ
     DLQRETRY -->|"replay with from_retry=True"| PROC
     WLOOP -->|"hourly"| PRUNE
-    PRUNE -->|"DELETE DUPLICATE and UNSUPPORTED rows older than 90 days"| PGDLQ
+    PRUNE -->|"DELETE DUPLICATE, DUPLICATE_PAYMENT and UNSUPPORTED rows older than 90 days"| PGDLQ
 
     ALEMBIC -->|"create and alter tables"| PGORG
     ALEMBIC --> PGLEDGER
@@ -237,18 +237,45 @@ flowchart TB
   client that keeps sending bad keys is stopped by a separate failed-authentication
   budget (`RATE_LIMIT_AUTH_FAILURES`) before it costs a database lookup.
 - **A rejected event is still answered 200.** Validation failures and duplicates are
-  written to `dlq` and returned as `DLQ_INVALID` or `DLQ_DUPLICATE`. Only a database
-  failure returns 503, so that Stripe retries.
+  written to `dlq` and returned as `DLQ_INVALID`, `DLQ_DUPLICATE` or `DUPLICATE_PAYMENT`.
+  Only a database failure returns 503, so that Stripe retries.
+- **A payment is counted once per invoice, not once per event.** Stripe announces one
+  paid invoice with several events (`invoice.paid`, `invoice.payment_succeeded`,
+  `payment_intent.succeeded`, `charge.succeeded`) and does not promise one `invoice.paid`
+  per invoice. The event id cannot catch the second announcement, because its id is new.
+  Migration 0012 adds `ledger.invoice_id` (the `data.object.id` of an invoice event), a
+  unique index allowing one `POSTED` row per `(org_id, invoice_id)`, and a CHECK that a
+  `POSTED` or `VOID` row names its invoice, so no row can escape the index with a NULL.
+  The insert uses `ON CONFLICT DO NOTHING` with no target, which covers both keys, and
+  `_classify_ledger_conflicts` reads which one a skipped row hit: the event id is
+  `DLQ_DUPLICATE`, the invoice is `DUPLICATE_PAYMENT`. A `DUPLICATE_PAYMENT` writes no
+  ledger row and no outbox row, so downstream receives the payment once, and leaves one
+  resolved `dlq` row and a `ledger_duplicate_payment` warning naming both events. This
+  holds on the single-event path, the batch path and both DLQ replays.
+- **`VOID` is one row per failed-payment event; `LIFECYCLE` is in no total.** Each
+  `invoice.payment_failed` is an attempt dunning acts on, so it is a `VOID` row keyed by
+  its event, delivered downstream, and an invoice that fails and is later paid holds its
+  `VOID` rows next to its one `POSTED` row. The attempt cannot be keyed more finely:
+  Stripe's `attempt_count` counts only automatic retries, so two manual failures share it.
+  A `VOID` amount is what failed to be collected, never revenue, and no total the service
+  exposes adds it: `/ledger/summary` counts rows per status and the metrics count events.
+  `LIFECYCLE` rows carry no amount and no invoice.
 - **A Stripe event type the ledger does not record is `UNSUPPORTED`, not an error.** A
   well-formed event of another type (for example `charge.succeeded`) is answered 200 with
   outcome `UNSUPPORTED` and stored in `dlq` with status `resolved`: it is not counted in
   `dlq_depth`, is not retried, and is pruned with the `DUPLICATE` rows after 90 days. An
   event with a supported type and a bad body is still `INVALID`. An event id must be
   printable ASCII, 1 to 255 characters, or the event is `INVALID`.
-- **A replayed signed payload leaves one row.** Unique partial indexes (migrations 0010
-  and 0011) allow at most one `DUPLICATE` and one `UNSUPPORTED` row per
-  `(org_id, transaction_id)`; the insert uses `ON CONFLICT DO NOTHING`, and the answer is
-  still `DLQ_DUPLICATE`.
+- **A replayed signed payload leaves one row.** Unique partial indexes (migrations 0010,
+  0011 and 0012) allow at most one `DUPLICATE`, one `UNSUPPORTED` and one
+  `DUPLICATE_PAYMENT` row per `(org_id, transaction_id)`; the insert uses
+  `ON CONFLICT DO NOTHING`, and the answer is unchanged.
+- **`dlq_depth` counts only rows a person has to act on.** `DUPLICATE`, `UNSUPPORTED` and
+  `DUPLICATE_PAYMENT` rows are written `resolved`: the event is already in the ledger, is a
+  type the ledger does not record, or announces a payment already counted. `DUPLICATE`
+  used to be written `pending`, and since nothing retries it, every Stripe redelivery
+  raised `dlq_depth` by one for good; migration 0013 settled the rows written that way.
+  Only `INVALID` and `TRANSIENT` rows start `pending`.
 - **Slow clients are cut at the edge, and the two cuts leave different traces.** Caddy
   closes a connection whose headers take over 10 s without sending any response, and
   writes nothing about it at the default log level (measured against `caddy:2-alpine`,
@@ -309,9 +336,10 @@ flowchart TB
   service connects as a superuser or a `BYPASSRLS` role, it logs `rls_inert` at start-up
   and isolation falls back to the `org_id` predicates in each query.
 - **The DLQ retry loop is wired but idle.** `retry_dlq_batch` only picks up rows with
-  reason `TRANSIENT`, and nothing in the ingest path writes that reason today. `DUPLICATE`
-  and `INVALID` rows have `max_retries = 0`; they are replayed by hand through
-  `POST /dlq/{dlq_id}/retry`, and a `resolved` row (`UNSUPPORTED`) answers 409.
+  reason `TRANSIENT`, and nothing in the ingest path writes that reason today. `INVALID`
+  rows have `max_retries = 0`; they are replayed by hand through
+  `POST /dlq/{dlq_id}/retry`. A `resolved` row (`DUPLICATE`, `DUPLICATE_PAYMENT`,
+  `UNSUPPORTED`, or an entry a replay settled) answers 409.
 - **Prometheus is not shipped.** `/metrics` is ready to be scraped with the operator key
   in an `X-Api-Key` header, but `docker-compose.yml` has no Prometheus service.
 - **There is no PostHog code.** The repository folder carries the name; the downstream is
@@ -392,7 +420,7 @@ flowchart LR
 
     P1["Order 1, next<br/>Checkout and PaymentIntent event types<br/>NOT IMPLEMENTED"]
     P1A["Capture the payloads with stripe trigger<br/>save them under fixtures/stripe/<br/>replacing the reference-built files"]
-    P1B["Decide which event is the money event<br/>invoice.paid already ledgers a paid invoice"]
+    P1B["Map each new money event to its invoice<br/>one POSTED row per invoice is enforced<br/>decide the key of a payment with no invoice"]
     P1C["Extend EventType, _STATUS_MAP<br/>and the amount field lookup in ledger.py<br/>handle objects with no customer id"]
     P1D["New Alembic revision if a type<br/>conflicts with ledger_amount_matches_kind"]
     P1E["Tests in test_ledger.py<br/>built from the captured payloads"]
@@ -473,17 +501,23 @@ and `test_ledger.py`, so run them in sequence, not in parallel branches.
     contract.
   - One payment arrives as several events. In the sandbox run each paid invoice came with
     a `payment_intent.succeeded` and a `charge.succeeded` within one second of it: 4
-    `invoice.paid`, 4 `payment_intent.succeeded`, 4 `charge.succeeded`. The ledger key is
-    `(org_id, transaction_id)` and the transaction id is the Stripe event id, so these are
-    different rows. Recording `payment_intent.succeeded` next to `invoice.paid` counts
-    one payment twice, and the idempotency guard cannot see it. Decide which event is the
-    money event for a payment that has an invoice before writing code.
+    `invoice.paid`, 4 `payment_intent.succeeded`, 4 `charge.succeeded`. The invariant that
+    keeps them from counting twice is already in place (migration 0012): one `POSTED` row
+    per `(org_id, invoice_id)`, and every `POSTED` row must name its invoice. This proposal
+    has to respect it, not rebuild it. A PaymentIntent or Checkout event that settles an
+    invoice must write that invoice's id into `invoice_id`, so the unique index turns it
+    into `DUPLICATE_PAYMENT` next to `invoice.paid` instead of a second `POSTED` row; in
+    API versions where the PaymentIntent no longer carries `invoice`, that link has to come
+    from the captured payloads before any code is written. A payment with no invoice (a
+    one-off Checkout session) has no invoice id to key on: it needs its own key and a
+    revision that widens `ledger_invoice_rows_name_their_invoice` on purpose, never a NULL
+    that slips past the index.
 - **Depends on.** The Stripe CLI and a Stripe account in test mode, to capture the
   payloads with `stripe trigger`. Neither is part of this repository.
 - **Done when.** Each new type, fed with its captured payload, reaches the ledger with the
   expected status and amount; a replay is `DLQ_DUPLICATE`; an event with a missing amount
   still goes to the DLQ; a payment that arrives as an invoice event and as a PaymentIntent
-  event is recorded once; the captured payloads, for the new types and for the five
+  event is recorded once, in a C6-32-style test that feeds both in every order; the captured payloads, for the new types and for the five
   already supported, are saved under `fixtures/stripe/` in place of the reference-built
   files, and `fixtures/stripe/README.md` states which files were captured; the README lists
   the new types wherever it lists the supported ones.

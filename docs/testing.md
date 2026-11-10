@@ -60,6 +60,13 @@ assert results_concurrent.count("DLQ_DUPLICATE") == 4  # all others hit ON CONFL
 assert ledger_rows == 1                                # counted by a separate connection
 ```
 
+C6-32 runs the same race on the payment key instead of the event key: eight threads, eight
+different event ids, one invoice, half through the single-event path and half through the
+batch path, five rounds, and once more as `billing_app` with row-level security enforced.
+Each round must end with one `POSTED` row, one outbox row and seven `DUPLICATE_PAYMENT`
+answers. The unique index decides the winner; `_classify_ledger_conflicts` only reads,
+after the fact, which key a skipped row hit.
+
 ### What each section covers
 
 The labels are the ones used in the section headers of `test_ledger.py`, so they can be
@@ -68,7 +75,7 @@ found with `grep`.
 | Section | What it checks |
 |---|---|
 | Phase 1 | Entry boundary: Pydantic types, field limits, the `EventType` enum, currency, customer and amount rules |
-| Phase 2 | Output models: `DLQEntry` and `LedgerEntry` construction and `to_db()` serialization |
+| Phase 2 | Output models: `DLQEntry` and `LedgerEntry` construction and `to_db()` serialization, which must match the column list of both ledger `INSERT` statements |
 | Phase 3 | Cross-field rules: a failed invoice needs an amount above zero, a paid invoice may be zero, customer ids start with `cus_` |
 | Phase 4 | Batch results are indexed by input position, an empty batch returns an empty list, a database failure in the handler is a 503 |
 | Phase 5 | Full stack over HTTP: 200 and 422, a bad signature is a 400, concurrent idempotency, batch duplicate partition, `BIGINT` amounts, outbox, DLQ |
@@ -116,6 +123,8 @@ found with `grep`.
 | C6-27 | A replayed event leaves one `DUPLICATE` row |
 | C6-28 | Event types the ledger does not record are `UNSUPPORTED`, not `INVALID` |
 | C6-30 | Every error path, driven through the real app, moves `http_errors_total` by one with the right `status`, `error_class` and `error_type`, moves `http_requests_total` by one (the 413 and the 500 included), and leaves exactly one `http_request` line with the same class and type; none ends in the `unclassified` fallback; a hostile path or tenant id never becomes a label; a request that ends with no response records nothing; no bare `HTTPException` in `ledger.py` |
+| C6-32 | A payment is counted once per invoice: every order of `invoice.paid`, `invoice.payment_succeeded`, `payment_intent.succeeded` and `charge.succeeded` for one invoice leaves one `POSTED` row; a second `invoice.paid` for the same invoice (new event id, even a different amount) is `DUPLICATE_PAYMENT` with no ledger row, no outbox row and one resolved `dlq` row, over HTTP too; the concurrent race above; the batch path and both DLQ replay paths; two tenants with one invoice id; failed attempts are one `VOID` row each and never revenue; `LIFECYCLE` rows carry no amount and no invoice; the database refuses a `POSTED` or `VOID` row with no invoice and a second `POSTED` row for one invoice; migration 0012's backfill, its refusal over an existing double count, and its downgrade |
+| C6-33 | A redelivered event does not raise `dlq_depth`: a `DUPLICATE` row is born `resolved` on the single-event and the batch path, `/ledger/summary` and the `/metrics` gauge leave it out, an `INVALID` row still counts, a manual retry answers 409; migration 0013 resolves the `pending` `DUPLICATE` rows written before it and leaves `exhausted` `DUPLICATE`, `INVALID` and `TRANSIENT` rows alone |
 | C6-31 | The Caddyfile writes a JSON access log with the request headers removed (site logger and default logger), marks its own `413` and `502` with the application's class and type, and keeps the slow-client timeouts |
 
 ## Caddy behaviour the suite cannot check
@@ -208,6 +217,15 @@ C6-30 was checked this way. Registering the observability layer inside the body 
 fails 3 checks, all on the 413. Removing the code that records class and type fails 53.
 Making the type marking a no-op fails 50, with every error landing in the `unclassified`
 fallback.
+
+C6-32 was checked the same way, each mutation in a copy of the tree with the schema built
+from that copy, and the full suite run each time. A non-unique index in place of
+`uq_ledger_one_posted_per_invoice` fails 35 checks, all in C6-32. Dropping the invoice-id
+extraction and the CHECK together fails 47, all in C6-32. Dropping the extraction alone,
+with the CHECK in place, fails 15 checks in Phase 1 and stops the run: the database refuses
+every invoice row, so the gap is loud, not silent. Letting `DUPLICATE` rows keep the
+`pending` default again fails 10 checks: 6 in C6-33 and the 4 earlier checks that assert a
+fresh `DUPLICATE` row is `resolved` (Phase 5, A2, A16, C6-32).
 
 One trap is worth knowing. A test that reports "no leak observed" can mean the leak does
 not exist or that the instrumentation never ran. The `/metrics` isolation test therefore

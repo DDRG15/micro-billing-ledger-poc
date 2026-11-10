@@ -98,6 +98,7 @@ def fake_event(index: int) -> dict:
         "id":   f"evt_bench_{suffix}",
         "type": "invoice.paid",
         "data": {"object": {
+            "id":          f"in_bench_{suffix}",   # one invoice per event, like the id
             "customer":    f"cus_bench{index:07d}",
             "amount_paid": random.randint(100, 100_000),
             "currency":    "usd",

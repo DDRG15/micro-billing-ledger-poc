@@ -218,6 +218,10 @@ _AMOUNT_FIELDS_DEFAULT = ("amount_paid", "amount", "amount_due")
 EVENT_ID_PATTERN = r"^[\x21-\x7e]{1,255}$"
 _EVENT_ID_RE = re.compile(r"[\x21-\x7e]{1,255}")
 
+# What an invoice id may look like: Stripe's "in_" prefix, then printable ASCII, 255 at most.
+#     See StripeEvent.check_invoice_id.
+_INVOICE_ID_RE = re.compile(r"in_[\x21-\x7e]{1,252}")
+
 
 def _dlq_transaction_id(event: dict) -> str:
     """The transaction_id for a DLQ row written because `event` failed validation.
@@ -245,6 +249,15 @@ class StripeObject(BaseModel):
     amount must be present depends on the event type, which this model cannot see,
     so that rule lives on StripeEvent (check_amount_present).
     """
+
+    # The object's own Stripe id: "in_..." for an Invoice, "sub_..." for a Subscription.
+    #     Optional here because this model cannot see the event type; StripeEvent
+    #     (check_invoice_id) requires it for invoice events, where it is the key the
+    #     ledger deduplicates payments on. Every Stripe object carries one.
+    id: Optional[str] = Field(
+        default=None,
+        description="Stripe object id (e.g., 'in_1N4P...' for an invoice)"
+    )
 
     # Stripe customer IDs look like "cus_ABC123". min_length=4 catches empty
     #     strings and single-char placeholders. The cus_ prefix check is in StripeEvent.
@@ -452,6 +465,37 @@ class StripeEvent(BaseModel):
         return self
 
     @model_validator(mode='after')
+    def check_invoice_id(self):
+        """
+        Cross-field rule: an invoice event must name its invoice, as Stripe always does
+        ("in_" followed by printable ASCII, at most 255 characters).
+
+        The invoice id is what the ledger counts a payment by (see
+        invoice_id_for_ledger). Stripe announces one payment with several events, and
+        nothing promises one invoice.paid per invoice, so the event id cannot keep a
+        payment from being counted twice; the invoice id can, through the unique index
+        uq_ledger_one_posted_per_invoice (migration 0012). An invoice event without it
+        would sit outside that index, so it is refused here, before any write, and the
+        database refuses the row as well (ledger_invoice_rows_name_their_invoice).
+        Subscription events are exempt: their object is a Subscription, not a payment.
+        """
+        if self.type in _LIFECYCLE_TYPES:
+            return self
+        obj_id = self.data.object.id
+        if not isinstance(obj_id, str) or not _INVOICE_ID_RE.fullmatch(obj_id):
+            raise ValueError(
+                f"{self.type.value} must carry data.object.id, the invoice id "
+                f"('in_' + printable ASCII, at most 255 characters)"
+            )
+        return self
+
+    def invoice_id_for_ledger(self) -> Optional[str]:
+        """The invoice this event's ledger row belongs to, or None for a subscription event."""
+        if self.type in _LIFECYCLE_TYPES:
+            return None
+        return self.data.object.id
+
+    @model_validator(mode='after')
     def check_customer_id_format(self):
         """
         Cross-field rule: Stripe customer IDs always start with 'cus_'.
@@ -496,7 +540,19 @@ class LedgerStatus(str, Enum):
     The _STATUS_MAP below uses EventType keys and LedgerStatus values — both
     are enums, so mypy can verify the mapping is complete.
     """
+    # The only status that is money collected. At most one per (org_id, invoice_id):
+    #     uq_ledger_one_posted_per_invoice, migration 0012.
     POSTED    = "POSTED"     # Revenue confirmed — invoice.paid
+    # One row per invoice.payment_failed EVENT, keyed like any event, not one per invoice.
+    #     Each failed attempt is a fact dunning acts on, and an invoice that fails and is
+    #     later paid correctly holds VOID rows next to its one POSTED row. Nothing can
+    #     key an attempt more finely than the event: Stripe's attempt_count counts only
+    #     automatic retries ("manual payment attempts after the first attempt do not
+    #     affect the retry schedule"), so two real manual failures share a count and a
+    #     key on it would discard one of them. A VOID amount is what failed to be
+    #     collected, never revenue: no total this service exposes adds VOID amounts
+    #     (/ledger/summary counts rows per status, the metrics count events), so N
+    #     attempts at the same amount_due are N facts, not N times the money.
     VOID      = "VOID"       # Payment failed — invoice.payment_failed
     LIFECYCLE = "LIFECYCLE"  # Account state changed, no money moved — customer.subscription.*
     # No event type maps to PENDING any more (subscription.updated used to). Kept
@@ -511,6 +567,8 @@ class DLQReason(str, Enum):
     instead of freeform strings means DLQ entries can be filtered and replayed
     by reason type — e.g., replay all INVALID entries after fixing a validator.
     """
+    # Stripe's redelivery of an event the ledger already holds. Audit-only: stored as
+    #     'resolved' (see DLQEntry), so a redelivery is not counted in dlq_depth.
     DUPLICATE    = "DUPLICATE"     # Stripe retry of already-processed event
     INVALID      = "INVALID"       # Failed Pydantic validation — bad structure or business rule
     UNKNOWN_TYPE = "UNKNOWN_TYPE"  # Reserved, never written — see UNSUPPORTED
@@ -522,12 +580,28 @@ class DLQReason(str, Enum):
     #     such an event, so it is stored for visibility with status 'resolved' (not
     #     actionable, not retried, 409 on manual retry) and aged out like DUPLICATE.
     UNSUPPORTED  = "UNSUPPORTED"
+    # A new event (its id is not in the ledger) for an invoice that already has its POSTED
+    #     row: the same payment announced again under another event id. Stripe does not
+    #     promise one invoice.paid per invoice, and the database refuses a second POSTED
+    #     row for one (org_id, invoice_id), so this row is the trace of what arrived. The
+    #     money is already counted and delivered once, so there is nothing to act on:
+    #     stored as 'resolved' like UNSUPPORTED (not in dlq_depth, 409 on manual retry),
+    #     one row per event, aged out by prune_dlq.
+    DUPLICATE_PAYMENT = "DUPLICATE_PAYMENT"
     # TRANSIENT is the only reason the retry worker auto-processes. It is wired and tested
     #     but has no production trigger today: single-event DB failures return HTTP 503 so
     #     Stripe itself retries, and batch failures roll back atomically. It is provisioned
     #     for a future non-Stripe / internal-async source — one with no upstream retrier —
     #     where a network timeout or an upstream 503 must be re-attempted by us, not Stripe.
     TRANSIENT    = "TRANSIENT"     # Transient DB/network error — auto-retryable (see note above)
+
+
+# Reasons that record an event with nothing left to do. Born 'resolved' (DLQEntry), so they
+#     never count in dlq_depth, are never retried, answer 409 on manual retry, and are
+#     aged out by prune_dlq.
+_AUDIT_ONLY_REASONS: frozenset = frozenset({
+    DLQReason.DUPLICATE, DLQReason.UNSUPPORTED, DLQReason.DUPLICATE_PAYMENT,
+})
 
 
 class DLQStatus(str, Enum):
@@ -556,6 +630,8 @@ class DLQEntry(BaseModel):
     received_at:    datetime   = Field(default_factory=lambda: datetime.now(timezone.utc))
     # Retry tracking — DUPLICATE and INVALID default to max_retries=0 (no auto-retry).
     # TRANSIENT defaults to max_retries=3 (auto-retried by the worker).
+    # status defaults to PENDING, except for the audit-only reasons (_AUDIT_ONLY_REASONS),
+    #     which __init__ files as RESOLVED unless the caller set a status explicitly.
     status:         DLQStatus  = DLQStatus.PENDING
     retry_count:    int        = 0
     max_retries:    int        = 0
@@ -567,6 +643,16 @@ class DLQEntry(BaseModel):
         # next_retry_at stays NULL, which the SELECT treats as "retry immediately".
         if self.reason == DLQReason.TRANSIENT and self.max_retries == 0:
             object.__setattr__(self, "max_retries", 3)
+        # A DUPLICATE, UNSUPPORTED or DUPLICATE_PAYMENT row is born resolved. Each records
+        #     an event there is nothing to do with: already in the ledger, a type the ledger
+        #     does not record, or a payment already counted. DUPLICATE used to be born
+        #     'pending' with max_retries 0, so no worker ever touched it and it stayed in
+        #     dlq_depth, the number that means "rows still needing action": every Stripe
+        #     redelivery raised the alarm by one, for good, with nothing wrong. Deciding it
+        #     here, not at each call site, keeps the single-event path,
+        #     the batch path and any future writer in agreement.
+        if self.reason in _AUDIT_ONLY_REASONS and "status" not in self.model_fields_set:
+            object.__setattr__(self, "status", DLQStatus.RESOLVED)
 
     def to_db(self) -> tuple:
         # org_id leads, matching the column order in every dlq INSERT.
@@ -585,9 +671,9 @@ class DLQEntry(BaseModel):
 
 class LedgerEntry(BaseModel):
     """
-    A fully-validated ledger row ready for database insertion. All nine fields
-    are constrained — no raw strings, no unvalidated amounts. to_db() produces
-    a 9-tuple in the exact column order of the INSERT statement, eliminating
+    A fully-validated ledger row ready for database insertion. Every field
+    is constrained — no raw strings, no unvalidated amounts. to_db() produces
+    an 11-tuple in the exact column order of _LEDGER_COLUMNS, eliminating
     query-column sequence drift. If you add a field here, you must add it to
     to_db() and to the INSERT — the code will be obviously incomplete.
     """
@@ -605,10 +691,13 @@ class LedgerEntry(BaseModel):
     idempotency_key: str          = Field(min_length=1)            # Network safety reference
     payload:         str                                           # Full JSON string — the outbox uses this for replay
     created_at:      datetime                                      # Timezone-aware ingestion timestamp (TIMESTAMPTZ)
+    # The invoice the row's money belongs to (data.object.id of an invoice event); None
+    #     for a lifecycle row. The key of uq_ledger_one_posted_per_invoice (migration 0012).
+    invoice_id:      Optional[str] = Field(default=None, min_length=1)
 
     def to_db(self) -> tuple:
         """
-        Serializes the LedgerEntry to an ordered 9-tuple for the INSERT statement.
+        Serializes the LedgerEntry to an ordered 11-tuple, in _LEDGER_COLUMNS order.
         .value on enum fields produces plain strings for TEXT columns.
         Column order here must match the INSERT statement in process_stripe_event
         exactly — any mismatch causes silent data corruption (wrong value in wrong column).
@@ -624,7 +713,28 @@ class LedgerEntry(BaseModel):
             self.idempotency_key,
             self.payload,
             self.created_at,
+            self.invoice_id,          # last, so the positions above stay where they were
         )
+
+
+# The ledger INSERT column list, in LedgerEntry.to_db() order, and the two statements that
+#     use it: the single-event path and the batch path. Spelled out as literals, not
+#     formatted in, so no SQL in this module is built from a variable; test_ledger.py
+#     checks that both statements carry this exact list and that to_db() matches its width.
+#     ON CONFLICT DO NOTHING has no conflict target on purpose: it covers the event key
+#     (the primary key) and the payment key (uq_ledger_one_posted_per_invoice, migration
+#     0012) alike; _classify_ledger_conflicts says which one a skipped row hit.
+_LEDGER_COLUMNS = ("(org_id, transaction_id, event_type, customer_id, amount_cents,"
+                   " currency, status, idempotency_key, payload, created_at, invoice_id)")
+_LEDGER_INSERT_ONE = (
+    "INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, amount_cents,"
+    " currency, status, idempotency_key, payload, created_at, invoice_id)"
+    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    " ON CONFLICT DO NOTHING")
+_LEDGER_INSERT_MANY = (
+    "INSERT INTO ledger (org_id, transaction_id, event_type, customer_id, amount_cents,"
+    " currency, status, idempotency_key, payload, created_at, invoice_id) VALUES %s"
+    " ON CONFLICT DO NOTHING RETURNING transaction_id")
 
 
 # ===========================================================================
@@ -964,6 +1074,33 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
                 END IF;
             END $$
         """)
+        # One POSTED row per invoice (migration 0012): invoice_id, backfilled from the stored
+        #     payload while the index is absent, the partial unique index, and the CHECK
+        #     that keeps a POSTED or VOID row from leaving invoice_id NULL and so escaping
+        #     the index. Over rows that already count one invoice twice the CREATE fails
+        #     and names the key; the migration refuses the same data with instructions.
+        cur.execute("ALTER TABLE ledger ADD COLUMN IF NOT EXISTS invoice_id TEXT")
+        cur.execute("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_class
+                               WHERE relname = 'uq_ledger_one_posted_per_invoice') THEN
+                    UPDATE ledger SET invoice_id = CASE
+                        WHEN NOT pg_input_is_valid(payload, 'jsonb') THEN NULL
+                        WHEN jsonb_typeof(payload::jsonb #> '{data,object,id}') = 'string'
+                            THEN NULLIF(payload::jsonb #>> '{data,object,id}', '')
+                        END
+                    WHERE invoice_id IS NULL AND event_type LIKE 'invoice.%';
+                    CREATE UNIQUE INDEX uq_ledger_one_posted_per_invoice
+                        ON ledger (org_id, invoice_id) WHERE status = 'POSTED';
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                               WHERE conname = 'ledger_invoice_rows_name_their_invoice') THEN
+                    ALTER TABLE ledger ADD CONSTRAINT ledger_invoice_rows_name_their_invoice
+                        CHECK (status NOT IN ('POSTED', 'VOID') OR invoice_id IS NOT NULL)
+                        NOT VALID;
+                END IF;
+            END $$
+        """)
 
         # dlq — every rejected event lands here with a structured reason code.
         #     raw_payload is the full event JSON as received (every field; re-serialized,
@@ -1046,6 +1183,11 @@ def _bootstrap(dsn: str = DATABASE_URL) -> "psycopg2.extensions.connection":
         cur.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS uq_dlq_one_unsupported_per_event
             ON dlq (org_id, transaction_id) WHERE reason = 'UNSUPPORTED'
+        """)
+        # uq_dlq_one_duplicate_payment_per_event (migration 0012): same rule again.
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_dlq_one_duplicate_payment_per_event
+            ON dlq (org_id, transaction_id) WHERE reason = 'DUPLICATE_PAYMENT'
         """)
         # idx_dlq_stale_claim — covers the reclaim half of the retry_dlq_batch WHERE
         # clause: status='retrying' AND claim older than the timeout. Mirrors 0003.
@@ -1130,8 +1272,81 @@ _STATUS_MAP: dict[EventType, LedgerStatus] = {
 #     UNSUPPORTED settles an entry as well: a row written as INVALID before that outcome
 #     existed (a charge.succeeded from an earlier run) replays to UNSUPPORTED, and
 #     leaving it pending would keep it in dlq_depth forever with nothing left to try.
+#     DUPLICATE_PAYMENT settles one too: the invoice's payment is in the ledger, under the
+#     event that announced it first.
 _RESOLVING_OUTCOMES: frozenset = frozenset(
-    {s.value for s in LedgerStatus} | {"DLQ_DUPLICATE", "UNSUPPORTED"})
+    {s.value for s in LedgerStatus} | {"DLQ_DUPLICATE", "UNSUPPORTED", "DUPLICATE_PAYMENT"})
+
+
+def _classify_ledger_conflicts(
+    cur: "psycopg2.extensions.cursor",
+    org_id: str,
+    entries: list,
+) -> dict:
+    """Why each of `entries` was skipped by `INSERT ... ON CONFLICT DO NOTHING`.
+
+    Returns {transaction_id: (outcome, existing_transaction_id)}. Two unique keys guard the
+    ledger and they mean different things:
+      (org_id, transaction_id)  the same EVENT again: Stripe's at-least-once redelivery,
+                                answered DLQ_DUPLICATE as it always was.
+      (org_id, invoice_id) for POSTED rows (uq_ledger_one_posted_per_invoice)
+                                a NEW event for a payment already counted: another
+                                invoice.paid for the same invoice. DUPLICATE_PAYMENT.
+    The event key wins when both hold, so a redelivery is never reported as a new event.
+
+    Runs in the caller's transaction, after its INSERT. Under READ COMMITTED each statement
+    takes a fresh snapshot, and ON CONFLICT only skips a row once the conflicting row's
+    transaction has committed (it waits while that one is in flight), so the row that
+    caused the skip is visible here. A skip that matches neither key means a unique index
+    this function does not know about; it raises, the transaction rolls back and the
+    webhook answers 503, so nothing is acknowledged that was not understood.
+    """
+    if not entries:
+        return {}
+    tids = [e.transaction_id for e in entries]
+    cur.execute(
+        "SELECT transaction_id FROM ledger WHERE org_id = %s AND transaction_id = ANY(%s)",
+        (org_id, tids),
+    )
+    known_events = {row[0] for row in cur.fetchall()}
+    invoices = sorted({e.invoice_id for e in entries
+                       if e.transaction_id not in known_events
+                       and e.status == LedgerStatus.POSTED and e.invoice_id})
+    posted_by_invoice: dict = {}
+    if invoices:
+        cur.execute(
+            "SELECT invoice_id, transaction_id FROM ledger "
+            "WHERE org_id = %s AND status = 'POSTED' AND invoice_id = ANY(%s)",
+            (org_id, invoices),
+        )
+        posted_by_invoice = {row[0]: row[1] for row in cur.fetchall()}
+    verdict: dict = {}
+    for e in entries:
+        if e.transaction_id in known_events:
+            verdict[e.transaction_id] = ("DLQ_DUPLICATE", e.transaction_id)
+        elif e.status == LedgerStatus.POSTED and e.invoice_id in posted_by_invoice:
+            verdict[e.transaction_id] = ("DUPLICATE_PAYMENT", posted_by_invoice[e.invoice_id])
+        else:
+            raise RuntimeError(
+                f"ledger skipped event {e.transaction_id} on a conflict that is neither its "
+                f"event id nor its invoice's POSTED row")
+    return verdict
+
+
+def _log_duplicate_payment(org_id: str, entry: "LedgerEntry", recorded_as: str) -> None:
+    """One WARNING per DUPLICATE_PAYMENT, naming both events and the invoice.
+
+    webhook_events_total{outcome="DUPLICATE_PAYMENT"} is the counter that alerts; this line
+    is what the on-call engineer reads next: which invoice, which event was refused and
+    which one already holds the payment.
+    """
+    _log.warning(
+        "duplicate payment refused transaction_id=%s invoice_id=%s recorded_as=%s",
+        entry.transaction_id, entry.invoice_id, recorded_as,
+        extra={"event": "ledger_duplicate_payment", "org_id": org_id,
+               "transaction_id": entry.transaction_id, "invoice_id": entry.invoice_id,
+               "recorded_as": recorded_as, "amount_cents": entry.amount_cents},
+    )
 
 
 def _unsupported_event_type(event: dict) -> Optional[str]:
@@ -1182,6 +1397,8 @@ def process_stripe_event(
       LIFECYCLE  — new customer.subscription.*, written with no amount
       DLQ_INVALID    — Pydantic validation failed; event in DLQ
       DLQ_DUPLICATE  — already processed; idempotency guard fired; event in DLQ
+      DUPLICATE_PAYMENT — a new event for an invoice whose payment is already POSTED;
+                       no ledger row, no outbox row, a resolved DLQ row as the trace
       UNSUPPORTED    — well-formed event of a type the ledger does not record; kept in
                        the DLQ as a resolved row (not counted in dlq_depth)
     Neither outcome writes a new DLQ row when from_retry is True.
@@ -1277,27 +1494,28 @@ def process_stripe_event(
         idempotency_key=idempotency_key,
         payload=payload_json,
         created_at=now,
+        invoice_id=validated_event.invoice_id_for_ledger(),
     )
 
     # ── Transactional Outbox: atomic dual-write ───────────────────────────────
     # The ledger INSERT and the outbox INSERT are in the same BEGIN…COMMIT.
-    #     ON CONFLICT (transaction_id) DO NOTHING is the idempotency guard:
-    #     if the event ID already exists in the ledger, the INSERT silently skips.
+    #     ON CONFLICT DO NOTHING, with no conflict target, is the idempotency guard for
+    #     BOTH unique keys: the event (PRIMARY KEY org_id, transaction_id) and the payment
+    #     (uq_ledger_one_posted_per_invoice). A target naming only the event key let a
+    #     second invoice.paid for one invoice through as a second POSTED row, because its
+    #     event id was new; with the payment index in place, a target would turn that
+    #     case into an unhandled unique violation instead.
     #     rowcount=1 = new event, committed to both ledger and outbox.
-    #     rowcount=0 = duplicate, ON CONFLICT fired, nothing written.
+    #     rowcount=0 = a key already held; _classify_ledger_conflicts says which one,
+    #     inside the same transaction, and nothing is written to the outbox.
+    duplicate_of: Optional[tuple] = None
     try:
         with _tx(conn, org_id) as cur:
-            cur.execute(
-                """
-                INSERT INTO ledger
-                  (org_id, transaction_id, event_type, customer_id, amount_cents,
-                   currency, status, idempotency_key, payload, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (org_id, transaction_id) DO NOTHING
-                """,
-                ledger_entry.to_db(),
-            )
+            cur.execute(_LEDGER_INSERT_ONE, ledger_entry.to_db())
             inserted = cur.rowcount  # 1=new row inserted, 0=ON CONFLICT fired (duplicate)
+            if inserted == 0:
+                duplicate_of = _classify_ledger_conflicts(
+                    cur, org_id, [ledger_entry])[transaction_id]
 
             if inserted == 1:
                 # Only write outbox row for genuinely new events — not for duplicates.
@@ -1348,6 +1566,26 @@ def process_stripe_event(
     #     inserted=0 means the event was a duplicate — idempotency guard fired.
     #     Write to DLQ with reason DUPLICATE for audit visibility.
     #     The duplicate event is NOT an error — it's Stripe doing its job (at-least-once delivery).
+    if duplicate_of is not None and duplicate_of[0] == "DUPLICATE_PAYMENT":
+        # A new event for a payment already counted. Not a redelivery (its id is new), so
+        #     the trace is its own reason, stored resolved: the money is in the ledger once
+        #     and in the outbox once, and there is nothing left to do. On a replay the DLQ
+        #     entry being retried is the trace, as for DUPLICATE. A lost trace row costs an
+        #     audit line, not money, so a failed write stays log-only and the answer 200.
+        recorded_as = duplicate_of[1]
+        _log_duplicate_payment(org_id, ledger_entry, recorded_as)
+        if not from_retry:
+            _write_dlq(conn, DLQEntry(
+                org_id=org_id, transaction_id=transaction_id,
+                reason=DLQReason.DUPLICATE_PAYMENT, raw_payload=event,
+                status=DLQStatus.RESOLVED))
+        return {
+            "outcome":        "DUPLICATE_PAYMENT",
+            "transaction_id": transaction_id,
+            "reason":         f"Payment already recorded: invoice {ledger_entry.invoice_id} "
+                              f"is POSTED under event {recorded_as}",
+        }
+
     if inserted == 0:
         # On a replay the DUPLICATE row already exists — it is the entry being retried.
         #     Writing another would grow the queue by one row per retry, forever.
@@ -1401,9 +1639,10 @@ def _write_dlq(conn: "psycopg2.extensions.connection", entry: DLQEntry) -> bool:
                 "INSERT INTO dlq (org_id, transaction_id, reason, raw_payload, received_at,"
                 " status, retry_count, max_retries, next_retry_at)"
                 " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
-                # A DUPLICATE row already held for this event (uq_dlq_one_duplicate_per_event)
+                # A DUPLICATE, UNSUPPORTED or DUPLICATE_PAYMENT row already held for this
+                #     event (the unique partial indexes of migrations 0010, 0011, 0012)
                 #     makes the repeat a no-op: a replayed signed payload used to append
-                #     one row per request. The caller still answers DLQ_DUPLICATE.
+                #     one row per request. The caller still answers the same outcome.
                 " ON CONFLICT DO NOTHING",
                 entry.to_db(),
             )
@@ -1630,13 +1869,16 @@ def prune_dlq(
     conn: "psycopg2.extensions.connection",
     retention_days: int = 90,
 ) -> int:
-    """Delete DUPLICATE and UNSUPPORTED DLQ rows older than retention_days. Returns rows deleted.
+    """Delete DUPLICATE, UNSUPPORTED and DUPLICATE_PAYMENT DLQ rows older than retention_days.
+
+    Returns rows deleted.
 
     Without retention the dlq table grows without bound: Stripe's at-least-once
     redelivery writes a DUPLICATE row per replayed event, and at 500 TPS even a small
     duplicate rate is millions of audit-only rows per day. Those rows are safe to age out.
     UNSUPPORTED rows are the same kind of row: a Stripe account sends event types the
-    ledger never records, one row each, with nothing left to do.
+    ledger never records, one row each, with nothing left to do. So are DUPLICATE_PAYMENT
+    rows: the payment they announce is already in the ledger under another event.
     INVALID and exhausted entries are NEVER pruned — they need human review and stay until
     an operator resolves them.
 
@@ -1651,7 +1893,7 @@ def prune_dlq(
             "DELETE FROM dlq "
             "WHERE reason = ANY(%s) "
             "  AND received_at < NOW() - make_interval(days => %s)",
-            ([DLQReason.DUPLICATE.value, DLQReason.UNSUPPORTED.value], retention_days),
+            (sorted(r.value for r in _AUDIT_ONLY_REASONS), retention_days),
         )
         return cur.rowcount
 
@@ -1670,11 +1912,15 @@ def process_stripe_event_batch(
     of the 192× throughput gain observed in the benchmark (26 TPS → ~5,000 TPS).
 
     WHY page_size=1000:
-    PostgreSQL limits a prepared statement to 65,535 bind parameters. With 9 ledger
-    columns per row, 1,000 rows = 9,000 parameters — safely within the limit while
+    PostgreSQL limits a prepared statement to 65,535 bind parameters. With 11 ledger
+    columns per row, 1,000 rows = 11,000 parameters — safely within the limit while
     keeping round trips near the minimum. Larger pages would require pre-splitting;
-    smaller pages waste round trips. 1,000 is the practical sweet spot for a 9-column
-    table on a localhost connection.
+    smaller pages waste round trips. 1,000 is the practical sweet spot for an
+    11-column insert on a localhost connection.
+
+    A batch in which some events did not land costs one or two more round trips:
+    _classify_ledger_conflicts asks which key each skipped event hit (the event id,
+    DLQ_DUPLICATE, or its invoice's POSTED row, DUPLICATE_PAYMENT).
 
     WHY RETURNING for duplicate partitioning:
     After a bulk INSERT with ON CONFLICT DO NOTHING, we need to know which rows
@@ -1764,6 +2010,7 @@ def process_stripe_event_batch(
             idempotency_key=validated.idempotency_key,
             payload=json.dumps(event),
             created_at=now,
+            invoice_id=validated.invoice_id_for_ledger(),
         )
         valid.append((idx, event, entry))
 
@@ -1781,10 +2028,10 @@ def process_stripe_event_batch(
             if valid:
                 # execute_values sends rows in page_size-row SQL statements.
                 #     Each statement carries (page_size × columns) bind parameters —
-                #     1,000 rows × 9 columns = 9,000 parameters, within PostgreSQL's
+                #     1,000 rows × 11 columns = 11,000 parameters, within PostgreSQL's
                 #     65,535-parameter limit. Fewer statements = fewer round trips = higher TPS.
                 #
-                #     ON CONFLICT (transaction_id) DO NOTHING is enforced per-row by
+                #     ON CONFLICT DO NOTHING is enforced per-row by
                 #     PostgreSQL's constraint engine — not by application code. This is the
                 #     same serialization point as process_stripe_event(); it works identically
                 #     under concurrent writers because the PRIMARY KEY constraint is the lock.
@@ -1798,16 +2045,12 @@ def process_stripe_event_batch(
                 #
                 #     fetch=True tells execute_values to accumulate RETURNING rows across
                 #     all page_size batches and return them together as one list.
+                #     No conflict target: the payment key (uq_ledger_one_posted_per_invoice)
+                #     is skipped the same way as the event key, including two events for
+                #     one invoice inside this batch, where the first one wins.
                 returned = execute_values(
                     cur,
-                    """
-                    INSERT INTO ledger
-                      (org_id, transaction_id, event_type, customer_id, amount_cents,
-                       currency, status, idempotency_key, payload, created_at)
-                    VALUES %s
-                    ON CONFLICT (org_id, transaction_id) DO NOTHING
-                    RETURNING transaction_id
-                    """,
+                    _LEDGER_INSERT_MANY,
                     [entry.to_db() for _, _, entry in valid],
                     page_size=page_size,
                     fetch=True,
@@ -1824,6 +2067,19 @@ def process_stripe_event_batch(
             #     correctly routes to DLQ_DUPLICATE instead of being misclassified as new.
             remaining_ids: set[str] = set(inserted_ids)
 
+            # Every entry that did not land, classified in one query per key: the same
+            #     event again (DLQ_DUPLICATE) or a new event for a payment already counted
+            #     (DUPLICATE_PAYMENT). A same-batch repeat of an event id that did land is
+            #     found by the event-key query too: the row is visible to this transaction.
+            _seen: set = set()
+            _skipped: list = []
+            for _i, _e, entry in valid:
+                if entry.transaction_id in inserted_ids and entry.transaction_id not in _seen:
+                    _seen.add(entry.transaction_id)
+                else:
+                    _skipped.append(entry)
+            verdicts = _classify_ledger_conflicts(cur, org_id, _skipped)
+
             for idx, event, entry in valid:
                 if entry.transaction_id in remaining_ids:
                     remaining_ids.discard(entry.transaction_id)  # consume so duplicate in same batch routes correctly
@@ -1835,6 +2091,22 @@ def process_stripe_event_batch(
                         "outcome":        entry.status.value,
                         "transaction_id": entry.transaction_id,
                         "reason":         None,
+                    }
+                elif verdicts[entry.transaction_id][0] == "DUPLICATE_PAYMENT":
+                    recorded_as = verdicts[entry.transaction_id][1]
+                    _log_duplicate_payment(org_id, entry, recorded_as)
+                    dup_dlq_rows.append(
+                        DLQEntry(
+                            org_id=org_id, transaction_id=entry.transaction_id,
+                            reason=DLQReason.DUPLICATE_PAYMENT, raw_payload=event,
+                            status=DLQStatus.RESOLVED,
+                        ).to_db()
+                    )
+                    results[idx] = {
+                        "outcome":        "DUPLICATE_PAYMENT",
+                        "transaction_id": entry.transaction_id,
+                        "reason":         f"Payment already recorded: invoice {entry.invoice_id} "
+                                          f"is POSTED under event {recorded_as}",
                     }
                 else:
                     dup_dlq_rows.append(
