@@ -177,7 +177,7 @@ The Transactional Outbox pattern guarantees that a `ledger` row and its correspo
 
 The worker runs **claim → dispatch → finish**:
 
-1. **Claim:** a short transaction selects eligible rows per tenant with `FOR UPDATE SKIP LOCKED`, ranks them round-robin across tenants, and sets `claimed_until`. Rows already delivered, backing off, or under a live lease are excluded. The transaction commits before dispatch starts. `WORKER_LEASE_SECONDS` defaults to `WORKER_BATCH_SIZE * 10 + 60` seconds (1,060 seconds for the default batch of 100).
+1. **Claim:** a short transaction selects eligible rows per tenant with `FOR UPDATE SKIP LOCKED`, ranks them round-robin across tenants — within a rank, tenants rotate in `org_id` order starting after the last tenant this worker served, so with more backlogged tenants than batch slots each one still gets a slot in turn — and sets `claimed_until`. Rows already delivered, backing off, or under a live lease are excluded. The transaction commits before dispatch starts. `WORKER_LEASE_SECONDS` defaults to `WORKER_BATCH_SIZE * 10 + 60` seconds (1,060 seconds for the default batch of 100).
 2. **Dispatch:** HTTP calls run with no database transaction open and no row locks held. The HTTP timeout is 10 seconds per socket operation (connect, each read), not per row: a downstream that keeps sending bytes slowly can hold one dispatch longer, which is how a worker can outlive its lease.
 3. **Finish:** each row's result commits in its own transaction scoped to that row's tenant. Success sets `dispatched=1` and `dispatched_at`; failure increments `attempts`, records `last_error` (up to 500 characters), sets `next_attempt_at`, and clears the lease.
 

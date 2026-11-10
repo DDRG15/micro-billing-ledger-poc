@@ -66,7 +66,8 @@ that outlives its lease, can deliver an event again. The worker forwards generic
 there is no PostHog adapter.
 
 The worker selects eligible candidates per tenant, then ranks them round-robin before
-applying the batch limit. Claims commit before HTTP; `claimed_until` keeps other workers
+applying the batch limit; the rotation continues across claims, so more backlogged
+tenants than batch slots still each get a turn. Claims commit before HTTP; `claimed_until` keeps other workers
 off a claimed row until the lease expires. Each result commits separately. Dispatch
 failures back off for 30, 120, 600 and then 3,600 seconds, repeating the final delay
 without an attempt limit. Backed-off and leased rows are excluded from selection. These

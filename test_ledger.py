@@ -3784,6 +3784,44 @@ finally:
 
 
 # =============================================================================
+# C6-13: tenants rotate across claims, not only within one
+#     The claim ranked tenants round-robin inside a batch but broke rank-1 ties by row id,
+#     so with more backlogged tenants than batch slots the same oldest backlogs took every
+#     rank-1 slot on every claim: a newer tenant waited until all of them had drained.
+# =============================================================================
+print("\n── C6-13: rank-1 slots rotate across claims ─────────────────────────────")
+
+c613 = fresh_conn()
+with c613.cursor() as _c:
+    for _o in ("c613_a", "c613_b", "c613_c", "c613_d"):
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,'whsec_t')",
+                   (_o, _o))
+for _o, _n in (("c613_a", 3), ("c613_b", 3), ("c613_c", 3), ("c613_d", 1)):
+    L.process_stripe_event_batch(c613, [fake_event(eid=f"evt_{_o}_{_i}") for _i in range(_n)],
+                                 org_id=_o)
+
+_orig_dispatch_613, _orig_batch_613, _orig_rr_613 = W._dispatch_row, W.WORKER_BATCH_SIZE, W._rr_after
+W.WORKER_BATCH_SIZE, W._rr_after = 2, ""
+_claims_613 = []
+W._dispatch_row = lambda row, destination=None: _claims_613[-1].append(row["org_id"])
+try:
+    for _ in range(2):
+        _claims_613.append([])
+        W.drain_batch(c613)
+    chk("four backlogged tenants, two slots: every tenant is served within two claims",
+        {_o for _cl in _claims_613 for _o in _cl} == {"c613_a", "c613_b", "c613_c", "c613_d"},
+        str(_claims_613))
+    _claims_613.append([])
+    W.drain_batch(c613)
+    chk("…and the third claim starts the rotation over",
+        _claims_613[2] == ["c613_a", "c613_b"], str(_claims_613))
+finally:
+    W._dispatch_row, W.WORKER_BATCH_SIZE, W._rr_after = (_orig_dispatch_613, _orig_batch_613,
+                                                         _orig_rr_613)
+    c613.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

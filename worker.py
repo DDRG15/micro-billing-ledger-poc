@@ -231,12 +231,17 @@ _CLAIM_SQL = """
         ) c
     ), picked AS (
         -- Round-robin across tenants: rank within each tenant, take rank 1 of every
-        -- tenant before rank 2 of any.
-        SELECT id, org_id
+        -- tenant before rank 2 of any. Within a rank, tenants go in org_id order
+        -- starting AFTER the last tenant this worker served at rank 1 (%(after)s),
+        -- wrapping around. Ordering a rank by row id instead gave the same oldest
+        -- backlogs every rank-1 slot on every claim: with more backlogged tenants than
+        -- batch slots, a tenant waited until every older backlog had drained.
+        SELECT id, org_id, rn
         FROM  (SELECT id, org_id,
                       ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY id) AS rn
                FROM   candidates) r
-        ORDER  BY rn, id
+        -- COLLATE "C": byte order, the same order Python compares the cursor in.
+        ORDER  BY rn, (org_id COLLATE "C" <= %(after)s), org_id COLLATE "C", id
         LIMIT  %(batch_size)s
     )
     UPDATE outbox o
@@ -245,8 +250,12 @@ _CLAIM_SQL = """
     JOIN   org g ON g.org_id = p.org_id
     WHERE  o.id = p.id
     RETURNING o.id, o.transaction_id, o.event_type, o.payload, o.org_id, o.attempts,
-              o.claimed_until, g.downstream_url
+              o.claimed_until, g.downstream_url, p.rn
 """
+
+# The last tenant this process served at rank 1 — where the next claim's rotation
+#     starts. Per process: each replica rotates on its own, which keeps every one fair.
+_rr_after: str = ""
 
 
 def _claim_batch(conn: psycopg2.extensions.connection) -> List[psycopg2.extras.RealDictRow]:
@@ -256,10 +265,16 @@ def _claim_batch(conn: psycopg2.extensions.connection) -> List[psycopg2.extras.R
     commits, milliseconds later; what keeps other workers off the rows during dispatch is
     claimed_until. ALL_ORGS: claiming is cross-tenant by definition.
     """
+    global _rr_after
     with _tx(conn, _ledger.ALL_ORGS) as cur:
         cur.execute(_CLAIM_SQL, {"batch_size": WORKER_BATCH_SIZE,
-                                 "lease": WORKER_LEASE_SECONDS})
-        return sorted(cur.fetchall(), key=lambda r: r["id"])
+                                 "lease": WORKER_LEASE_SECONDS, "after": _rr_after})
+        rows = cur.fetchall()
+    served = [r["org_id"] for r in rows if r["rn"] == 1]
+    if served:
+        # The last rank-1 tenant in this claim's rotation order (same key as the SQL).
+        _rr_after = max(served, key=lambda o, a=_rr_after: (o <= a, o))
+    return sorted(rows, key=lambda r: r["id"])
 
 
 def _finish_row(conn: psycopg2.extensions.connection, row: psycopg2.extras.RealDictRow,
