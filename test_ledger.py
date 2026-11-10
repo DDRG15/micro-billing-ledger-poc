@@ -4564,6 +4564,86 @@ chk("the timeouts sit in the global block, ahead of the site block",
 
 
 # =============================================================================
+# C6-26: an event id outside printable ASCII is INVALID at ingest
+#     A signature proves who sent an event, not that its id is sane. An id with a CR/LF
+#     was ledgered and then failed every delivery at header-build time (the id becomes
+#     the worker's X-Transaction-Id header), retrying forever; a NUL made the INSERT
+#     raise a ValueError that escaped as a 500. The id is now printable ASCII without
+#     spaces, 1-255 characters; anything else takes the INVALID path. Rejecting it must
+#     not turn into a 503 either, so the DLQ row stores a printable rendering of the id.
+# =============================================================================
+print("\n── C6-26: control characters / spaces / non-ASCII / >255 in an event id ──")
+
+c626 = fresh_conn()
+_bad_ids_626 = {
+    "LF":            "evt_c626\nx",
+    "CRLF header injection": "evt_c626\r\nX-Evil: 1",
+    "trailing LF":   "evt_c626_end\n",
+    "NUL":           "evt_c626\x00x",
+    "TAB":           "evt_c626\tx",
+    "space":         "evt c626",
+    "DEL":           "evt_c626\x7fx",
+    "non-ASCII":     "evt_c626_é",
+    "256 chars":     "e" * 256,
+}
+for _label, _bad in _bad_ids_626.items():
+    try:
+        _res = L.process_stripe_event(c626, fake_event(eid=_bad))
+    except Exception as _exc:  # noqa: BLE001 — the point is that nothing may escape
+        _res = {"outcome": f"raised {type(_exc).__name__}: {_exc}"}
+    chk(f"id with {_label} → DLQ_INVALID, nothing raised", _res.get("outcome") == "DLQ_INVALID",
+        str(_res)[:160])
+chk("…none of them reached the ledger or the outbox",
+    _q1(c626, "SELECT COUNT(*) FROM ledger") == 0 and _q1(c626, "SELECT COUNT(*) FROM outbox") == 0)
+chk("…each left one INVALID DLQ row",
+    _q1(c626, "SELECT COUNT(*) FROM dlq WHERE reason='INVALID'") == len(_bad_ids_626),
+    str(_q1(c626, "SELECT COUNT(*) FROM dlq")))
+_stored_626 = [r[0] for r in _qall(c626, "SELECT transaction_id FROM dlq ORDER BY id")]
+chk("…whose transaction_id is printable ASCII, so listing and replay stay safe",
+    all(L._EVENT_ID_RE.fullmatch(t) for t in _stored_626), str(_stored_626))
+chk("…and the original id is preserved in raw_payload",
+    json.loads(_q1(c626, "SELECT raw_payload FROM dlq ORDER BY id LIMIT 1") or "{}").get("id")
+    == "evt_c626\nx")
+
+for _label, _good in {"evt_ + alphanumerics": "evt_1Pq3Zs2eZvKYlo2C",
+                      "all printable ASCII punctuation": "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+                      "exactly 255 chars": "e" * 255}.items():
+    _res = L.process_stripe_event(c626, fake_event(eid=_good))
+    chk(f"id with {_label} → still POSTED", _res.get("outcome") == "POSTED", str(_res)[:160])
+
+# The batch path validates with the same model and writes its own DLQ rows.
+_batch_626 = L.process_stripe_event_batch(
+    c626, [fake_event(eid="evt_c626_batch\r\nx"), fake_event(eid="evt_c626_batch_ok")])
+chk("batch: a CRLF id → DLQ_INVALID, its neighbour → POSTED",
+    [r["outcome"] for r in _batch_626] == ["DLQ_INVALID", "POSTED"], str(_batch_626))
+
+# Over HTTP: a signed event whose id carries a NUL must be answered 200 (it is recorded
+#     in the DLQ), not 500 and not 503, which Stripe would retry for three days.
+_SEC_C626 = "whsec_c626_signing_secret"
+with c626.cursor() as _c:
+    _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,%s)",
+               ("c626", "c626", _SEC_C626))
+_orig_pool_626 = L._pool
+L._pool = _MockPool(c626)
+try:
+    _cl626 = TestClient(L.app, raise_server_exceptions=False)
+    _ev626 = _fixture("invoice.paid", "evt_c626_http\x00x")
+    _r = _post_raw(_cl626, "/webhook/stripe/c626", json.dumps(_ev626), _SEC_C626)
+    chk("signed event with a NUL in its id → 200 DLQ_INVALID (not 500/503)",
+        _r.status_code == 200 and _r.json().get("outcome") == "DLQ_INVALID",
+        f"{_r.status_code} {_r.text[:160]}")
+    chk("…recorded under the tenant, as INVALID",
+        _q1(c626, "SELECT COUNT(*) FROM dlq WHERE org_id='c626' AND reason='INVALID'") == 1)
+    _ok626 = _fixture("invoice.paid", "evt_c626_http_ok")
+    _r = _post_raw(_cl626, "/webhook/stripe/c626", json.dumps(_ok626), _SEC_C626)
+    chk("a normal Stripe-shaped id over the same route → POSTED",
+        _r.status_code == 200 and _r.json().get("outcome") == "POSTED", f"{_r.status_code} {_r.text[:160]}")
+finally:
+    L._pool = _orig_pool_626
+    c626.close()
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

@@ -212,6 +212,30 @@ _AMOUNT_FIELDS_BY_TYPE: dict = {
 _AMOUNT_FIELDS_DEFAULT = ("amount_paid", "amount", "amount_due")
 
 
+# What an event id may look like: printable ASCII without spaces. See StripeEvent.id.
+EVENT_ID_PATTERN = r"^[\x21-\x7e]{1,255}$"
+_EVENT_ID_RE = re.compile(r"[\x21-\x7e]{1,255}")
+
+
+def _dlq_transaction_id(event: dict) -> str:
+    """The transaction_id for a DLQ row written because `event` failed validation.
+
+    Scenario: the event was rejected, and one reason can be its id. Writing that id
+    verbatim made the rejection itself fail: an id containing NUL cannot be stored in a
+    TEXT column, so _write_dlq returned False and the handler answered 503 — Stripe
+    redelivers a hostile event for three days — and a non-string id failed DLQEntry's
+    own validation. Decision: a well-formed id is kept as is; anything else is stored
+    as a printable rendering (offending characters become '?', cut to 255), and the
+    untouched original stays in raw_payload for whoever reads the row.
+    """
+    raw = event.get("id")
+    if not isinstance(raw, str) or not raw:
+        return "unknown"
+    if _EVENT_ID_RE.fullmatch(raw):
+        return raw
+    return re.sub(r"[^\x21-\x7e]", "?", raw)[:255]
+
+
 class StripeObject(BaseModel):
     """
     Represents the `data.object` payload inside a Stripe webhook: an Invoice or a
@@ -321,8 +345,19 @@ class StripeEvent(BaseModel):
 
     # Stripe event ID — this becomes the ledger primary key.
     #     min_length=1 catches empty strings that would create a NULL-equivalent PK.
+    #
+    #     pattern: printable ASCII, no spaces, 1-255 characters (Stripe ids are
+    #     evt_ + alphanumerics). The id travels into the worker's X-Transaction-Id header
+    #     and into log lines, and the signature only proves who sent the event, not that
+    #     the id is sane: an id with a CR/LF or other control character was ledgered, then
+    #     failed every delivery attempt at header-build time (http.client refuses it) and
+    #     sat in the outbox retrying forever; a NUL made the INSERT itself raise a
+    #     ValueError that escaped as a 500. Refused here it takes the INVALID path like
+    #     any malformed event. `$` is end-of-text in the Rust regex engine pydantic uses,
+    #     so a trailing newline does not slip through the way it does in Python's re.
     id: str = Field(
         min_length=1,
+        pattern=EVENT_ID_PATTERN,
         description="Unique Stripe event ID (e.g., 'evt_3Px...')"
     )
 
@@ -1105,8 +1140,8 @@ def process_stripe_event(
     try:
         validated_event = StripeEvent(**event)
     except ValidationError as e:
-        transaction_id = event.get("id") or "unknown"
-        # "unknown" fallback only if the event has no id at all.
+        transaction_id = _dlq_transaction_id(event)
+        # "unknown" fallback only if the event has no usable id at all.
         #     DLQEntry.min_length=1 would reject "" so we use "unknown" as the floor.
         if not from_retry:
             dlq_entry = DLQEntry(
@@ -1606,7 +1641,7 @@ def process_stripe_event_batch(
         try:
             validated = StripeEvent(**event)
         except ValidationError as e:
-            tid = event.get("id") or "unknown"
+            tid = _dlq_transaction_id(event)
             invalid_dlq_rows.append(
                 # org_id=org_id, not the model default. A DLQ row written under the
                 #     wrong tenant is not merely mislabelled: the retry paths trust
