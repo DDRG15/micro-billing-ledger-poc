@@ -1,0 +1,16 @@
+# End-to-end harness: adds a downstream receiver to the normal stack and points the
+#     worker at it. Use through e2e/dc.sh, which also loads e2e/e2e.env.
+#     Relative paths resolve from the repository root (the project directory).
+services:
+  downstream:
+    build: .
+    networks: [billing_net]
+    command: python /e2e/downstream.py
+    volumes:
+      - ./e2e:/e2e:ro
+      - ./e2e/recv:/recv
+    restart: unless-stopped
+  worker:
+    depends_on:
+      downstream:
+        condition: service_started

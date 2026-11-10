@@ -63,3 +63,7 @@ build/
 #     Pure noise in a git repository.
 .DS_Store
 Thumbs.db
+
+# End-to-end harness: generated secrets and receiver output.
+e2e/e2e.env
+e2e/recv/
