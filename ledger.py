@@ -128,11 +128,13 @@ _log = logging.getLogger("ledger")
 #     All pinned in requirements.txt — no surprise version changes.
 # ---------------------------------------------------------------------------
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status  # noqa: E402
+from fastapi.exception_handlers import http_exception_handler  # noqa: E402
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.responses import JSONResponse, Response  # noqa: E402
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator  # noqa: E402
 from limits import parse as _parse_rate_limit  # noqa: E402
 from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: E402
+from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa: E402
 from slowapi.util import get_remote_address  # noqa: E402
 from slowapi.errors import RateLimitExceeded  # noqa: E402
 from prometheus_client import (  # noqa: E402
@@ -1954,7 +1956,15 @@ app = FastAPI(
 #     429 Too Many Requests is returned when the limit is exceeded.
 _limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = _limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+async def _rate_limited(request: Request, exc: RateLimitExceeded) -> Response:
+    """slowapi's own 429 (headers included), with its error type recorded first."""
+    _mark_error(request.scope, "rate_limited")
+    return _rate_limit_exceeded_handler(request, exc)
+
+
+app.add_exception_handler(RateLimitExceeded, _rate_limited)
 
 # Limits are configurable so they can be tuned per deployment — and so a load test can
 #     measure the ingest path instead of measuring the limiter. The defaults are the
@@ -1986,6 +1996,11 @@ _HTTP_REQUESTS = Counter(
     "HTTP requests by route template and status code",
     ["method", "path", "status"],
 )
+_HTTP_ERRORS = Counter(
+    "http_errors_total",
+    "HTTP error responses (status >= 400) by status, error class and error type",
+    ["status", "error_class", "error_type"],
+)
 _HTTP_LATENCY = Histogram(
     "http_request_duration_seconds",
     "Request latency by route template",
@@ -2012,38 +2027,147 @@ _OUTBOX_PENDING = Gauge("outbox_pending", "Outbox rows not yet dispatched downst
 _METRICS_RENDER_LOCK = threading.Lock()
 
 
-@app.middleware("http")
-async def _observability(request: Request, call_next):
-    """Emit one structured log line and one metrics sample per request.
+# ---------------------------------------------------------------------------
+# Error taxonomy
+# Every response with status >= 400 is recorded with a CLASS and a TYPE.
+#     Scenario: at 03:00 the on-call engineer sees http_requests_total{status="401"} climbing.
+#     A status says what the server answered; it does not say whether a partner's key
+#     rotated (a missing_api_key spike from one client) or someone is guessing keys
+#     (invalid_api_key, then auth_failure_budget). Consequence: without the type, every
+#     triage starts by reading logs. Decision: the type is fixed in code, here, and is the
+#     only thing that reaches a metric label.
+#
+#     The values come from this table and nowhere else: never from the request. A label
+#     built from a path, a header or an exception message is unbounded cardinality, and a
+#     caller who controls it controls the size of the time-series database. A type the
+#     table does not know, or a response nobody labelled, is recorded as unclassified_4xx
+#     or unclassified_5xx so it is visible, and a test fails if any known path lands there.
+#
+#     unknown_tenant answers the same 400 as invalid_signature, on purpose: a different
+#     body would let anyone enumerate tenants. Only the log and the metric, which belong to
+#     the operator, tell them apart.
+# ---------------------------------------------------------------------------
+_ERROR_TYPES: dict = {
+    # type                    class
+    "invalid_signature":      "authentication",
+    "unknown_tenant":         "authentication",
+    "missing_api_key":        "authentication",
+    "invalid_api_key":        "authentication",
+    "operator_key_required":  "authorization",
+    "malformed_tenant_id":    "validation",
+    "request_validation":     "validation",
+    "invalid_query":          "validation",
+    "method_not_allowed":     "validation",
+    "body_too_large":         "size_limit",
+    "rate_limited":           "rate_limit",
+    "auth_failure_budget":    "rate_limit",
+    "route_not_found":        "not_found",
+    "dlq_entry_not_found":    "not_found",
+    "dlq_already_resolved":   "conflict",
+    "database_unavailable":   "dependency",
+    "pool_exhausted":         "dependency",
+    "ingest_db_failure":      "dependency",
+    "unhandled_exception":    "internal",
+}
+_UNCLASSIFIED = {4: ("unclassified", "unclassified_4xx"), 5: ("unclassified", "unclassified_5xx")}
+
+# Where the type travels from the code that produced the error to the middleware that
+#     records it. The scope dict is the one object every ASGI layer shares for a request.
+_ERROR_TYPE_KEY = "ledger.error_type"
+
+
+def _mark_error(scope: dict, error_type: str) -> None:
+    """Say what kind of error this request is ending in. Read by _Observability."""
+    scope[_ERROR_TYPE_KEY] = error_type
+
+
+def _classify_error(status_code: int, error_type: Optional[str]) -> tuple:
+    """(error_class, error_type) for a response, from the fixed table above."""
+    error_class = _ERROR_TYPES.get(error_type) if error_type else None
+    if error_class is None:
+        return _UNCLASSIFIED[5 if status_code >= 500 else 4]
+    return error_class, error_type
+
+
+class _ApiError(HTTPException):
+    """An HTTPException that names its error type. Every raise in this module uses it:
+    a bare HTTPException has no type, and test_ledger.py refuses one in this file."""
+
+    def __init__(self, status_code: int, detail: str, error_type: str,
+                 headers: Optional[dict] = None) -> None:
+        super().__init__(status_code=status_code, detail=detail, headers=headers)
+        self.error_type = error_type
+
+
+class _Observability:
+    """Pure ASGI middleware: one structured log line and one metrics sample per request,
+    and the class and type of every error.
+
+    It is the OUTERMOST middleware, added after _BodySizeCap. As @app.middleware it was
+    added first, so it sat inside the body cap: a 413 never reached it and left no
+    http_requests_total sample and no http_request line (measured: delta 0). And as a
+    BaseHTTPMiddleware it never saw an unhandled exception's 500 either, because
+    ServerErrorMiddleware, which sits outside every user middleware, builds that response.
+    Here the exception passes through this layer on its way out, is recorded as a 500
+    unhandled_exception, and is re-raised so uvicorn still logs the traceback.
+
+    A request that ends with no response and no exception (the client hung up while the
+    body was still arriving) has no status to record and leaves nothing.
 
     Labels use the route TEMPLATE (/dlq/{dlq_id}/retry), never the resolved path.
     Labelling by resolved path gives every dlq_id its own time series, which turns a
     handful of routes into unbounded cardinality and is the standard way to take down
-    a Prometheus server with your own instrumentation.
+    a Prometheus server with your own instrumentation. A request refused before routing
+    (413, a route that does not exist) has no template and is labelled "unmatched".
     """
-    start = time.perf_counter()
-    response = await call_next(request)
-    duration_ms = round((time.perf_counter() - start) * 1000, 2)
 
-    route = request.scope.get("route")
-    path = getattr(route, "path", None) or "unmatched"
-    status_code = str(response.status_code)
+    def __init__(self, asgi_app) -> None:
+        self.app = asgi_app
 
-    _HTTP_REQUESTS.labels(request.method, path, status_code).inc()
-    _HTTP_LATENCY.labels(request.method, path).observe(duration_ms / 1000.0)
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        start = time.perf_counter()
+        sent: list = []
 
-    _log.info(
-        "request %s %s -> %s", request.method, path, status_code,
-        extra={
+        async def _send(message) -> None:
+            if message["type"] == "http.response.start" and not sent:
+                sent.append(message["status"])
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        except Exception:
+            _mark_error(scope, "unhandled_exception")
+            self._record(scope, 500, start)
+            raise
+        if sent:
+            self._record(scope, sent[0], start)
+
+    @staticmethod
+    def _record(scope: dict, status_code: int, start: float) -> None:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        method = scope["method"]
+        path = getattr(scope.get("route"), "path", None) or "unmatched"
+
+        _HTTP_REQUESTS.labels(method, path, str(status_code)).inc()
+        _HTTP_LATENCY.labels(method, path).observe(duration_ms / 1000.0)
+
+        fields = {
             "event":       "http_request",
-            "method":      request.method,
+            "method":      method,
             "path":        path,
-            "status":      response.status_code,
+            "status":      status_code,
             "duration_ms": duration_ms,
-            "client_ip":   get_remote_address(request),
-        },
-    )
-    return response
+            "client_ip":   get_remote_address(Request(scope)),
+        }
+        if status_code >= 400:
+            error_class, error_type = _classify_error(status_code, scope.get(_ERROR_TYPE_KEY))
+            _HTTP_ERRORS.labels(str(status_code), error_class, error_type).inc()
+            fields["error_class"] = error_class
+            fields["error_type"] = error_type
+        _log.info("request %s %s -> %s", method, path, status_code, extra=fields)
 
 
 # Largest request body the service reads. A Stripe event is a few KB to a few hundred KB.
@@ -2076,6 +2200,7 @@ class _BodySizeCap:
             self.max_bytes, scope.get("path", "")[:128], client,
             extra={"event": "body_too_large", "declared_length": declared, "client_ip": client},
         )
+        _mark_error(scope, "body_too_large")
         await send({"type": "http.response.start", "status": 413,
                     "headers": [(b"content-type", b"application/json"),
                                 (b"connection", b"close")]})
@@ -2121,6 +2246,9 @@ class _BodySizeCap:
 
 
 app.add_middleware(_BodySizeCap, max_bytes=MAX_REQUEST_BODY_BYTES)
+# Added AFTER the body cap, so it is the outer layer and sees the 413 the cap sends. Swap
+#     these two lines and a refused body vanishes from http_requests_total again.
+app.add_middleware(_Observability)
 
 
 @app.exception_handler(RequestValidationError)
@@ -2134,7 +2262,30 @@ async def _validation_error(request: Request, exc: RequestValidationError) -> JS
     """
     detail = [{"type": e.get("type"), "loc": [str(x)[:64] for x in e.get("loc", ())][:8],
                "msg": str(e.get("msg", ""))[:200]} for e in exc.errors()[:20]]
+    # A body error means the envelope was wrong; anything else (query string, path) is a
+    #     parameter. Decided by the first element of each location, which FastAPI sets.
+    in_body = any(e.get("loc") and e["loc"][0] == "body" for e in exc.errors())
+    _mark_error(request.scope, "request_validation" if in_body else "invalid_query")
     return JSONResponse(status_code=422, content={"detail": detail})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(request: Request, exc: StarletteHTTPException) -> Response:
+    """Render an HTTPException as FastAPI always did, and record its error type.
+
+    Replaces FastAPI's default handler for this class and delegates to it, so the body and
+    headers (Retry-After, Allow) are unchanged. The 404 and 405 raised by the router itself
+    carry no type; they are named here by status. Anything else without a type is left for
+    _classify_error to record as unclassified.
+    """
+    error_type = getattr(exc, "error_type", None)
+    if error_type is None and exc.status_code == 404:
+        error_type = "route_not_found"
+    elif error_type is None and exc.status_code == 405:
+        error_type = "method_not_allowed"
+    if error_type:
+        _mark_error(request.scope, error_type)
+    return await http_exception_handler(request, exc)
 
 # Ensure all three tables and their indexes exist before the pool opens connections.
 #     The bootstrap connection is closed immediately — it is not reused.
@@ -2254,6 +2405,8 @@ async def _database_unavailable(request: Request, exc: Exception) -> JSONRespons
     """
     if request.url.path.startswith("/webhook"):
         _WEBHOOK_EVENTS.labels("DB_ERROR").inc()
+    _mark_error(request.scope, "pool_exhausted" if isinstance(exc, _PoolBusy)
+                else "database_unavailable")
     _log.error("database unavailable path=%s error=%s", request.url.path, type(exc).__name__,
                extra={"event": "db_unavailable", "error": type(exc).__name__})
     return JSONResponse(status_code=503, content={"detail": "Database unavailable, retry"},
@@ -2495,16 +2648,16 @@ def _auth_budget(request: Request) -> str:
     """Refuse a client that has used up its failed-authentication budget; return its key."""
     client = get_remote_address(request)
     if _limiter.enabled and not _limiter._limiter.test(_AUTH_FAILURE_LIMIT, "auth_failure", client):
-        raise HTTPException(status_code=429, detail="Too many failed authentication attempts",
-                            headers={"Retry-After": "60"})
+        raise _ApiError(429, "Too many failed authentication attempts", "auth_failure_budget",
+                        headers={"Retry-After": "60"})
     return client
 
 
-def _auth_failed(client: str, detail: str) -> HTTPException:
+def _auth_failed(client: str, detail: str, error_type: str) -> HTTPException:
     """Count one failed authentication for this client and build its 401."""
     if _limiter.enabled:
         _limiter._limiter.hit(_AUTH_FAILURE_LIMIT, "auth_failure", client)
-    return HTTPException(status_code=401, detail=detail)
+    return _ApiError(401, detail, error_type)
 
 
 def _require_api_key(request: Request, x_api_key: str = Header(default="")) -> str:
@@ -2531,7 +2684,7 @@ def _require_api_key(request: Request, x_api_key: str = Header(default="")) -> s
         return DEFAULT_ORG_ID  # dev mode — no credential configured anywhere
     client = _auth_budget(request)
     if not x_api_key:
-        raise _auth_failed(client, "X-Api-Key header required")
+        raise _auth_failed(client, "X-Api-Key header required", "missing_api_key")
 
     if _ANY_ORG_KEYS:
         conn = _pool.getconn()
@@ -2549,7 +2702,7 @@ def _require_api_key(request: Request, x_api_key: str = Header(default="")) -> s
     if BILLING_API_KEY and hmac.compare_digest(x_api_key.encode(), BILLING_API_KEY.encode()):
         return DEFAULT_ORG_ID
 
-    raise _auth_failed(client, "Invalid API key")
+    raise _auth_failed(client, "Invalid API key", "invalid_api_key")
 
 
 def _require_operator_key(request: Request, x_api_key: str = Header(default="")) -> None:
@@ -2570,7 +2723,7 @@ def _require_operator_key(request: Request, x_api_key: str = Header(default=""))
         return  # dev mode — the startup warning already says the endpoints are open
     client = _auth_budget(request)
     if not x_api_key:
-        raise _auth_failed(client, "X-Api-Key header required")
+        raise _auth_failed(client, "X-Api-Key header required", "missing_api_key")
     if BILLING_API_KEY and hmac.compare_digest(x_api_key.encode(), BILLING_API_KEY.encode()):
         return
     if _ANY_ORG_KEYS:
@@ -2580,8 +2733,8 @@ def _require_operator_key(request: Request, x_api_key: str = Header(default=""))
         finally:
             _pool.putconn(conn)
         if is_tenant:
-            raise HTTPException(status_code=403, detail="/metrics requires the operator key")
-    raise _auth_failed(client, "Invalid API key")
+            raise _ApiError(403, "/metrics requires the operator key", "operator_key_required")
+    raise _auth_failed(client, "Invalid API key", "invalid_api_key")
 
 
 class StripeWebhookPayload(BaseModel):
@@ -2628,7 +2781,7 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
             extra={"event": "webhook_unknown_org", "org_id": org_id[:64]},
         )
         _WEBHOOK_EVENTS.labels("UNKNOWN_ORG").inc()
-        raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
+        raise _ApiError(400, "Invalid or missing Stripe signature", "malformed_tenant_id")
 
     conn = _pool.getconn()
     try:
@@ -2639,7 +2792,7 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
                 extra={"event": "webhook_unknown_org", "org_id": org_id},
             )
             _WEBHOOK_EVENTS.labels("UNKNOWN_ORG").inc()
-            raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
+            raise _ApiError(400, "Invalid or missing Stripe signature", "unknown_tenant")
 
         try:
             stripe.Webhook.construct_event(raw_body, sig_header, secret)
@@ -2649,7 +2802,7 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
             #     500 — but only for orgs that exist, since an unknown org answers 400
             #     before this point: a tenant-enumeration oracle. Every malformed
             #     signature is the same 400 now.
-            raise HTTPException(status_code=400, detail="Invalid or missing Stripe signature")
+            raise _ApiError(400, "Invalid or missing Stripe signature", "invalid_signature")
 
         try:
             # The body Stripe signed, parsed — not payload.model_dump(). The HTTP model
@@ -2667,7 +2820,7 @@ def _ingest_webhook(request: Request, payload: StripeWebhookPayload, org_id: str
             #     which is correct for a transient error; 200 would say "got it" when
             #     nothing kept it.
             _WEBHOOK_EVENTS.labels("DB_ERROR").inc()
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise _ApiError(503, str(exc), "ingest_db_failure")
     finally:
         _pool.putconn(conn)
 
@@ -2865,7 +3018,7 @@ def dlq_entries(request: Request, limit: int = 50, status: Optional[str] = None,
     next_retry_at and claimed_at.
     """
     if limit < 1:
-        raise HTTPException(status_code=422, detail="limit must be >= 1")
+        raise _ApiError(422, "limit must be >= 1", "invalid_query")
     limit = min(limit, 1000)  # never dump the entire table
     if status is None:
         statuses = None
@@ -2874,8 +3027,8 @@ def dlq_entries(request: Request, limit: int = 50, status: Optional[str] = None,
     elif status in {s.value for s in DLQStatus}:
         statuses = [status]
     else:
-        raise HTTPException(status_code=422, detail=(
-            "status must be one of pending, retrying, resolved, exhausted, actionable"))
+        raise _ApiError(422, "status must be one of pending, retrying, resolved, exhausted, "
+                             "actionable", "invalid_query")
 
     where, params = ["org_id = %s"], [org_id]
     if statuses is not None:
@@ -2955,13 +3108,13 @@ def dlq_retry(request: Request, dlq_id: int,
             )
             row = cur.fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail=f"DLQ entry {dlq_id} not found")
+            raise _ApiError(404, f"DLQ entry {dlq_id} not found", "dlq_entry_not_found")
 
         transaction_id, raw_payload_str, current_status = row
         if current_status == "resolved":
-            raise HTTPException(
-                status_code=409,
-                detail=f"DLQ entry {dlq_id} is already resolved — nothing to replay",
+            raise _ApiError(
+                409, f"DLQ entry {dlq_id} is already resolved — nothing to replay",
+                "dlq_already_resolved",
             )
 
         payload = json.loads(raw_payload_str)

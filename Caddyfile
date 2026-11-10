@@ -34,6 +34,17 @@
             idle        2m
         }
     }
+
+    # The default logger, which also writes the access line of a request whose Host matches
+    #     no site (Caddy answers those 200 with an empty body). It gets the same header
+    #     filter as the site's log below: measured, a wrong-Host request carrying X-Api-Key
+    #     wrote the key to stdout through this logger.
+    log {
+        format filter {
+            wrap json
+            request>headers delete
+        }
+    }
 }
 
 {$CADDY_DOMAIN} {
@@ -47,6 +58,43 @@
         max_size 1MiB
     }
     reverse_proxy billing:8000
+
+    # Access log: one JSON line per request Caddy answers, to stdout (docker compose logs caddy).
+    #     Scenario: until now Caddy wrote no access log. A 413 at the edge, a 502 while the
+    #     billing container restarted, a client cut off mid-upload: none left a line, so the
+    #     only account of a failed delivery was whatever the application saw, and the
+    #     application never sees these.
+    #     Consequence: Stripe reports failed deliveries and nothing on our side says why.
+    #     Decision: log them. Caddy's default log writes every request header except
+    #     Authorization and Cookie. X-Api-Key (the operator and tenant credential) and
+    #     Stripe-Signature would land in plaintext, in a stream Docker keeps and log shippers
+    #     copy. The filter deletes the whole request>headers object rather than naming
+    #     secrets one by one, so a header added later cannot leak by omission.
+    log {
+        output stdout
+        format filter {
+            wrap json
+            request>headers delete
+        }
+    }
+
+    # Error class and type on the access line, with the same names the application uses
+    #     (see "Error taxonomy" in ledger.py and the README). Only responses Caddy itself
+    #     produces pass through handle_errors: 413 from request_body max_size, and 502 when
+    #     billing:8000 cannot be reached. A 4xx or 5xx that the application returns is a
+    #     normal proxied response; the application records its own class and type.
+    #     Measured, not assumed: Caddy's 499 for a body that did not finish within read_body
+    #     never reaches an error route, so it carries a status and no class or type; and a
+    #     connection closed by read_header 10s produces no response and no log line at all.
+    handle_errors 413 {
+        log_append error_class size_limit
+        log_append error_type body_too_large
+    }
+
+    handle_errors 502 {
+        log_append error_class dependency
+        log_append error_type upstream_unavailable
+    }
 
     # Security headers — applied to every response.
     header {
