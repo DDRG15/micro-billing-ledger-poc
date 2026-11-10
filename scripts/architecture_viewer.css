@@ -1,0 +1,58 @@
+/* Inlined into docs/architecture.html by build_architecture_viewer.py.
+   The two interaction colors are defined once, here: --incoming and --outgoing. */
+:root { color-scheme: dark; --bg:#0d1117; --panel:#151b23; --text:#e6edf3; --muted:#a7b5c5; --line:#303d4d;
+        --edge:#8b98a8; --incoming:#58a6ff; --outgoing:#ffb454; --both:#d2a8ff; --focus:#f0f6fc; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,sans-serif; }
+header, main { max-width:1800px; margin:auto; padding:20px 28px; }
+header { padding-bottom:8px; }
+h1 { margin:0 0 6px; font-size:26px; letter-spacing:-.4px; }
+p { margin:6px 0; }
+.hint, .status, .panel-title { color:var(--muted); }
+.controls, .legend, .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.toolbar { justify-content:space-between; margin:12px 0; }
+button { border:1px solid var(--line); border-radius:7px; background:var(--panel); color:var(--text);
+         padding:8px 13px; font:inherit; cursor:pointer; }
+button:hover { border-color:var(--incoming); }
+button:focus-visible { outline:3px solid var(--incoming); outline-offset:3px; }
+[role=tab][aria-selected=true] { color:var(--incoming); border-color:var(--incoming); }
+.legend { font-size:13px; color:var(--muted); }
+.node-legend { margin:0 0 10px; }
+.chip { width:16px; height:12px; display:inline-block; vertical-align:middle; margin-right:6px; border:2px solid; border-radius:3px; }
+.swatch { width:24px; height:3px; display:inline-block; vertical-align:middle; margin-right:5px; }
+.swatch.incoming { background:var(--incoming); } .swatch.outgoing { background:var(--outgoing); }
+.swatch.both { background:var(--both); }
+.swatch.dashed { background:repeating-linear-gradient(90deg,var(--muted) 0 5px,transparent 5px 9px); }
+.canvas { border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:auto;
+          height:72vh; padding:16px; }
+.canvas svg { display:block; max-width:none!important; height:auto; margin:auto; }
+.canvas .node { cursor:pointer; transition:opacity .12s; }
+.canvas .node:focus { outline:none; }
+.canvas .node:focus-visible > .label-container,
+.canvas .node.is-selected > .label-container,
+.canvas .node:focus-visible > .label-container > path,
+.canvas .node.is-selected > .label-container > path { stroke:var(--focus)!important; stroke-width:3px!important; }
+.canvas .node:focus-visible > .label-container { stroke-dasharray:6 3; }
+.canvas .edge-connection { transition:stroke .12s,opacity .12s; }
+.canvas .edge-connection:not(.is-incoming):not(.is-outgoing):not(.is-both) { stroke:var(--edge)!important; }
+.canvas.has-selection .edge-connection { opacity:.12!important; }
+.canvas.has-selection .edgeLabel[data-edge-ref] { opacity:.12; }
+.canvas.has-selection .edge-connection.is-incoming { opacity:1!important; stroke:var(--incoming)!important; stroke-width:3.5px!important; }
+.canvas.has-selection .edge-connection.is-outgoing { opacity:1!important; stroke:var(--outgoing)!important; stroke-width:3.5px!important; }
+.canvas.has-selection .edge-connection.is-both { opacity:1!important; stroke:var(--both)!important; stroke-width:3.5px!important; }
+.canvas.has-selection .edgeLabel.is-incoming { opacity:1; } .canvas.has-selection .edgeLabel.is-outgoing { opacity:1; }
+.canvas.has-selection .edgeLabel.is-both { opacity:1; }
+.canvas .edgeLabel.is-incoming p { color:var(--incoming)!important; font-weight:600; }
+.canvas .edgeLabel.is-outgoing p { color:var(--outgoing)!important; font-weight:600; }
+.canvas .edgeLabel.is-both p { color:var(--both)!important; font-weight:600; }
+.details { border:1px solid var(--line); border-radius:9px; padding:12px 16px; margin-top:12px; min-height:76px; }
+.details strong { font-size:15px; }
+.connections { display:flex; gap:7px; flex-wrap:wrap; margin-top:6px; }
+.connections button { font-size:12px; padding:4px 8px; text-align:left; }
+.connections button[data-direction=incoming] { border-color:var(--incoming); }
+.connections button[data-direction=outgoing] { border-color:var(--outgoing); }
+.connections button[data-direction=both] { border-color:var(--both); }
+.connections button small { color:var(--muted); font-size:11px; }
+[hidden] { display:none!important; }
+footer { color:var(--muted); font-size:12px; margin-top:12px; }
+@media (max-width:650px) { header, main { padding:14px 16px; } h1 { font-size:21px; } .canvas { padding:6px; height:60vh; } }
