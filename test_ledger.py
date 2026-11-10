@@ -3704,7 +3704,13 @@ L.process_stripe_event_batch(c612, [fake_event(eid=f"evt_c612_y_{_i}") for _i in
                              org_id="c612_y")
 
 _orig_dispatch_612, _orig_batch_612 = W._dispatch_row, W.WORKER_BATCH_SIZE
+_orig_conc_612 = W.WORKER_DISPATCH_CONCURRENCY
 W.WORKER_BATCH_SIZE = 5
+# Serial dispatch here: with tenants in parallel, the main thread commits one tenant's
+#     outcome while another tenant's dispatch samples the session state, and that
+#     sample reads "idle in transaction" for a recording transaction that is not held
+#     across any HTTP call. C6-22 covers the concurrent path.
+W.WORKER_DISPATCH_CONCURRENCY = 1
 _calls_612, _states_612 = [], []
 
 
@@ -3788,6 +3794,7 @@ try:
         _applied is False and _stale_state()[:3] == (1, 0, None), str(_stale_state()))
 finally:
     W._dispatch_row, W.WORKER_BATCH_SIZE = _orig_dispatch_612, _orig_batch_612
+    W.WORKER_DISPATCH_CONCURRENCY = _orig_conc_612
     c612_obs.close()
     c612.close()
 
@@ -4281,6 +4288,92 @@ finally:
     L._ANY_ORG_KEYS, L.BILLING_API_KEY, L._lookup_org_by_key, L._pool = _orig_621
     L._limiter.reset()
     c621.close()
+
+
+# =============================================================================
+# C6-22: tenants are dispatched concurrently; one slow tenant no longer sets the pace
+#     Dispatch was serial. A tenant whose downstream trickled bytes cost every other
+#     tenant up to one 15 s deadline per batch, so while it had fresh rows global
+#     throughput was one batch per deadline (reproduced live). Rows of different tenants
+#     now go out on a bounded thread pool; one tenant's rows stay serial, in id order, and
+#     every database call stays on the thread that owns the connection.
+# =============================================================================
+print("\n── C6-22: tenants dispatch in parallel, a tenant's rows in id order ─────")
+
+c622 = fresh_conn()
+c622_obs = psycopg2.connect(_TEST_DSN)
+c622_obs.autocommit = True
+with c622.cursor() as _c:
+    for _o in ("c622_slow", "c622_fast"):
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,'whsec_t')",
+                   (_o, _o))
+L.process_stripe_event_batch(c622, [fake_event(eid=f"evt_c622_slow_{_i}") for _i in range(3)],
+                             org_id="c622_slow")
+L.process_stripe_event_batch(c622, [fake_event(eid=f"evt_c622_fast_{_i}") for _i in range(3)],
+                             org_id="c622_fast")
+
+_orig_622 = (W._dispatch_row, W._finish_row, W._release_row, W.WORKER_BATCH_SIZE,
+             W.WORKER_DISPATCH_CONCURRENCY, W._rr_after)
+W.WORKER_BATCH_SIZE, W.WORKER_DISPATCH_CONCURRENCY, W._rr_after = 10, 8, ""
+_log_622, _fast_done_622, _slow_end_622 = [], [], []
+_fast_in_db_622 = []                 # fast rows already committed when slow's last row starts
+_db_threads_622 = set()
+_lock_622 = threading.Lock()
+
+
+def _dispatch_622(row, destination=None):
+    _org = row["org_id"]
+    with _lock_622:
+        _log_622.append((_org, row["id"]))
+    if _org == "c622_slow":
+        if len([1 for _o, _ in _log_622 if _o == "c622_slow"]) == 3:
+            _fast_in_db_622.append(_q1(c622_obs, "SELECT COUNT(*) FROM outbox "
+                                                 "WHERE org_id='c622_fast' AND dispatched=1"))
+        time.sleep(1.0)
+        _slow_end_622.append(time.monotonic())
+    else:
+        time.sleep(0.5)
+        _fast_done_622.append(time.monotonic())
+
+
+def _spy_finish_622(*a, **kw):
+    _db_threads_622.add(threading.current_thread())
+    return _orig_622[1](*a, **kw)
+
+
+def _spy_release_622(*a, **kw):
+    _db_threads_622.add(threading.current_thread())
+    return _orig_622[2](*a, **kw)
+
+
+W._dispatch_row, W._finish_row, W._release_row = _dispatch_622, _spy_finish_622, _spy_release_622
+try:
+    _t0_622 = time.monotonic()
+    _n_622 = W.drain_batch(c622)
+    _took_622 = time.monotonic() - _t0_622
+    chk("all six rows are dispatched and drain_batch still returns the count",
+        _n_622 == 6 and _q1(c622, "SELECT COUNT(*) FROM outbox WHERE dispatched=1") == 6,
+        str(_n_622))
+    chk("the fast tenant's rows are all dispatched before the slow tenant finishes",
+        len(_fast_done_622) == 3 and len(_slow_end_622) == 3
+        and max(_fast_done_622) < _slow_end_622[-1],
+        f"fast done at {[round(t - _t0_622, 1) for t in _fast_done_622]}, "
+        f"slow done at {[round(t - _t0_622, 1) for t in _slow_end_622]}")
+    chk("total drain time is the slow tenant's (~3 s), not the sum of both (~4.5 s)",
+        _took_622 < 3.75, f"{_took_622:.2f}s")
+    chk("a finished tenant is committed while the slow one is still dispatching",
+        _fast_in_db_622 == [3], str(_fast_in_db_622))
+    chk("every database write ran on the thread that called drain_batch",
+        _db_threads_622 == {threading.current_thread()}, str(_db_threads_622))
+
+    _ids_622 = {_o: [_i for _o2, _i in _log_622 if _o2 == _o] for _o in ("c622_slow", "c622_fast")}
+    chk("one tenant's rows are dispatched serially, in id order",
+        all(len(_v) == 3 and _v == sorted(_v) for _v in _ids_622.values()), str(_ids_622))
+finally:
+    (W._dispatch_row, W._finish_row, W._release_row, W.WORKER_BATCH_SIZE,
+     W.WORKER_DISPATCH_CONCURRENCY, W._rr_after) = _orig_622
+    c622_obs.close()
+    c622.close()
 
 
 # =============================================================================

@@ -19,6 +19,7 @@ DATABASE_URL        the owner connection; migrations only
 DOWNSTREAM_URL      (optional) — if set, HTTP POST each event payload here
 WORKER_BATCH_SIZE   (default: 100) — rows read per poll cycle
 WORKER_POLL_INTERVAL (default: 5)  — seconds to sleep when queue is empty
+WORKER_DISPATCH_CONCURRENCY (default: 8) — tenants dispatched in parallel within a batch
 
 DESIGN NOTES
 ------------
@@ -42,8 +43,9 @@ import socket
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from typing import Generator, List, Optional
+from typing import Dict, Generator, List, Optional, Tuple
 
 import psycopg2
 import psycopg2.extensions
@@ -74,6 +76,12 @@ WORKER_LOG_ONLY: bool = os.environ.get("WORKER_LOG_ONLY", "false").lower() == "t
 #     request, however slowly the downstream trickles bytes. See _post.
 DISPATCH_SOCKET_TIMEOUT: float = float(os.environ.get("DISPATCH_SOCKET_TIMEOUT", "10"))
 DISPATCH_DEADLINE_SECONDS: float = float(os.environ.get("DISPATCH_DEADLINE_SECONDS", "15"))
+# Tenants dispatched in parallel inside one batch (rows of one tenant stay serial). Dispatch
+#     used to be fully serial, so a tenant whose downstream trickled bytes cost every other
+#     tenant up to one DISPATCH_DEADLINE_SECONDS per batch and capped global throughput at
+#     one batch per deadline for as long as that tenant had fresh rows. Threads only do
+#     HTTP; every database call stays on the drain_batch thread (see drain_batch).
+WORKER_DISPATCH_CONCURRENCY: int = max(1, int(os.environ.get("WORKER_DISPATCH_CONCURRENCY", "8")))
 # How long a claim keeps other workers off a row. It must outlast a whole batch of
 #     dispatches (batch x the dispatch deadline) or a slow but live worker's rows get
 #     claimed twice; it is also how long a crashed worker's rows wait to be reclaimed.
@@ -372,6 +380,43 @@ def _release_row(conn: psycopg2.extensions.connection, row: psycopg2.extras.Real
         )
 
 
+# One row's result as a dispatch thread reports it: "sent", "failed" (with the error text)
+#     or "released" (not tried: stopping, or its tenant already failed in this batch).
+_Outcome = Tuple[psycopg2.extras.RealDictRow, str, Optional[str]]
+
+
+def _dispatch_tenant(rows: List[psycopg2.extras.RealDictRow]) -> List[_Outcome]:
+    """Dispatch one tenant's claimed rows, in id order, and report what happened to each.
+
+    Runs on a pool thread, so it does HTTP and nothing else: a psycopg2 connection must
+    not be used from several threads at once, and every outcome is recorded by
+    drain_batch on its own thread. _dispatch_row is looked up in module globals at call
+    time (not bound at submit time) so a replacement installed on this module applies.
+
+    The first failure ends the tenant's turn: its remaining rows are reported "released"
+    untried. A tenant with a dead or slow downstream would otherwise burn one deadline
+    per row, holding its pool slot for the rest of the batch.
+    """
+    outcomes: List[_Outcome] = []
+    failed = False
+    for row in rows:
+        # Stopping (SIGTERM) or this tenant already failed: hand the row back untried.
+        #     Leaving it claimed stranded it for the whole lease — a worker restarted
+        #     mid-batch kept up to a batch of paid events undelivered for ~17 minutes
+        #     (reproduced against the compose stack).
+        if _stop or failed:
+            outcomes.append((row, "released", None))
+            continue
+        try:
+            _dispatch_row(row, row.get("downstream_url"))
+        except Exception as exc:
+            outcomes.append((row, "failed", str(exc) or type(exc).__name__))
+            failed = True
+            continue
+        outcomes.append((row, "sent", None))
+    return outcomes
+
+
 def drain_batch(conn: psycopg2.extensions.connection) -> int:
     """
     Claim a batch, dispatch it with no transaction open, commit each row's outcome.
@@ -390,39 +435,63 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
     Delivery is at-least-once: if this process dies between 2 and 3, the lease expires
     and the row is dispatched again. Receivers deduplicate on transaction_id.
 
-    A tenant whose dispatch fails gives up the rest of its rows in this batch: they are
-    released untried (lease cleared, no attempt counted) and the batch moves on to the
-    other tenants. Dispatch is serial, so without this one tenant with a dead or slow
-    downstream cost every other tenant up to batch x DISPATCH_DEADLINE_SECONDS per batch;
-    now it costs at most one deadline.
+    Tenants are dispatched concurrently (WORKER_DISPATCH_CONCURRENCY threads), one task
+    per tenant, its rows serial in id order. Fully serial dispatch let one tenant whose
+    downstream trickled bytes cost every other tenant up to a deadline per batch: with a
+    slow tenant that always had fresh rows, global throughput was one batch per deadline.
+    A tenant whose dispatch fails still gives up the rest of its rows in this batch
+    (released untried, no attempt counted), so it costs its own slot at most one deadline.
+
+    The threads only do HTTP. This thread owns the connection and records each tenant's
+    outcomes as that tenant's task completes (as_completed): a tenant that finishes
+    early is committed while the slow ones are still in flight. The lease is unchanged —
+    a batch can still take batch x DISPATCH_DEADLINE_SECONDS in the worst case (all rows
+    one tenant, every one trickling), and the lease default is sized for exactly that.
     """
     rows = _claim_batch(conn)
     if not rows:
         return 0
 
+    by_org: Dict[str, List[psycopg2.extras.RealDictRow]] = {}
+    for row in rows:                       # rows are sorted by id: each list keeps id order
+        by_org.setdefault(row["org_id"], []).append(row)
+
+    def record(outcomes: List[_Outcome]) -> int:
+        """Commit one tenant's outcomes on this thread; returns how many were delivered."""
+        sent = 0
+        for row, kind, error in outcomes:
+            if kind == "released":
+                _release_row(conn, row)
+            elif kind == "failed":
+                log.warning(
+                    "dispatch_failed id=%s transaction_id=%s attempts=%d error=%s",
+                    row["id"], row["transaction_id"], row["attempts"] + 1, error,
+                )
+                _finish_row(conn, row, error)
+            else:
+                _finish_row(conn, row, None)
+                sent += 1
+        return sent
+
     dispatched = 0
-    failed_orgs: set = set()
     t0 = time.monotonic()
-    for row in rows:
-        # Stopping (SIGTERM) or a tenant that already failed in this batch: hand the row
-        #     back untried. Leaving it claimed stranded it for the whole lease — a worker
-        #     restarted mid-batch kept up to a batch of paid events undelivered for
-        #     ~17 minutes (reproduced against the compose stack).
-        if _stop or row["org_id"] in failed_orgs:
-            _release_row(conn, row)
-            continue
+    workers = min(WORKER_DISPATCH_CONCURRENCY, len(by_org))
+    if workers <= 1:
+        # One tenant, or concurrency set to 1: nothing to overlap, so dispatch on this
+        #     thread, exactly as the serial worker did. No pool, no thread hand-off.
+        for org_rows in by_org.values():
+            dispatched += record(_dispatch_tenant(org_rows))
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dispatch")
         try:
-            _dispatch_row(row, row.get("downstream_url"))
-        except Exception as exc:
-            log.warning(
-                "dispatch_failed id=%s transaction_id=%s attempts=%d error=%s",
-                row["id"], row["transaction_id"], row["attempts"] + 1, exc,
-            )
-            _finish_row(conn, row, str(exc) or type(exc).__name__)
-            failed_orgs.add(row["org_id"])
-            continue
-        _finish_row(conn, row, None)
-        dispatched += 1
+            futures = [pool.submit(_dispatch_tenant, org_rows) for org_rows in by_org.values()]
+            for future in as_completed(futures):
+                dispatched += record(future.result())
+        finally:
+            # Normally every future is done. On a database error mid-recording, do not
+            #     wait for tenants still in flight (up to a deadline per row): the caller
+            #     reconnects, and unrecorded rows are redelivered when their lease expires.
+            pool.shutdown(wait=False, cancel_futures=True)
 
     if dispatched:
         log.info(
