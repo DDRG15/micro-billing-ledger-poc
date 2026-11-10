@@ -4375,6 +4375,55 @@ finally:
     c622_obs.close()
     c622.close()
 
+# A header value http.client refuses (a control character, a character outside latin-1)
+#     raised ValueError before any byte was sent, so that outbox row retried forever.
+import urllib.parse  # noqa: E402
+
+_seen_622 = []
+
+
+class _HeaderSink622(_hs_615.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        _seen_622.append({k: self.headers.get(k) for k in
+                          ("X-Transaction-Id", "X-Org-Id", "X-Event-Type", "X-Injected")})
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+_srv_622 = _hs_615.HTTPServer(("127.0.0.1", 0), _HeaderSink622)
+_th_615.Thread(target=_srv_622.serve_forever, daemon=True).start()
+_url_622 = f"http://127.0.0.1:{_srv_622.server_port}/hook"
+try:
+    _odd_622 = "evt_c622\x01\u00e9\u4e2d 100%\r\nX-Injected: 1"
+    _err_622 = None
+    try:
+        W._dispatch_row({"id": 1, "payload": "{}", "event_type": "invoice.paid",
+                         "transaction_id": _odd_622, "org_id": "c622\u00e9"}, _url_622)
+    except Exception as _e:
+        _err_622 = f"{type(_e).__name__}: {_e}"
+    chk("a transaction_id with control / non-latin-1 characters is delivered, not raised",
+        _err_622 is None and len(_seen_622) == 1, str(_err_622))
+    _h_622 = _seen_622[0] if _seen_622 else {}
+    chk("…the header is percent-encoded and decodes back to the original id",
+        urllib.parse.unquote(_h_622.get("X-Transaction-Id") or "") == _odd_622
+        and "%01" in (_h_622.get("X-Transaction-Id") or ""), str(_h_622))
+    chk("…a line break in the id cannot inject a header; org id is encoded too",
+        _h_622.get("X-Injected") is None
+        and urllib.parse.unquote(_h_622.get("X-Org-Id") or "") == "c622\u00e9", str(_h_622))
+    W._dispatch_row({"id": 2, "payload": "{}", "event_type": "invoice.paid",
+                     "transaction_id": "evt_1Abc-2_x.y:z 100%", "org_id": "acme"}, _url_622)
+    chk("an ordinary id is sent byte for byte (no encoding, '%' untouched)",
+        _seen_622[-1]["X-Transaction-Id"] == "evt_1Abc-2_x.y:z 100%"
+        and _seen_622[-1]["X-Org-Id"] == "acme" and _seen_622[-1]["X-Event-Type"] == "invoice.paid",
+        str(_seen_622[-1]))
+finally:
+    _srv_622.shutdown()
+
 
 # =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed

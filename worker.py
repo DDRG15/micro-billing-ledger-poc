@@ -221,6 +221,26 @@ def _post(url: str, data: bytes, headers: dict) -> int:
         conn.close()
 
 
+# Printable ASCII except "%", which is escaped once a value is encoded at all.
+_HEADER_SAFE = "".join(chr(c) for c in range(0x20, 0x7F) if chr(c) != "%")
+
+
+def _header_value(value: str) -> str:
+    """Make a header value safe for http.client; printable ASCII passes through unchanged.
+
+    A transaction_id (or org / event type) holding a control character or a character
+    outside latin-1 made http.client raise ValueError while building the request. That is
+    not a failure the downstream caused, so the row backed off, was claimed again and
+    failed the same way forever. Anything outside printable ASCII now makes the whole
+    value percent-encoded as UTF-8 ('%' included, so the encoding is reversible): the row
+    is delivered and the receiver recovers the original with urllib.parse.unquote.
+    Ordinary ids are sent byte for byte as before.
+    """
+    if all(0x20 <= ord(ch) <= 0x7E for ch in value):
+        return value
+    return urllib.parse.quote(value, safe=_HEADER_SAFE)
+
+
 def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] = None) -> None:
     """
     Forward a single outbox row to its tenant's downstream system.
@@ -239,9 +259,9 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] =
         try:
             status = _post(target, row["payload"].encode(), {
                 "Content-Type": "application/json",
-                "X-Event-Type": row["event_type"],
-                "X-Transaction-Id": row["transaction_id"],
-                "X-Org-Id": row.get("org_id", "default"),
+                "X-Event-Type": _header_value(row["event_type"]),
+                "X-Transaction-Id": _header_value(row["transaction_id"]),
+                "X-Org-Id": _header_value(row.get("org_id", "default")),
             })
         except RuntimeError as exc:
             raise RuntimeError(f"{exc} transaction_id={row['transaction_id']}") from None
