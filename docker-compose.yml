@@ -234,7 +234,7 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # caddy — reverse proxy + automatic HTTPS (Phase 8)
+  # caddy — reverse proxy + automatic HTTPS
   # Handles TLS termination via Let's Encrypt. Set CADDY_DOMAIN in .env
   #     to your real domain and Caddy provisions the certificate automatically.
   #     For local dev with CADDY_DOMAIN=localhost, access via https://localhost
