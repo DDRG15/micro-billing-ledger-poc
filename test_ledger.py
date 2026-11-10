@@ -3822,6 +3822,70 @@ finally:
 
 
 # =============================================================================
+# C6-14: the request body is capped while it is read
+#     FastAPI read the whole body into memory before the limiter, the signature check or
+#     any handler ran, and nothing capped it: one unauthenticated 100 MB POST OOM-killed
+#     the 256 MB billing container (reproduced against the compose stack).
+# =============================================================================
+print("\n── C6-14: oversized bodies → 413, read no further than the cap ──────────")
+
+_cap_client = TestClient(L.app)
+_cap = L.MAX_REQUEST_BODY_BYTES
+_r = _cap_client.post("/webhook/stripe", content=b"x" * (_cap + 1),
+                      headers={"Content-Type": "application/json"})
+chk("a declared Content-Length over the cap → 413", _r.status_code == 413, str(_r.status_code))
+
+
+
+
+def _chunked_614(total=50 * 1024 * 1024, step=64 * 1024):
+    for _ in range(total // step):
+        yield b"0" * step
+
+
+_r = _cap_client.post("/webhook/stripe/default", content=_chunked_614(),
+                      headers={"Content-Type": "application/json"})
+chk("a chunked 50 MB body with no Content-Length → 413", _r.status_code == 413, str(_r.status_code))
+# TestClient buffers a generator body itself before calling the app, so the read-stops-at-
+#     the-cap property is checked on the middleware directly, with a receive() that counts
+#     what it is asked for — the same channel uvicorn feeds from the socket.
+import asyncio as _asyncio_614  # noqa: E402
+
+_pulled_614, _sent_614, _app_called_614 = [0], [], [False]
+
+
+async def _receive_614():
+    _pulled_614[0] += 64 * 1024
+    return {"type": "http.request", "body": b"0" * (64 * 1024),
+            "more_body": _pulled_614[0] < 50 * 1024 * 1024}
+
+
+async def _send_614(message):
+    _sent_614.append(message)
+
+
+async def _inner_app_614(scope, receive, send):
+    _app_called_614[0] = True
+
+
+_asyncio_614.run(L._BodySizeCap(_inner_app_614, _cap)(
+    {"type": "http", "method": "POST", "path": "/webhook/stripe", "headers": [],
+     "client": ("203.0.113.9", 1)}, _receive_614, _send_614))
+chk("…and reading stopped at the cap, not at 50 MB, without reaching the app",
+    _pulled_614[0] <= _cap + 64 * 1024 and not _app_called_614[0]
+    and _sent_614 and _sent_614[0].get("status") == 413,
+    f"{_pulled_614[0]} bytes pulled, app called={_app_called_614[0]}")
+_r = _cap_client.post("/webhook/stripe", content=b'{"id":"evt_cap","type":"invoice.paid"}',
+                      headers={"Content-Type": "application/json", "Stripe-Signature": "t=1,v1=00"})
+chk("a small body still reaches the signature check (400, not 413)", _r.status_code == 400,
+    str(_r.status_code))
+_r = _cap_client.post("/webhook/stripe", content=b"{}",
+                      headers={"Content-Type": "application/json", "Content-Length": "12abc"})
+chk("a malformed Content-Length is refused before reading", _r.status_code in (400, 413),
+    str(_r.status_code))
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

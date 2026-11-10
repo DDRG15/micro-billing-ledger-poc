@@ -1864,6 +1864,83 @@ async def _observability(request: Request, call_next):
     )
     return response
 
+
+# Largest request body the service reads. A Stripe event is a few KB to a few hundred KB.
+MAX_REQUEST_BODY_BYTES: int = int(os.environ.get("MAX_REQUEST_BODY_BYTES", str(1024 * 1024)))
+
+
+class _BodySizeCap:
+    """Pure ASGI middleware: refuse a body over MAX_REQUEST_BODY_BYTES with 413, reading
+    it chunk by chunk and stopping at the cap.
+
+    FastAPI reads the whole body into memory to build the request model BEFORE the rate
+    limiter, the signature check or any handler code runs. With no cap anywhere, one
+    unauthenticated 100 MB POST OOM-killed the 256 MB billing container, and repeating it
+    kept ingest down. A declared Content-Length over the cap is refused before a byte is
+    read; a chunked body is counted as it arrives and refused the moment it crosses the
+    cap, so the most this process ever holds for one request is the cap itself. The
+    accepted body is then replayed to the application unchanged.
+
+    Pure ASGI rather than @app.middleware: an exception raised from inside the app's
+    receive() would surface as a 500 through ServerErrorMiddleware, not a 413.
+    """
+
+    def __init__(self, asgi_app, max_bytes: int) -> None:
+        self.app, self.max_bytes = asgi_app, max_bytes
+
+    async def _refuse(self, scope, send, declared) -> None:
+        client = (scope.get("client") or ("?",))[0]
+        _log.warning(
+            "request body over %d bytes refused path=%s client=%s",
+            self.max_bytes, scope.get("path", "")[:128], client,
+            extra={"event": "body_too_large", "declared_length": declared, "client_ip": client},
+        )
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"connection", b"close")]})
+        await send({"type": "http.response.body", "body": b'{"detail":"Request body too large"}'})
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["method"] in ("GET", "HEAD", "OPTIONS"):
+            await self.app(scope, receive, send)
+            return
+        declared = None
+        for name, value in scope["headers"]:
+            if name == b"content-length":
+                declared = value[:20].decode("latin-1")
+                if not declared.isdigit():
+                    await self._refuse(scope, send, declared)
+                    return
+                if int(declared) > self.max_bytes:
+                    await self._refuse(scope, send, declared)
+                    return
+        chunks, total = [], 0
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body = message.get("body", b"")
+            total += len(body)
+            if total > self.max_bytes:
+                await self._refuse(scope, send, declared)
+                return
+            chunks.append(body)
+            if not message.get("more_body", False):
+                break
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": b"".join(chunks), "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+app.add_middleware(_BodySizeCap, max_bytes=MAX_REQUEST_BODY_BYTES)
+
 # Ensure all three tables and their indexes exist before the pool opens connections.
 #     The bootstrap connection is closed immediately — it is not reused.
 #

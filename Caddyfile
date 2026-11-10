@@ -21,6 +21,12 @@
     # Forward all traffic to the billing FastAPI container.
     #     The billing service is NOT exposed to the internet directly —
     #     all external traffic must pass through Caddy.
+    # Refuse oversized bodies at the edge (413) before they reach the 256 MB billing
+    #     container. The app enforces the same cap (MAX_REQUEST_BODY_BYTES) for traffic
+    #     that does not pass through Caddy.
+    request_body {
+        max_size 1MiB
+    }
     reverse_proxy billing:8000
 
     # Security headers — applied to every response.
