@@ -51,6 +51,43 @@ only in a declared local dev run and answer `404` everywhere else. A signed payl
 replayed within Stripe's signature tolerance leaves one `DUPLICATE` or one `UNSUPPORTED`
 row per event, not one per request (unique partial indexes, migrations 0010 and 0011).
 
+**Every error is recorded with a class and a type.** At 03:00 `http_requests_total{status="401"}`
+is climbing. The status says what the server answered; it does not say whether a partner
+rotated a key (a burst of `missing_api_key` from one client) or someone is guessing keys
+(`invalid_api_key`, then `auth_failure_budget`). Without the type, every triage starts by
+reading logs. So every response with status 400 or above
+leaves one `http_request` log line carrying `error_class` and `error_type` and adds one to
+`http_errors_total{status,error_class,error_type}`. That includes the `413`, and the `500`
+from an exception no handler catches: the observability layer records it and re-raises, so
+uvicorn still logs the traceback. Both values come from a fixed table in `ledger.py`, never
+from the request; a caller who chose a metric label would choose the size of the time-series
+database. A response nobody labelled is recorded as `unclassified_4xx` or `unclassified_5xx`,
+and a test fails if any known path ends there. The three causes of the same `400` body (bad
+signature, unknown tenant, malformed tenant id) are told apart only in this log and metric.
+
+Recorded is not alerted. Prometheus is not in the Compose stack, so the counter moves and
+nobody is paged until something outside this repository scrapes `/metrics` and evaluates a
+rule. Three cases leave nothing in the application: a connection Caddy closes at
+`read_header` (no response and no log line at all), a client that hangs up while its body is
+still arriving (Caddy writes an access line with status `499` and no class or type), and a
+request that is not valid HTTP (uvicorn answers `400` itself). The README table "Errors:
+class and type" lists every pair.
+
+**The proxy's access log carries no credential.** Caddy writes one JSON access line per
+request to stdout. Its default log writes every request header except `Authorization` and
+`Cookie`, so `X-Api-Key` and `Stripe-Signature` came out in plaintext, into a stream Docker
+keeps and log shippers copy; anyone who can read the logs would hold a working operator or
+tenant key. The Caddyfile deletes the whole `request>headers` object from the log instead of
+naming secrets one by one, so a header added later cannot leak by omission. The filter is on
+the site's logger and on the global default logger. The default logger matters because it also
+writes the line for a request whose `Host` matches no site, and a wrong-`Host` request that
+carried `X-Api-Key` wrote the key to stdout through it. Measured with canary values in both
+headers, the log output held 0 occurrences of either. The suite does not start Caddy: section C6-31
+of `test_ledger.py` reads the Caddyfile as text and fails if either filter is missing, so the behaviour above
+needs a new measurement after any change to the Caddy image or the Caddyfile. The log still
+holds the request URI, the client address and the response headers. The service takes its
+credentials only in headers, so none of those is a credential.
+
 **Tenant isolation (partial).** `ledger`, `outbox` and `dlq` carry `org_id`, and the
 ledger primary key is `(org_id, transaction_id)` so the idempotency guard is per-tenant —
 without that, two tenants presenting the same Stripe event id would silently discard one
@@ -211,7 +248,7 @@ the container or restarting the process. Re-reading a file on every request woul
 I/O call to the hot path and a new class of failure — a half-written secret file read
 mid-rotation — to solve a problem that a deploy already solves.
 
-## Dependencies
+## Dependencies and build
 
 Production dependencies are pinned to exact versions in `requirements.txt`. Pinning
 prevents surprise breakage, but it also freezes vulnerabilities in place: a pinned
@@ -219,3 +256,27 @@ version stops receiving fixes the moment one is published. Transitive dependenci
 the harder case — they are not listed in the manifest, so a scanner watching this
 repository may not flag them at all. `starlette` reached this project that way through
 FastAPI's pin range. Check the resolved tree, not only the manifest.
+
+**The Docker build context is an allowlist.** The context is everything the daemon
+receives, whether or not a `COPY` reads it. A deny-list has to anticipate every file that
+will ever appear in a checkout: a local `.env` holding real secrets, editor state, notes. A
+file nobody thought of is sent to the daemon anyway, and one broad `COPY . .` added later
+puts it into an image layer. `.dockerignore` therefore starts with `*` and re-admits only what
+the Dockerfile copies: `requirements.txt`, `ledger.py`, `worker.py`, `provision.py`,
+`alembic.ini` and `alembic/`. A new stray file is excluded by default, and a `COPY` added
+without its matching `!` line fails the build with "file not found", which is the intended
+signal. Keep the two lists equal.
+
+**Static analysis runs on every push.** `ruff` and `bandit` run in CI (`lint.yml`) on every
+push and pull request to `main`. Both cover the service, the worker and the end-to-end
+harness; `ruff` also covers the tests, the benchmark and the viewer builder. The Alembic
+migrations are in neither scan. `bandit` reports medium severity and above (`-ll`). Six
+findings are suppressed, each with an explicit rule id. The one on the DLQ listing query in
+`ledger.py` is a B608 false positive: its `WHERE` clause is built from three fixed string
+fragments and every value is a bound parameter, so no caller input reaches the SQL text, but
+bandit cannot see that. A scan that
+reports nothing proves nothing until the scanner has been seen to report something. Run
+against a file holding `shell=True`, `eval` and a concatenated SQL string, bandit 1.7.8
+flagged all three (B602, B307, B608); the recipe is in [docs/testing.md](docs/testing.md).
+That check is manual. CI does not repeat it, so a change that made `bandit` scan nothing
+would still pass.
