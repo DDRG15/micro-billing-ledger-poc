@@ -3936,6 +3936,100 @@ finally:
 
 
 # =============================================================================
+# C6-16: a slow downstream is cut at a deadline and cannot hold other tenants
+#     The 10 s timeout bounded each socket read, not the request, and dispatch is serial:
+#     a downstream trickling one byte every few seconds held the whole worker — every
+#     other tenant's deliveries — for as long as it kept trickling.
+# =============================================================================
+print("\n── C6-16: dispatch deadline; a failing tenant yields the batch ──────────")
+
+import socket as _sock_616  # noqa: E402
+
+_lsn_616 = _sock_616.socket()
+_lsn_616.bind(("127.0.0.1", 0))
+_lsn_616.listen(4)
+_stop_616 = _th_615.Event()
+
+
+def _drip_616():
+    while not _stop_616.is_set():
+        try:
+            _lsn_616.settimeout(0.5)
+            _c, _ = _lsn_616.accept()
+        except OSError:
+            continue
+        _c.recv(65536)
+        try:
+            _c.sendall(b"HTTP/1.1 200 OK\r\nX-A: ")
+            while not _stop_616.is_set():
+                _c.sendall(b"a")
+                time.sleep(0.2)
+        except OSError:
+            pass
+        finally:
+            _c.close()
+
+
+_th_615.Thread(target=_drip_616, daemon=True).start()
+_orig_deadline_616 = W.DISPATCH_DEADLINE_SECONDS
+W.DISPATCH_DEADLINE_SECONDS = 1.5
+try:
+    _t0_616, _err_616 = time.monotonic(), None
+    try:
+        W._dispatch_row({"id": 1, "payload": "{}", "event_type": "invoice.paid",
+                         "transaction_id": "evt_c616", "org_id": "default"},
+                        f"http://127.0.0.1:{_lsn_616.getsockname()[1]}/hook")
+    except RuntimeError as _e:
+        _err_616 = str(_e)
+    _took_616 = time.monotonic() - _t0_616
+    chk("a trickling downstream is cut at the dispatch deadline, not after it finishes",
+        _err_616 is not None and "deadline" in _err_616 and _took_616 < 4,
+        f"{_took_616:.1f}s {_err_616}")
+finally:
+    W.DISPATCH_DEADLINE_SECONDS = _orig_deadline_616
+    _stop_616.set()
+    _lsn_616.close()
+
+c616 = fresh_conn()
+with c616.cursor() as _c:
+    for _o in ("c616_bad", "c616_good"):
+        _c.execute("INSERT INTO org (org_id, name, stripe_webhook_secret) VALUES (%s,%s,'whsec_t')",
+                   (_o, _o))
+L.process_stripe_event_batch(c616, [fake_event(eid=f"evt_c616_bad_{_i}") for _i in range(4)],
+                             org_id="c616_bad")
+L.process_stripe_event_batch(c616, [fake_event(eid=f"evt_c616_good_{_i}") for _i in range(2)],
+                             org_id="c616_good")
+_orig_dispatch_616, _orig_batch_616, _orig_rr_616 = W._dispatch_row, W.WORKER_BATCH_SIZE, W._rr_after
+W.WORKER_BATCH_SIZE, W._rr_after = 10, ""
+_calls_616 = []
+
+
+def _dispatch_616(row, destination=None):
+    _calls_616.append(row["org_id"])
+    if row["org_id"] == "c616_bad":
+        raise RuntimeError("downstream exceeded the 15 s dispatch deadline")
+
+
+W._dispatch_row = _dispatch_616
+try:
+    W.drain_batch(c616)
+    chk("a failing tenant is tried once per batch; the other tenant is fully served",
+        _calls_616.count("c616_bad") == 1 and _calls_616.count("c616_good") == 2, str(_calls_616))
+    with c616.cursor() as _c:
+        _c.execute("SELECT COUNT(*) FILTER (WHERE attempts = 0 AND claimed_until IS NULL "
+                   "AND next_attempt_at IS NULL), COUNT(*) FROM outbox "
+                   "WHERE org_id = 'c616_bad' AND dispatched = 0")
+        _rel_616 = _c.fetchone()
+    chk("…its untried rows are released with no attempt counted, eligible next claim",
+        _rel_616 == (3, 4), str(_rel_616))
+finally:
+    W._dispatch_row, W.WORKER_BATCH_SIZE, W._rr_after = (_orig_dispatch_616, _orig_batch_616,
+                                                         _orig_rr_616)
+    c616.close()
+
+
+
+# =============================================================================
 # M7: close every connection opened via fresh_conn(). Closing an already-closed
 #     connection is a no-op, so sections that closed their own connection are fine.
 # =============================================================================

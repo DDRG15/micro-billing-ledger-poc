@@ -37,9 +37,11 @@ import logging
 import os
 import signal
 import sys
+import http.client
+import socket
+import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from contextlib import contextmanager
 from typing import Generator, List, Optional
 
@@ -68,11 +70,15 @@ WORKER_POLL_INTERVAL: float = float(os.environ.get("WORKER_POLL_INTERVAL", "5"))
 #     Must be set explicitly — the worker refuses to start without a DOWNSTREAM_URL
 #     unless this flag is "true", preventing silent data loss in production.
 WORKER_LOG_ONLY: bool = os.environ.get("WORKER_LOG_ONLY", "false").lower() == "true"
+# A dispatch's socket timeout bounds each connect/read; the deadline bounds the whole
+#     request, however slowly the downstream trickles bytes. See _post.
+DISPATCH_SOCKET_TIMEOUT: float = float(os.environ.get("DISPATCH_SOCKET_TIMEOUT", "10"))
+DISPATCH_DEADLINE_SECONDS: float = float(os.environ.get("DISPATCH_DEADLINE_SECONDS", "15"))
 # How long a claim keeps other workers off a row. It must outlast a whole batch of
-#     dispatches (batch x the 10 s HTTP timeout) or a slow but live worker's rows get
+#     dispatches (batch x the dispatch deadline) or a slow but live worker's rows get
 #     claimed twice; it is also how long a crashed worker's rows wait to be reclaimed.
-WORKER_LEASE_SECONDS: int = int(os.environ.get("WORKER_LEASE_SECONDS",
-                                               str(WORKER_BATCH_SIZE * 10 + 60)))
+WORKER_LEASE_SECONDS: int = int(os.environ.get(
+    "WORKER_LEASE_SECONDS", str(int(WORKER_BATCH_SIZE * DISPATCH_DEADLINE_SECONDS) + 60)))
 # Backoff after a failed dispatch, by attempts so far; the last value repeats. Never
 #     gives up: the event is in the ledger, and silently abandoning its delivery is the
 #     one outcome ruled out. A row stuck here shows in outbox_pending and last_error.
@@ -151,22 +157,60 @@ def _tx(
 # Dispatch
 # ---------------------------------------------------------------------------
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect: surface the 3xx as an HTTPError, i.e. a failed dispatch.
+def _post(url: str, data: bytes, headers: dict) -> int:
+    """POST once and return the status. Never follows a redirect; never runs past
+    DISPATCH_DEADLINE_SECONDS in total.
 
-    urllib follows 301/302/303 on a POST by re-issuing it as a GET with no body. The
-    redirect target's 200 then read as success: the row was marked dispatched with no
-    error while the receiver got an empty GET — reproduced against the compose stack, a
-    paid event "delivered" that never arrived, with nothing in outbox_pending, last_error
-    or the logs. A 3xx is now a failure the row backs off from, with the status recorded.
-    Not following also keeps a downstream from steering the worker to another host.
+    Redirects: urllib followed a 301/302/303 on a POST by re-issuing it as a GET with no
+    body, and the redirect target's 200 read as success — reproduced against the compose
+    stack, a paid event marked dispatched with no error while the receiver got an empty
+    GET. http.client follows nothing: a 3xx is a non-2xx status, the dispatch fails and
+    the row backs off with the status recorded. It also keeps a downstream from steering
+    the worker to another host.
+
+    Deadline: the socket timeout bounds each connect and each read, not the request. A
+    downstream that trickles one byte every few seconds never trips it, and dispatch is
+    serial, so one tenant's endpoint held the whole worker — every other tenant's
+    deliveries, the DLQ retry and the prune — for as long as it kept trickling
+    (reproduced: 90 s and counting with five rows of another tenant waiting). A timer
+    shuts the socket down at the deadline, which unblocks the read in this thread.
     """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise RuntimeError(f"unsupported downstream URL scheme {parts.scheme!r}")
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.hostname, parts.port, timeout=DISPATCH_SOCKET_TIMEOUT)
+    expired = threading.Event()
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+    def _expire() -> None:
+        expired.set()
+        sock = conn.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
-
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+    timer = threading.Timer(DISPATCH_DEADLINE_SECONDS, _expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        conn.request("POST", path, body=data, headers=headers)
+        resp = conn.getresponse()
+        resp.read(64 * 1024)  # drain a little so the status is final; the body is not used
+        if expired.is_set():
+            # Cut mid-response: http.client reads EOF after a complete status line as the
+            #     end of the headers, so a trickle cut at the deadline would read as "200".
+            raise RuntimeError(f"downstream exceeded the {DISPATCH_DEADLINE_SECONDS:g} s dispatch deadline")
+        return resp.status
+    except (OSError, http.client.HTTPException) as exc:
+        if expired.is_set():
+            raise RuntimeError(f"downstream exceeded the {DISPATCH_DEADLINE_SECONDS:g} s dispatch deadline")
+        raise RuntimeError(f"downstream unreachable: {type(exc).__name__}: {exc}")
+    finally:
+        timer.cancel()
+        conn.close()
 
 
 def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] = None) -> None:
@@ -175,7 +219,7 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] =
     destination is that tenant's org.downstream_url, falling back to the process-wide
     DOWNSTREAM_URL when the tenant has not set one.
     If neither is set: structured log line (POC mode).
-    Raises on failure so the caller skips the UPDATE (row retried next poll).
+    Raises on failure so the caller records it and the row backs off.
 
     The destination is resolved per tenant because delivering one tenant's billing
     events — customer ids, amounts, raw payloads — to another tenant's endpoint would
@@ -184,30 +228,15 @@ def _dispatch_row(row: psycopg2.extras.RealDictRow, destination: Optional[str] =
     """
     target = destination or DOWNSTREAM_URL
     if target:
-        data = row["payload"].encode()
-        req = urllib.request.Request(
-            target,
-            data=data,
-            headers={
+        try:
+            status = _post(target, row["payload"].encode(), {
                 "Content-Type": "application/json",
                 "X-Event-Type": row["event_type"],
                 "X-Transaction-Id": row["transaction_id"],
                 "X-Org-Id": row.get("org_id", "default"),
-            },
-            method="POST",
-        )
-        try:
-            with _NO_REDIRECT_OPENER.open(req, timeout=10) as resp:  # nosec B310 — URL is operator-supplied DOWNSTREAM_URL, not user input
-                status = resp.status
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-        except urllib.error.URLError as exc:
-            # B2: URLError (DNS failure, connection refused, timeout) is a distinct
-            # exception from HTTPError — must be caught explicitly and surfaced as
-            # dispatch_failed, not allowed to bubble up as unexpected_error.
-            raise RuntimeError(
-                f"downstream unreachable for transaction_id={row['transaction_id']}: {exc.reason}"
-            )
+            })
+        except RuntimeError as exc:
+            raise RuntimeError(f"{exc} transaction_id={row['transaction_id']}") from None
         if not (200 <= status < 300):
             raise RuntimeError(
                 f"downstream HTTP {status} for transaction_id={row['transaction_id']}"
@@ -333,6 +362,16 @@ def _finish_row(conn: psycopg2.extensions.connection, row: psycopg2.extras.RealD
     return applied
 
 
+def _release_row(conn: psycopg2.extensions.connection, row: psycopg2.extras.RealDictRow) -> None:
+    """Give a claimed row back untried: clear this worker's lease, count no attempt."""
+    with _tx(conn, row["org_id"]) as cur:
+        cur.execute(
+            "UPDATE outbox SET claimed_until = NULL "
+            "WHERE id = %s AND dispatched = 0 AND claimed_until = %s",
+            (row["id"], row["claimed_until"]),
+        )
+
+
 def drain_batch(conn: psycopg2.extensions.connection) -> int:
     """
     Claim a batch, dispatch it with no transaction open, commit each row's outcome.
@@ -350,14 +389,24 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
 
     Delivery is at-least-once: if this process dies between 2 and 3, the lease expires
     and the row is dispatched again. Receivers deduplicate on transaction_id.
+
+    A tenant whose dispatch fails gives up the rest of its rows in this batch: they are
+    released untried (lease cleared, no attempt counted) and the batch moves on to the
+    other tenants. Dispatch is serial, so without this one tenant with a dead or slow
+    downstream cost every other tenant up to batch x DISPATCH_DEADLINE_SECONDS per batch;
+    now it costs at most one deadline.
     """
     rows = _claim_batch(conn)
     if not rows:
         return 0
 
     dispatched = 0
+    failed_orgs: set = set()
     t0 = time.monotonic()
     for row in rows:
+        if row["org_id"] in failed_orgs:
+            _release_row(conn, row)
+            continue
         try:
             _dispatch_row(row, row.get("downstream_url"))
         except Exception as exc:
@@ -366,6 +415,7 @@ def drain_batch(conn: psycopg2.extensions.connection) -> int:
                 row["id"], row["transaction_id"], row["attempts"] + 1, exc,
             )
             _finish_row(conn, row, str(exc) or type(exc).__name__)
+            failed_orgs.add(row["org_id"])
             continue
         _finish_row(conn, row, None)
         dispatched += 1
